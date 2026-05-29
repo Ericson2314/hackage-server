@@ -709,7 +709,7 @@ mkHtmlCore ServerEnv{serverBaseURI, serverBlobStore}
           , "votes"             $= pkgVotes
           , "hasVotes"          $= pkgVotes > 0
           , "hasExecOnly"       $= (not . hasLibs) pkgdesc && (not . null) execs
-          , "userRating"        $= userRating
+          , "userRating"        $= fmap (fromIntegral :: Int32 -> Int) userRating
           , "score"             $= pkgScore
           , "hasrdeps"          $= not (rdeps == ([],[]))
           , "rdeps"             $= renderPkgPageDeps rdeps

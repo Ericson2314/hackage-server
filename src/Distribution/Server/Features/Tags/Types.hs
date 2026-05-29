@@ -1,7 +1,10 @@
-{-# LANGUAGE DeriveDataTypeable, TypeFamilies, TemplateHaskell, GeneralizedNewtypeDeriving #-}
+{-# LANGUAGE MultiParamTypeClasses, DeriveDataTypeable, TypeFamilies, TemplateHaskell, GeneralizedNewtypeDeriving #-}
 
 module Distribution.Server.Features.Tags.Types where
 
+import Database.Beam.Backend.SQL (HasSqlValueSyntax(..))
+import Database.Beam.Postgres.Syntax (PgValueSyntax)
+import qualified Data.Text as T
 import Distribution.Server.Framework.MemSize
 
 import qualified Distribution.Compat.CharParsing as P
@@ -44,3 +47,5 @@ tagInitialChar c = Char.isAlphaNum c || c `elem` ".#*"
 tagLaterChar   c = Char.isAlphaNum c || c `elem` "-+#*."
 
 $(deriveSafeCopy 0 'base ''Tag)
+
+instance HasSqlValueSyntax PgValueSyntax Tag where sqlValueSyntax (Tag s) = sqlValueSyntax (T.pack s)

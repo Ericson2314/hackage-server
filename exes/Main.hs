@@ -55,6 +55,7 @@ import Control.Monad
          ( void, unless, when, filterM )
 import Control.Arrow
          ( second )
+import qualified Data.ByteString.Char8 as BS8
 import qualified Data.ByteString.Lazy as BS
 import qualified Distribution.Server.Util.GZip as GZip
 import qualified Text.Parsec as Parse
@@ -206,6 +207,7 @@ data RunFlags = RunFlags {
     flagRunTemp            :: Flag Bool,
     flagRunCacheDelay      :: Flag String,
     flagRunLiveTemplates   :: Flag Bool,
+    flagRunDbConnStr       :: Flag String,
     -- Online backup flags
     flagRunBackupOutputDir :: Flag FilePath,
     flagRunBackupLinkBlobs :: Flag Bool,
@@ -226,6 +228,7 @@ defaultRunFlags = RunFlags {
     flagRunTemp            = Flag False,
     flagRunCacheDelay      = NoFlag,
     flagRunLiveTemplates   = Flag False,
+    flagRunDbConnStr       = NoFlag,
     flagRunBackupOutputDir = Flag "backups",
     flagRunBackupLinkBlobs = Flag False,
     flagRunBackupScrubbed  = Flag False
@@ -293,6 +296,10 @@ runCommand =
           "Save time during bulk imports by delaying cache updates."
           flagRunCacheDelay (\v flags -> flags { flagRunCacheDelay = v })
           (reqArgFlag "SECONDS")
+      , option [] ["db-conn-str"]
+          "PostgreSQL connection string (default: dbname=hackage)"
+          flagRunDbConnStr (\v flags -> flags { flagRunDbConnStr = v })
+          (reqArgFlag "CONNSTR")
       , option ['o'] ["output-dir"]
           "The directory in which to create the backup (default ./backups/)"
           flagRunBackupOutputDir (\v flags -> flags { flagRunBackupOutputDir = v })
@@ -323,7 +330,8 @@ runAction opts = do
     usercontenturi <- checkUserContentURI defaults (flagToMaybe (flagRunUserContentURI opts))
     requiredbasehostheader <- checkRequiredBaseHostHeader defaults (flagToMaybe (flagRunRequiredBaseHostHeader opts))
     cacheDelay <- checkCacheDelay defaults (flagToMaybe (flagRunCacheDelay opts))
-    let stateDir  = fromFlagOrDefault (confStateDir  defaults) (flagRunStateDir  opts)
+    let dbConnStr = maybe (confDbConnStr defaults) BS8.pack (flagToMaybe (flagRunDbConnStr opts))
+        stateDir  = fromFlagOrDefault (confStateDir  defaults) (flagRunStateDir  opts)
         staticDir = fromFlagOrDefault (confStaticDir defaults) (flagRunStaticDir opts)
         tmpDir    = fromFlagOrDefault (confTmpDir    defaults) (flagRunTmpDir    opts)
         listenOn  = (confListenOn defaults) {
@@ -340,7 +348,8 @@ runAction opts = do
                         confTmpDir     = tmpDir,
                         confCacheDelay = cacheDelay,
                         confLiveTemplates = liveTemplates,
-                        confVerbosity  = verbosity
+                        confVerbosity  = verbosity,
+                        confDbConnStr  = dbConnStr
                     }
         outputDir = fromFlag (flagRunBackupOutputDir opts)
         linkBlobs = fromFlag (flagRunBackupLinkBlobs opts)
@@ -498,7 +507,8 @@ data InitFlags = InitFlags {
     flagInitVerbosity :: Flag Verbosity,
     flagInitAdmin     :: Flag String,
     flagInitStateDir  :: Flag FilePath,
-    flagInitStaticDir :: Flag FilePath
+    flagInitStaticDir :: Flag FilePath,
+    flagInitDbConnStr :: Flag String
   }
 
 defaultInitFlags :: InitFlags
@@ -506,7 +516,8 @@ defaultInitFlags = InitFlags {
     flagInitVerbosity = Flag Verbosity.normal,
     flagInitAdmin     = NoFlag,
     flagInitStateDir  = NoFlag,
-    flagInitStaticDir = NoFlag
+    flagInitStaticDir = NoFlag,
+    flagInitDbConnStr = NoFlag
   }
 
 initCommand :: CommandUI InitFlags
@@ -535,19 +546,25 @@ initCommand =
           flagInitStateDir (\v flags -> flags { flagInitStateDir = v })
       , optionStaticDir
           flagInitStaticDir (\v flags -> flags { flagInitStaticDir = v })
+      , option [] ["db-conn-str"]
+          "PostgreSQL connection string (default: dbname=hackage)"
+          flagInitDbConnStr (\v flags -> flags { flagInitDbConnStr = v })
+          (reqArgFlag "CONNSTR")
       ]
 
 initAction :: InitFlags -> IO ()
 initAction opts = do
     defaults <- Server.defaultServerConfig
 
-    let stateDir  = fromFlagOrDefault (confStateDir defaults)  (flagInitStateDir opts)
+    let dbConnStr = maybe (confDbConnStr defaults) BS8.pack (flagToMaybe (flagInitDbConnStr opts))
+        stateDir  = fromFlagOrDefault (confStateDir defaults)  (flagInitStateDir opts)
         staticDir = fromFlagOrDefault (confStaticDir defaults) (flagInitStaticDir opts)
         verbosity = fromFlag (flagInitVerbosity opts)
         config    = defaults {
                         confVerbosity = verbosity,
                         confStateDir  = stateDir,
-                        confStaticDir = staticDir
+                        confStaticDir = staticDir,
+                        confDbConnStr = dbConnStr
                     }
         parseAdmin adminStr = case break (==':') adminStr of
             (uname, ':':pass) -> Just (uname, pass)
@@ -582,7 +599,8 @@ data BackupFlags = BackupFlags {
     flagBackupStateDir    :: Flag FilePath,
     flagBackupStaticDir   :: Flag FilePath,
     flagBackupLinkBlobs   :: Flag Bool,
-    flagBackupScrubbed    :: Flag Bool
+    flagBackupScrubbed    :: Flag Bool,
+    flagBackupDbConnStr   :: Flag String
   }
 
 defaultBackupFlags :: BackupFlags
@@ -592,7 +610,8 @@ defaultBackupFlags = BackupFlags {
     flagBackupStateDir    = NoFlag,
     flagBackupStaticDir   = NoFlag,
     flagBackupLinkBlobs   = Flag False,
-    flagBackupScrubbed    = Flag False
+    flagBackupScrubbed    = Flag False,
+    flagBackupDbConnStr   = NoFlag
   }
 
 backupCommand :: CommandUI BackupFlags
@@ -634,13 +653,18 @@ backupCommand =
            "identifying information (for development use)")
           flagBackupScrubbed (\v flags -> flags { flagBackupScrubbed = v })
           (noArg (Flag True))
+      , option [] ["db-conn-str"]
+          "PostgreSQL connection string (default: dbname=hackage)"
+          flagBackupDbConnStr (\v flags -> flags { flagBackupDbConnStr = v })
+          (reqArgFlag "CONNSTR")
       ]
 
 backupAction :: BackupFlags -> IO ()
 backupAction opts = do
     defaults <- Server.defaultServerConfig
 
-    let stateDir  = fromFlagOrDefault (confStateDir defaults)  (flagBackupStateDir  opts)
+    let dbConnStr = maybe (confDbConnStr defaults) BS8.pack (flagToMaybe (flagBackupDbConnStr opts))
+        stateDir  = fromFlagOrDefault (confStateDir defaults)  (flagBackupStateDir  opts)
         staticDir = fromFlagOrDefault (confStaticDir defaults) (flagBackupStaticDir opts)
         outputDir = fromFlag (flagBackupOutputDir opts)
         linkBlobs = fromFlag (flagBackupLinkBlobs opts)
@@ -649,7 +673,8 @@ backupAction opts = do
         config    = defaults {
                       confVerbosity = verbosity,
                       confStateDir  = stateDir,
-                      confStaticDir = staticDir
+                      confStaticDir = staticDir,
+                      confDbConnStr = dbConnStr
                      }
 
     withServer config False $ startBackup verbosity scrubbed outputDir linkBlobs
@@ -875,14 +900,16 @@ testBackupAction opts = do
 data RestoreFlags = RestoreFlags {
     flagRestoreVerbosity :: Flag Verbosity,
     flagRestoreStateDir  :: Flag FilePath,
-    flagRestoreStaticDir :: Flag FilePath
+    flagRestoreStaticDir :: Flag FilePath,
+    flagRestoreDbConnStr :: Flag String
   }
 
 defaultRestoreFlags :: RestoreFlags
 defaultRestoreFlags = RestoreFlags {
     flagRestoreVerbosity = Flag Verbosity.normal,
     flagRestoreStateDir  = NoFlag,
-    flagRestoreStaticDir = NoFlag
+    flagRestoreStaticDir = NoFlag,
+    flagRestoreDbConnStr = NoFlag
   }
 
 restoreCommand :: CommandUI RestoreFlags
@@ -906,6 +933,10 @@ restoreCommand =
           flagRestoreStateDir  (\v flags -> flags { flagRestoreStateDir  = v })
       , optionStaticDir
           flagRestoreStaticDir (\v flags -> flags { flagRestoreStaticDir = v })
+      , option [] ["db-conn-str"]
+          "PostgreSQL connection string (default: dbname=hackage)"
+          flagRestoreDbConnStr (\v flags -> flags { flagRestoreDbConnStr = v })
+          (reqArgFlag "CONNSTR")
       ]
 
 restoreAction :: RestoreFlags -> [String] -> IO ()
@@ -913,11 +944,13 @@ restoreAction _ [] = dieNoVerbosity "No restore tarball given."
 restoreAction opts [tarFile] = do
     defaults <- Server.defaultServerConfig
 
-    let stateDir  = fromFlagOrDefault (confStateDir  defaults) (flagRestoreStateDir  opts)
+    let dbConnStr = maybe (confDbConnStr defaults) BS8.pack (flagToMaybe (flagRestoreDbConnStr opts))
+        stateDir  = fromFlagOrDefault (confStateDir  defaults) (flagRestoreStateDir  opts)
         staticDir = fromFlagOrDefault (confStaticDir defaults) (flagRestoreStaticDir opts)
         verbosity = fromFlag (flagRestoreVerbosity opts)
         config    = defaults {
                       confStateDir  = stateDir,
+                      confDbConnStr = dbConnStr,
                       confStaticDir = staticDir,
                       confVerbosity = verbosity
                     }

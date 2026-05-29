@@ -1,6 +1,6 @@
 -- | This module defines a plugin interface for Hackage features.
 --
-{-# LANGUAGE ExistentialQuantification, RankNTypes, NoMonomorphismRestriction #-}
+{-# LANGUAGE ExistentialQuantification, FlexibleContexts, RankNTypes, NoMonomorphismRestriction #-}
 module Distribution.Server.Framework.Feature
   ( -- * Main datatypes
     HackageFeature(..)
@@ -29,9 +29,9 @@ import Distribution.Server.Framework.BackupRestore (RestoreBackup(..), AbstractR
 import Distribution.Server.Framework.Resource      (Resource, ServerErrorResponse)
 import Distribution.Server.Framework.BlobStorage   (BlobStorage)
 import Distribution.Server.Framework.MemSize
+import Distribution.Server.Framework.PostgreSQL
+import Distribution.Server.Framework.EventSourcing (QueryEvent(..), UpdateEvent(..), SaveEvent(..))
 
-import Data.Acid
-import Data.Acid.Advanced
 
 -- | We compose the overall Hackage server featureset from a bunch of these
 -- features. The intention is to make the Hackage server reasonably modular
@@ -142,12 +142,12 @@ compareState old new =
     dropCommonPrefix common xs ys = (reverse common, xs, ys)
 
 abstractAcidStateComponent :: (Eq st, Show st, MemSize st)
-                           => StateComponent AcidState st -> AbstractStateComponent
+                         => StateComponent AcidState st -> AbstractStateComponent
 abstractAcidStateComponent = abstractAcidStateComponent' compareState
 
 abstractAcidStateComponent' :: MemSize st
-                            => (st -> st -> [String])
-                            -> StateComponent AcidState st -> AbstractStateComponent
+                          => (st -> st -> [String])
+                          -> StateComponent AcidState st -> AbstractStateComponent
 abstractAcidStateComponent' cmp st = AbstractStateComponent {
     abstractStateDesc       = stateDesc st
   , abstractStateCheckpoint = createCheckpoint (stateHandle st)
@@ -202,17 +202,24 @@ instance Semigroup AbstractStateComponent where
                                            (abstractStateSize b)
     }
 
-queryState :: (MonadIO m, QueryEvent event)
-           => StateComponent AcidState (EventState event)
-           -> event
-           -> m (EventResult event)
-queryState = query' . stateHandle
+queryState :: (MonadIO m, QueryEvent ev)
+           => StateComponent AcidState (QueryState ev)
+           -> ev
+           -> m (QueryResult ev)
+queryState sc ev = liftIO $ queryPg (stateHandle sc) (runQueryEvent ev)
 
-updateState :: (MonadIO m, UpdateEvent event)
-            => StateComponent AcidState (EventState event)
-            -> event
-            -> m (EventResult event)
-updateState = update' . stateHandle
+updateState :: (MonadIO m, SaveEvent ev)
+            => StateComponent AcidState (UpdateState ev)
+            -> ev
+            -> m (UpdateResult ev)
+updateState sc ev = liftIO $ do
+    -- Log event (for audit / future replay)
+    runPgTx (pgConn (stateHandle sc)) (saveEvent ev)
+    -- Update in-memory state
+    result <- updatePg (stateHandle sc) (runUpdateEvent ev)
+    -- Write full state to checkpoint tables (durability)
+    createCheckpoint (stateHandle sc)
+    return result
 
 
 --------------------------------------------------------------------------------

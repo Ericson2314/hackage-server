@@ -1,4 +1,4 @@
-{-# LANGUAGE DeriveDataTypeable, GeneralizedNewtypeDeriving,
+{-# LANGUAGE OverloadedStrings, MultiParamTypeClasses, FlexibleInstances, DeriveAnyClass, DeriveGeneric, DerivingStrategies, DeriveDataTypeable, GeneralizedNewtypeDeriving,
              TypeFamilies, TemplateHaskell #-}
 
 module Distribution.Server.Features.Votes.State where
@@ -18,7 +18,8 @@ import qualified Data.Map as Map
 import Data.List
 import Data.Maybe (fromMaybe)
 import Control.Arrow ((&&&))
-import Data.Acid     (Query, Update, makeAcidic)
+import Distribution.Server.Framework.EventSourcing (Query, Update, makeAcidic)
+import Distribution.Server.Framework.BeamInstances ()
 import Data.SafeCopy (base, extension, deriveSafeCopy, Migrate(..))
 
 import qualified Control.Monad.State as State
@@ -27,7 +28,8 @@ import Control.Monad.Reader.Class (ask)
 newtype VotesState_v0 = VotesState_v0 { votesMap :: Map PackageName UserIdSet }
 
 newtype VotesState = VotesState (Map PackageName (Map UserId Score))
-  deriving (Show, Eq, MemSize)
+  deriving stock (Show, Eq)
+  deriving newtype (MemSize)
 
 -- SafeCopy instances
 deriveSafeCopy 0 'base      ''VotesState_v0
@@ -58,7 +60,7 @@ userVotedForPackage pkgname uid votes =
 -- Using a Bayesian average (m=1.5, C=2) to calculate scoring
 votesScore :: Map UserId Score -> Float
 votesScore m =
-     let grouping = map (head &&& length) . group . sort . Map.elems $ m
+     let grouping = map (\g -> (head g, fromIntegral (length g) :: Score)) . group . sort . Map.elems $ m
          score :: Float
          score = fromIntegral ((sum $ map (uncurry (*)) grouping) + 3)/
                  fromIntegral (2 + sum (map snd grouping))

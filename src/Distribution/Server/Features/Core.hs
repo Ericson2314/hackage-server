@@ -1,7 +1,14 @@
-{-# LANGUAGE NamedFieldPuns  #-}
-{-# LANGUAGE RankNTypes      #-}
-{-# LANGUAGE RecordWildCards #-}
-{-# LANGUAGE RecursiveDo     #-}
+{-# LANGUAGE DeriveAnyClass      #-}
+{-# LANGUAGE DeriveGeneric       #-}
+{-# LANGUAGE FlexibleContexts, FlexibleInstances   #-}
+{-# LANGUAGE MultiParamTypeClasses #-}
+{-# LANGUAGE NamedFieldPuns      #-}
+{-# LANGUAGE OverloadedStrings   #-}
+{-# LANGUAGE RankNTypes          #-}
+{-# LANGUAGE RecordWildCards     #-}
+{-# LANGUAGE RecursiveDo         #-}
+{-# LANGUAGE StandaloneDeriving  #-}
+{-# LANGUAGE TypeFamilies        #-}
 module Distribution.Server.Features.Core (
     CoreFeature(..),
     CoreResource(..),
@@ -27,7 +34,7 @@ import qualified Codec.Compression.GZip                             as GZip
 import           Data.Aeson                                         (Value (..), toJSON)
 import qualified Data.Aeson.Key                                     as Key
 import qualified Data.Aeson.KeyMap                                  as KeyMap
-import           Data.ByteString.Lazy                               (LazyByteString, fromStrict)
+import           Data.ByteString.Lazy                               (LazyByteString, fromStrict, toStrict)
 import qualified Data.Foldable                                      as Foldable
 import qualified Data.Text                                          as Text
 import           Data.Time.Clock                                    (UTCTime, getCurrentTime)
@@ -38,12 +45,14 @@ import qualified Data.Vector                                        as Vec
 import           Distribution.Server.Prelude
 
 import           Distribution.Server.Features.Core.Backup
+import           Distribution.Server.Features.Core.Db
 import qualified Distribution.Server.Features.Core.State            as Acid
 import           Distribution.Server.Features.Security.Migration
-import           Distribution.Server.Features.Security.SHA256       (sha256)
+import           Distribution.Server.Features.Security.SHA256       (SHA256Digest, sha256)
 import           Distribution.Server.Features.Users
 import           Distribution.Server.Framework
 import qualified Distribution.Server.Framework.BlobStorage          as BlobStorage
+import           Distribution.Server.Framework.BlobStorage (BlobId)
 import qualified Distribution.Server.Framework.ResponseContentTypes as Resource
 import           Distribution.Server.Packages.Index                 (TarIndexEntry (..))
 import qualified Distribution.Server.Packages.Index                 as Packages.Index
@@ -51,7 +60,8 @@ import           Distribution.Server.Packages.PackageIndex          (PackageInde
 import qualified Distribution.Server.Packages.PackageIndex          as PackageIndex
 import           Distribution.Server.Packages.Types
 import           Distribution.Server.Packages.Utils
-import           Distribution.Server.Users.Types                    (UserId,
+import           Distribution.Server.Users.Types                    (UserId(..),
+                                                                     UserName(..),
                                                                      userName)
 import           Distribution.Server.Users.Users                    (lookupUserId,
                                                                      userIdToName)
@@ -59,7 +69,22 @@ import           Distribution.Server.Users.Users                    (lookupUserI
 -- Cabal
 import           Distribution.Package
 import           Distribution.Text                                  (display)
-import           Distribution.Version                               (nullVersion)
+import           Distribution.Version                               (Version, nullVersion)
+
+import           GHC.Generics (Generic)
+import           Database.Beam
+import           Database.Beam.Postgres
+import qualified Database.PostgreSQL.Simple as PG
+import           Control.Concurrent.MVar (swapMVar)
+import qualified Data.ByteString as BS
+import qualified Data.ByteString.Lazy as BSL
+import           Data.Int (Int32, Int64)
+import qualified Data.Map.Strict as Map
+import qualified Data.Sequence as Seq
+
+import           Distribution.Server.Framework.BlobStorage (blobMd5, readBlobId)
+import           Distribution.Server.Util.ReadDigest (readDigest)
+import           Distribution.Parsec (simpleParsec)
 
 -- | The core feature, responsible for the main package index and all access
 -- and modifications of it.
@@ -268,10 +293,10 @@ data CoreResource = CoreResource {
 }
 
 initCoreFeature :: ServerEnv -> IO (UserFeature -> IO CoreFeature)
-initCoreFeature env@ServerEnv{serverStateDir, serverCacheDelay,
+initCoreFeature env@ServerEnv{serverPgConn, serverCacheDelay,
                               serverVerbosity = verbosity} = do
     -- Canonical state
-    packagesState <- packagesStateComponent verbosity False serverStateDir
+    packagesState <- packagesStateComponent verbosity serverPgConn
 
     -- Hooks
     packageChangeHook   <- newHook
@@ -326,7 +351,7 @@ initCoreFeature env@ServerEnv{serverStateDir, serverCacheDelay,
         -- reconstruct the package log rather than use the package log as it was
         -- constructed in the first place, and we might potentially lose
         -- information.
-        createCheckpoint (stateHandle packagesState)
+        return () -- each update is already durable
 
       rec let (feature, getIndexTarball)
                 = coreFeature env users
@@ -360,19 +385,26 @@ initCoreFeature env@ServerEnv{serverStateDir, serverCacheDelay,
 
       return feature
 
-packagesStateComponent :: Verbosity -> Bool -> FilePath -> IO (StateComponent AcidState Acid.PackagesState)
-packagesStateComponent verbosity freshDB stateDir = do
-  let stateFile = stateDir </> "db" </> "PackagesState"
+------------------------------------------------------------------------
+
+packagesStateComponent :: Verbosity -> PgConnection -> IO (StateComponent AcidState Acid.PackagesState)
+packagesStateComponent verbosity conn = do
+  -- Load state
   st <- logTiming verbosity "Loaded PackagesState" $
-          openLocalStateFrom stateFile (Acid.initialPackagesState freshDB)
+          runPgTx conn loadPackagesState
+
+  pgSt <- mkAcidState conn st savePackagesState
   return StateComponent {
        stateDesc    = "Main package database"
-     , stateHandle  = st
-     , getState     = query st Acid.GetPackagesState
-     , putState     = update st . Acid.ReplacePackagesState
+     , stateHandle  = pgSt
+     , getState     = queryPg pgSt (runQueryEvent Acid.GetPackagesState)
+     , putState     = \s -> do
+         runPgTx conn (savePackagesState s)
+         _ <- swapMVar (pgMVar pgSt) s
+         return ()
      , backupState  = \_ -> indexToAllVersions
      , restoreState = packagesBackup
-     , resetState   = packagesStateComponent verbosity True
+     , resetState   = \_ -> packagesStateComponent verbosity conn
      }
 
 coreFeature :: ServerEnv
@@ -576,6 +608,7 @@ coreFeature ServerEnv{serverBlobStore = store} UserFeature{..}
           runHook_ packageChangeHook  (PackageChangeInfo PackageUpdatedTarball oldpkginfo newpkginfo)
           return True
 
+    updateSetPackageUploader :: MonadIO m => PackageId -> UserId -> m Bool
     updateSetPackageUploader pkgid userid = do
       mpkginfo <- updateState packagesState (Acid.SetPackageUploader pkgid userid)
       case mpkginfo of
@@ -584,6 +617,7 @@ coreFeature ServerEnv{serverBlobStore = store} UserFeature{..}
           runHook_ packageChangeHook  (PackageChangeInfo PackageUpdatedUploader oldpkginfo newpkginfo)
           return True
 
+    updateSetPackageUploadTime :: MonadIO m => PackageId -> UTCTime -> m Bool
     updateSetPackageUploadTime pkgid time = do
       mpkginfo <- updateState packagesState (Acid.SetPackageUploadTime pkgid time)
       case mpkginfo of

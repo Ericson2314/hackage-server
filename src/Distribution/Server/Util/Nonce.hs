@@ -1,4 +1,4 @@
-{-# LANGUAGE DeriveDataTypeable #-}
+{-# LANGUAGE OverloadedStrings, MultiParamTypeClasses, DeriveDataTypeable #-}
 {-# LANGUAGE GeneralizedNewtypeDeriving #-}
 {-# LANGUAGE TemplateHaskell #-}
 {-# LANGUAGE TypeFamilies #-}
@@ -10,6 +10,9 @@ module Distribution.Server.Util.Nonce
     )
 where
 
+import Database.Beam.Backend.SQL (HasSqlValueSyntax(..))
+import Database.Beam.Postgres.Syntax (PgValueSyntax)
+import qualified Data.Text as T
 import Distribution.Server.Framework.MemSize
 
 import Data.ByteString (ByteString)
@@ -54,3 +57,5 @@ instance Migrate Nonce where
     migrate (Nonce_v0 x) = either (const $ Nonce x) Nonce $ Base16.decode x
 
 $(deriveSafeCopy 1 'extension ''Nonce)
+
+instance HasSqlValueSyntax PgValueSyntax Nonce where sqlValueSyntax = sqlValueSyntax . T.pack . show

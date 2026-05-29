@@ -6,6 +6,7 @@ import Distribution.Server.Framework.Logging (Verbosity)
 import Distribution.Server.Framework.Cron (Cron)
 import Distribution.Server.Framework.Templating (TemplatesMode)
 import Distribution.Server.Framework.Error (ServerPartE)
+import Distribution.Server.Framework.PostgreSQL (PgConnection)
 
 import qualified Data.ByteString as BS
 import qualified Data.Text as T
@@ -73,7 +74,10 @@ data ServerEnv = ServerEnv {
     -- increasing the time taken to update the cache we can push this further.
     serverCacheDelay :: Int,
 
-    serverVerbosity  :: Verbosity
+    serverVerbosity  :: Verbosity,
+
+    -- | PostgreSQL connection for state persistence
+    serverPgConn     :: PgConnection
 }
 
 getHost :: ServerMonad m => m (Maybe BS.ByteString)

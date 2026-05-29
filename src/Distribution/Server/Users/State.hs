@@ -1,4 +1,4 @@
-{-# LANGUAGE DeriveDataTypeable, TypeFamilies, TemplateHaskell,
+{-# LANGUAGE OverloadedStrings, DeriveAnyClass, DeriveGeneric, DerivingStrategies, DeriveDataTypeable, TypeFamilies, TemplateHaskell,
              FlexibleInstances, FlexibleContexts, MultiParamTypeClasses,
              TypeOperators #-}
 {-# OPTIONS_GHC -fno-warn-orphans #-}
@@ -12,7 +12,8 @@ import Distribution.Server.Users.Group (UserIdSet)
 import qualified Distribution.Server.Users.Group as Group
 import qualified Distribution.Server.Users.Users as Users
 
-import Data.Acid     (Query, Update, makeAcidic)
+import Distribution.Server.Framework.EventSourcing (Query, Update, makeAcidic)
+import Distribution.Server.Framework.BeamInstances ()
 import Data.SafeCopy (base, deriveSafeCopy)
 
 import Control.Monad.Reader

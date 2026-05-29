@@ -87,7 +87,7 @@ invariant Users{userIdMap, userNameMap, nextId, authTokenMap} =
       --  1) the next id should be 0 if the userIdMap is empty
       --     or one bigger than the maximum allocated id
       let UserId nextid = nextId
-       in nextid == case IntMap.maxViewWithKey userIdMap of
+       in fromIntegral nextid == case IntMap.maxViewWithKey userIdMap of
                       Nothing                     -> 0
                       Just ((maxAllocatedId,_),_) -> maxAllocatedId + 1
 
@@ -109,7 +109,7 @@ invariant Users{userIdMap, userNameMap, nextId, authTokenMap} =
                , isActiveAccount (userStatus uinfo)]
 
     userNameMapConsistent =
-      and [ case IntMap.lookup uid userIdMap of
+      and [ case IntMap.lookup (fromIntegral uid) userIdMap of
               Nothing    -> False
               Just uinfo -> userName uinfo == uname
           | (uname, UserId uid) <- Map.toList userNameMap ]
@@ -124,14 +124,14 @@ invariant Users{userIdMap, userNameMap, nextId, authTokenMap} =
     authTokenMapConsistent =
       and
       [ and
-        [ case IntMap.lookup uid userIdMap of
+        [ case IntMap.lookup (fromIntegral uid) userIdMap of
             Nothing    -> False
             Just uinfo -> Map.member token (userTokens uinfo)
         | (token, UserId uid) <- Map.toList authTokenMap
         ]
       , and
         [ Map.lookup token authTokenMap == Just uid
-        | (token, uid) <- concatMap getUserTokList (IntMap.toList userIdMap)
+        | (token, uid) <- concatMap getUserTokList [(fromIntegral k, v) | (k, v) <- IntMap.toList userIdMap]
         ]
       ]
     getUserTokList (uid, uinfo) = [ (t, UserId uid)
@@ -151,7 +151,7 @@ ma ?! e = maybe (Left e) Right ma
 
 
 lookupUserId :: UserId -> Users -> Maybe UserInfo
-lookupUserId (UserId userId) users = IntMap.lookup userId (userIdMap users)
+lookupUserId (UserId userId) users = IntMap.lookup (fromIntegral userId) (userIdMap users)
 
 lookupUserName :: UserName -> Users -> Maybe (UserId, UserInfo)
 lookupUserName uname users = do
@@ -204,7 +204,7 @@ addUser name status users =
           userTokens = Map.empty
         }
         users' = checkinvariant users {
-          userIdMap   = IntMap.insert uid uinfo (userIdMap users),
+          userIdMap   = IntMap.insert (fromIntegral uid) uinfo (userIdMap users),
           userNameMap = Map.insert name userid (userNameMap users),
           nextId      = UserId (uid + 1)
         }
@@ -218,7 +218,7 @@ insertUserAccount userId@(UserId uid) uinfo users = do
     guard (not userIdInUse)                     ?! Left  ErrUserIdClash
     guard (not userNameInUse || isUserDeleted)  ?! Right ErrUserNameClash
     return $! checkinvariant users {
-          userIdMap   = IntMap.insert uid uinfo (userIdMap users),
+          userIdMap   = IntMap.insert (fromIntegral uid) uinfo (userIdMap users),
           authTokenMap =
               foldl' (\om tok -> Map.insert tok userId om)
                      (authTokenMap users)
@@ -230,7 +230,7 @@ insertUserAccount userId@(UserId uid) uinfo users = do
                         in UserId (max nextid (uid + 1))
         }
   where
-    userIdInUse   = IntMap.member uid (userIdMap users)
+    userIdInUse   = IntMap.member (fromIntegral uid) (userIdMap users)
     userNameInUse = Map.member (userName uinfo) (userNameMap users)
     isUserDeleted = case userStatus uinfo of
                       AccountDeleted -> True
@@ -254,7 +254,7 @@ deleteUser (UserId userId) users = do
   userInfo     <- lookupUserId (UserId userId) users ?! ErrNoSuchUserId
   let userInfo' = userInfo { userStatus = AccountDeleted }
   return $! checkinvariant users {
-    userIdMap   = IntMap.insert userId userInfo' (userIdMap users),
+    userIdMap   = IntMap.insert (fromIntegral userId) userInfo' (userIdMap users),
     userNameMap = Map.delete (userName userInfo) (userNameMap users)
   }
 
@@ -272,7 +272,7 @@ setUserEnabledStatus (UserId uid) enable users = do
     userInfo  <- lookupUserId (UserId uid) users ?! Left  ErrNoSuchUserId
     userInfo' <- changeStatus userInfo           ?! Right ErrDeletedUser
     return $! checkinvariant users {
-        userIdMap = IntMap.insert uid userInfo' (userIdMap users)
+        userIdMap = IntMap.insert (fromIntegral uid) userInfo' (userIdMap users)
     }
   where
     changeStatus userInfo | enable = case userStatus userInfo of
@@ -293,7 +293,7 @@ setUserAuth (UserId uid) newauth users = do
     userInfo  <- lookupUserId (UserId uid) users ?! Left  ErrNoSuchUserId
     userInfo' <- changeAuth userInfo             ?! Right ErrDeletedUser
     return $! checkinvariant users {
-      userIdMap = IntMap.insert uid userInfo' (userIdMap users)
+      userIdMap = IntMap.insert (fromIntegral uid) userInfo' (userIdMap users)
     }
   where
     changeAuth userInfo = case userStatus userInfo of
@@ -311,7 +311,7 @@ setUserName (UserId uid) newname users = do
     let oldname   = userName userinfo
         userinfo' = userinfo { userName = newname }
     return $! checkinvariant users {
-      userIdMap   = IntMap.insert uid userinfo' (userIdMap users),
+      userIdMap   = IntMap.insert (fromIntegral uid) userinfo' (userIdMap users),
       userNameMap = Map.insert newname (UserId uid) . Map.delete oldname $ userNameMap users
     }
   where
@@ -327,7 +327,7 @@ addAuthToken (UserId uid) token description users = do
                                               (userTokens userinfo)
                     }
     return $! checkinvariant users {
-      userIdMap    = IntMap.insert uid userinfo' (userIdMap users),
+      userIdMap    = IntMap.insert (fromIntegral uid) userinfo' (userIdMap users),
       authTokenMap = Map.insert token (UserId uid) (authTokenMap users)
     }
 
@@ -342,17 +342,17 @@ revokeAuthToken (UserId uid) token users = do
                       userTokens = Map.delete token (userTokens userinfo)
                     }
     return $! checkinvariant users {
-      userIdMap    = IntMap.insert uid userinfo' (userIdMap users),
+      userIdMap    = IntMap.insert (fromIntegral uid) userinfo' (userIdMap users),
       authTokenMap = Map.delete token (authTokenMap users)
     }
 
 enumerateAllUsers :: Users -> [(UserId, UserInfo)]
 enumerateAllUsers users =
-    [ (UserId uid, uinfo) | (uid, uinfo) <- IntMap.assocs (userIdMap users) ]
+    [ (UserId (fromIntegral uid), uinfo) | (uid, uinfo) <- IntMap.assocs (userIdMap users) ]
 
 enumerateActiveUsers :: Users -> [(UserId, UserInfo)]
 enumerateActiveUsers users =
-    [ (UserId uid, uinfo) | (uid, uinfo) <- IntMap.assocs (userIdMap users)
+    [ (UserId (fromIntegral uid), uinfo) | (uid, uinfo) <- IntMap.assocs (userIdMap users)
                           , isActiveAccount (userStatus uinfo) ]
 
 data Users_v0 = Users_v0 {

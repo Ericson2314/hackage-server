@@ -1,4 +1,14 @@
-{-# LANGUAGE RankNTypes, NamedFieldPuns, RecordWildCards, RecursiveDo #-}
+{-# LANGUAGE DeriveAnyClass #-}
+{-# LANGUAGE DeriveGeneric #-}
+{-# LANGUAGE FlexibleInstances #-}
+{-# LANGUAGE MultiParamTypeClasses #-}
+{-# LANGUAGE OverloadedStrings #-}
+{-# LANGUAGE RankNTypes #-}
+{-# LANGUAGE NamedFieldPuns #-}
+{-# LANGUAGE RecordWildCards #-}
+{-# LANGUAGE RecursiveDo #-}
+{-# LANGUAGE StandaloneDeriving #-}
+{-# LANGUAGE TypeFamilies #-}
 module Distribution.Server.Features.Distro (
     DistroFeature(..),
     DistroResource(..),
@@ -13,15 +23,27 @@ import Distribution.Server.Features.Users
 import Distribution.Server.Users.Group (UserGroup(..), GroupDescription(..), nullDescription)
 import qualified Distribution.Server.Features.Distro.State as Acid
 import Distribution.Server.Features.Distro.Types
+import Distribution.Server.Features.Distro.Distributions (Distributions(..), DistroVersions(..), DistroPackageInfo(..))
 import Distribution.Server.Features.Distro.Backup (dumpBackup, restoreBackup)
+import qualified Distribution.Server.Users.Types as Users.Types
+import qualified Distribution.Server.Users.Group as Group
 import Distribution.Server.Util.Parse (unpackUTF8)
 
 import Distribution.Text (display, simpleParse)
 import Distribution.Package
 
-import Data.List (intercalate)
+import Data.List (intercalate, foldl')
+import qualified Data.Map as Map
+import qualified Data.Set as Set
 import qualified Data.Text as T
 import Text.CSV (parseCSV)
+
+import GHC.Generics (Generic)
+import           Data.Int (Int32)
+import Database.Beam
+import Database.Beam.Postgres
+import qualified Database.PostgreSQL.Simple as PG
+import Control.Concurrent.MVar (swapMVar)
 
 -- TODO:
 -- 1. write an HTML view for this module, and delete the text
@@ -45,8 +67,8 @@ data DistroResource = DistroResource {
 
 initDistroFeature :: ServerEnv
                   -> IO (UserFeature -> CoreFeature -> IO DistroFeature)
-initDistroFeature ServerEnv{serverStateDir} = do
-    distrosState <- distrosStateComponent serverStateDir
+initDistroFeature ServerEnv{serverPgConn} = do
+    distrosState <- distrosStateComponent serverPgConn
 
     return $ \user@UserFeature{adminGroup, groupResourcesAt} core@CoreFeature{coreResource} -> do
       rec
@@ -72,17 +94,171 @@ initDistroFeature ServerEnv{serverStateDir} = do
 
       return feature
 
-distrosStateComponent :: FilePath -> IO (StateComponent AcidState Acid.Distros)
-distrosStateComponent stateDir = do
-  st <- openLocalStateFrom (stateDir </> "db" </> "Distros") Acid.initialDistros
+------------------------------------------------------------------------
+-- Beam tables
+--
+
+data DistroDistroT f = DistroDistroRow
+  { _ddName :: C f T.Text
+  } deriving (Generic, Beamable)
+
+instance Table DistroDistroT where
+  data PrimaryKey DistroDistroT f =
+    DistroDistroId (C f T.Text)
+    deriving (Generic, Beamable)
+  primaryKey r = DistroDistroId (_ddName r)
+
+deriving instance Show (DistroDistroT Identity)
+
+data DistroMaintainerT f = DistroMaintainerRow
+  { _dmDistroName :: C f T.Text
+  , _dmUserId     :: C f Int32
+  } deriving (Generic, Beamable)
+
+instance Table DistroMaintainerT where
+  data PrimaryKey DistroMaintainerT f =
+    DistroMaintainerId (C f T.Text) (C f Int32)
+    deriving (Generic, Beamable)
+  primaryKey r = DistroMaintainerId (_dmDistroName r) (_dmUserId r)
+
+deriving instance Show (DistroMaintainerT Identity)
+
+data DistroVersionT f = DistroVersionRow
+  { _dvrDistroName :: C f T.Text
+  , _dvrPkgName    :: C f T.Text
+  , _dvrVersion    :: C f T.Text
+  , _dvrUrl        :: C f T.Text
+  } deriving (Generic, Beamable)
+
+instance Table DistroVersionT where
+  data PrimaryKey DistroVersionT f =
+    DistroVersionId (C f T.Text) (C f T.Text)
+    deriving (Generic, Beamable)
+  primaryKey r = DistroVersionId (_dvrDistroName r) (_dvrPkgName r)
+
+deriving instance Show (DistroVersionT Identity)
+
+data DistroDb f = DistroDb
+  { _distroDistros      :: f (TableEntity DistroDistroT)
+  , _distroMaintainers  :: f (TableEntity DistroMaintainerT)
+  , _distroVersions     :: f (TableEntity DistroVersionT)
+  } deriving (Generic, Database Postgres)
+
+distroDb :: DatabaseSettings Postgres DistroDb
+distroDb = defaultDbSettings `withDbModification`
+  DistroDb
+    (setEntityName "distro__distros" <>
+     modifyTableFields tableModification { _ddName = "name" })
+    (setEntityName "distro__maintainers" <>
+     modifyTableFields tableModification
+       { _dmDistroName = "distro_name"
+       , _dmUserId     = "user_id"
+       })
+    (setEntityName "distro__versions" <>
+     modifyTableFields tableModification
+       { _dvrDistroName = "distro_name"
+       , _dvrPkgName    = "pkg_name"
+       , _dvrVersion    = "version"
+       , _dvrUrl        = "url"
+       })
+
+distroDistrosTable :: DatabaseEntity Postgres DistroDb (TableEntity DistroDistroT)
+distroDistrosTable = _distroDistros distroDb
+
+distroMaintainersTable :: DatabaseEntity Postgres DistroDb (TableEntity DistroMaintainerT)
+distroMaintainersTable = _distroMaintainers distroDb
+
+distroVersionsTable :: DatabaseEntity Postgres DistroDb (TableEntity DistroVersionT)
+distroVersionsTable = _distroVersions distroDb
+
+loadDistros :: PgTx Acid.Distros
+loadDistros = do
+  distroRows <- beamTx $
+    runSelectReturningList $ select $ all_ distroDistrosTable
+  maintRows <- beamTx $
+    runSelectReturningList $ select $ all_ distroMaintainersTable
+  verRows <- beamTx $
+    runSelectReturningList $ select $ all_ distroVersionsTable
+
+  let -- Build Distributions (nameMap :: Map DistroName UserIdSet)
+      distNames = [ DistroName (T.unpack name) | DistroDistroRow name <- distroRows ]
+      maintMap = foldl' (\m (DistroMaintainerRow dname uid) ->
+                           let dn = DistroName (T.unpack dname)
+                               uidVal = Users.Types.UserId (fromIntegral uid)
+                           in Map.insertWith (<>) dn (Group.fromList [uidVal]) m)
+                        (Map.fromList [(dn, Group.empty) | dn <- distNames])
+                        maintRows
+      dists = Distributions { nameMap = maintMap }
+
+      -- Build DistroVersions
+      (pkgDistroMap', distroMap') = foldl' addVer (Map.empty, Map.empty) verRows
+      addVer (pdm, dm) (DistroVersionRow dname pkgN ver url) =
+        case (simpleParse (T.unpack pkgN), simpleParse (T.unpack ver)) of
+          (Just pkgName, Just version) ->
+            let dn = DistroName (T.unpack dname)
+                info = DistroPackageInfo version (T.unpack url)
+            in ( Map.insertWith Map.union pkgName (Map.singleton dn info) pdm
+               , Map.insertWith Set.union dn (Set.singleton pkgName) dm )
+          _ -> (pdm, dm)
+      versions = DistroVersions { packageDistroMap = pkgDistroMap', distroMap = distroMap' }
+
+  return $ Acid.Distros dists versions
+
+saveDistros :: Acid.Distros -> PgTx ()
+saveDistros (Acid.Distros dists versions) =
+  do
+    beamTx $ do
+      runDelete $ delete distroDistrosTable (\_ -> val_ True)
+      runDelete $ delete distroMaintainersTable (\_ -> val_ True)
+      runDelete $ delete distroVersionsTable (\_ -> val_ True)
+
+    -- Save distro names
+    let distroRows = [ DistroDistroRow (T.pack (display dn))
+                     | dn <- Map.keys (nameMap dists) ]
+    mapM_ (\chunk -> beamTx $
+      runInsert $ insert distroDistrosTable $ insertValues chunk)
+      (distroChunksOf 1000 distroRows)
+
+    -- Save maintainers
+    let maintRows = [ DistroMaintainerRow (T.pack (display dn)) (fromIntegral uid)
+                    | (dn, uidSet) <- Map.toList (nameMap dists)
+                    , Users.Types.UserId uid <- Group.toList uidSet ]
+    mapM_ (\chunk -> beamTx $
+      runInsert $ insert distroMaintainersTable $ insertValues chunk)
+      (distroChunksOf 1000 maintRows)
+
+    -- Save versions
+    let verRows = [ DistroVersionRow (T.pack (display dn)) (T.pack (display pkgName))
+                                     (T.pack (display (distroVersion info))) (T.pack (distroUrl info))
+                  | (pkgName, distMap) <- Map.toList (packageDistroMap versions)
+                  , (dn, info) <- Map.toList distMap ]
+    mapM_ (\chunk -> beamTx $
+      runInsert $ insert distroVersionsTable $ insertValues chunk)
+      (distroChunksOf 1000 verRows)
+
+distroChunksOf :: Int -> [a] -> [[a]]
+distroChunksOf _ [] = []
+distroChunksOf n xs = let (h, t) = splitAt n xs in h : distroChunksOf n t
+
+------------------------------------------------------------------------
+
+distrosStateComponent :: PgConnection -> IO (StateComponent AcidState Acid.Distros)
+distrosStateComponent serverPgConn = do
+  -- Load state
+  st <- runPgTx serverPgConn loadDistros
+
+  pgSt <- mkAcidState serverPgConn st saveDistros
   return StateComponent {
       stateDesc    = ""
-    , stateHandle  = st
-    , getState     = query st Acid.GetDistributions
-    , putState     = \(Acid.Distros dists versions) -> update st (Acid.ReplaceDistributions dists versions)
+    , stateHandle  = pgSt
+    , getState     = queryPg pgSt (runQueryEvent Acid.GetDistributions)
+    , putState     = \s -> do
+        runPgTx serverPgConn (saveDistros s)
+        _ <- swapMVar (pgMVar pgSt) s
+        return ()
     , backupState  = \_ -> dumpBackup
     , restoreState = restoreBackup
-    , resetState   = distrosStateComponent
+    , resetState   = \_ -> distrosStateComponent serverPgConn
     }
 
 distroFeature :: UserFeature

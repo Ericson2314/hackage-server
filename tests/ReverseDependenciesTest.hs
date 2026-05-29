@@ -543,7 +543,7 @@ getNotificationEmailsTests =
     genVersion = mkVersion <$> Gen.list (Range.linear 1 4) (Gen.int $ Range.linear 0 50)
     genPackageId = PackageIdentifier <$> genPackageName <*> genVersion
     genCabalFileText = CabalFileText <$> Gen.utf8 (Range.linear 0 50000) Gen.unicode
-    genNonExistentUserId = UserId <$> Gen.int (Range.linear (-1000) (-1))
+    genNonExistentUserId = UserId . fromIntegral <$> Gen.int (Range.linear (-1000) (-1))
     genOldUploadInfo = (,) <$> genUTCTime <*> genNonExistentUserId
     genUploadInfo = fmap fromOldUploadInfo genOldUploadInfo
     genTag = Tag <$> Gen.string (Range.linear 1 10) Gen.unicode
@@ -629,7 +629,7 @@ genDependencyTriggerBounds = Gen.enumBounded
 
 genUidPref :: MonadGen m => m (UserId, NotifyPref)
 genUidPref = do
-  uid <- UserId <$> Gen.int (Range.linear 0 100)
+  uid <- UserId . fromIntegral <$> Gen.int (Range.linear 0 100)
   pref <-
     NotifyPref
       <$> Gen.bool

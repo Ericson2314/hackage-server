@@ -1,7 +1,14 @@
-{-# LANGUAGE RankNTypes, NamedFieldPuns, RecordWildCards #-}
-{-# LANGUAGE DerivingStrategies #-}
-{-# LANGUAGE DeriveGeneric #-}
 {-# LANGUAGE DeriveAnyClass #-}
+{-# LANGUAGE DeriveGeneric #-}
+{-# LANGUAGE DerivingStrategies #-}
+{-# LANGUAGE FlexibleInstances #-}
+{-# LANGUAGE MultiParamTypeClasses #-}
+{-# LANGUAGE NamedFieldPuns #-}
+{-# LANGUAGE OverloadedStrings #-}
+{-# LANGUAGE RankNTypes #-}
+{-# LANGUAGE RecordWildCards #-}
+{-# LANGUAGE StandaloneDeriving #-}
+{-# LANGUAGE TypeFamilies #-}
 {-# OPTIONS_GHC -Wno-orphans #-}
 -- | Download counts
 --
@@ -37,17 +44,25 @@ import Distribution.Server.Features.Core
 import Distribution.Server.Features.Users
 
 import Distribution.Package
-import Distribution.Server.Util.CountingMap (cmFromCSV, cmToList)
+import Distribution.Text (display, simpleParse)
+import Distribution.Server.Util.CountingMap (cmFromCSV, cmToList, cmInsert, cmEmpty)
 
 import Data.Time.Calendar (Day, addDays)
 import Data.Time.Clock (getCurrentTime, utctDay)
 import Control.Concurrent.Chan
 import Control.Concurrent (forkIO)
 import GHC.Generics (Generic)
+import           Data.Int (Int32)
 import Data.Aeson (ToJSON)
 import qualified Data.Aeson as Aeson
-import Data.List (sortBy)
+import Data.List (foldl', sortBy)
 import Data.Function (on)
+import qualified Data.Text as T
+
+import Database.Beam
+import Database.Beam.Postgres
+import qualified Database.PostgreSQL.Simple as PG
+import Control.Concurrent.MVar (swapMVar)
 
 data DownloadFeature = DownloadFeature {
     downloadFeatureInterface :: HackageFeature
@@ -73,8 +88,8 @@ data PackageDownloads = PackageDownloads {
 
 initDownloadFeature :: ServerEnv
                     -> IO (CoreFeature -> UserFeature -> IO DownloadFeature)
-initDownloadFeature serverEnv@ServerEnv{serverStateDir} = do
-    inMemState     <- inMemStateComponent  serverStateDir
+initDownloadFeature serverEnv@ServerEnv{serverStateDir, serverPgConn} = do
+    inMemState     <- inMemStateComponent  serverPgConn
     let onDiskState = onDiskStateComponent serverStateDir
     (recentDownloads,
      totalDownloads) <- computeRecentAndTotalDownloads =<< getState onDiskState
@@ -89,18 +104,127 @@ initDownloadFeature serverEnv@ServerEnv{serverStateDir} = do
       registerHook (packageDownloadHook core) (writeChan downChan)
       return feature
 
-inMemStateComponent :: FilePath -> IO (StateComponent AcidState InMemStats)
-inMemStateComponent stateDir = do
+------------------------------------------------------------------------
+-- Beam tables
+--
+
+data DlCountT f = DlCountRow
+  { _dcPkgName    :: C f T.Text
+  , _dcPkgVersion :: C f T.Text
+  , _dcCount      :: C f Int32
+  } deriving (Generic, Beamable)
+
+instance Table DlCountT where
+  data PrimaryKey DlCountT f =
+    DlCountId (C f T.Text) (C f T.Text)
+    deriving (Generic, Beamable)
+  primaryKey r = DlCountId (_dcPkgName r) (_dcPkgVersion r)
+
+deriving instance Show (DlCountT Identity)
+
+data DlMetaT f = DlMetaRow
+  { _dmToday :: C f Day
+  } deriving (Generic, Beamable)
+
+instance Table DlMetaT where
+  data PrimaryKey DlMetaT f =
+    DlMetaId (C f Day)
+    deriving (Generic, Beamable)
+  primaryKey r = DlMetaId (_dmToday r)
+
+deriving instance Show (DlMetaT Identity)
+
+data DlDb f = DlDb
+  { _dlCounts :: f (TableEntity DlCountT)
+  , _dlMeta   :: f (TableEntity DlMetaT)
+  } deriving (Generic, Database Postgres)
+
+dlDb :: DatabaseSettings Postgres DlDb
+dlDb = defaultDbSettings `withDbModification`
+  DlDb
+    (setEntityName "download_count__inmem" <>
+     modifyTableFields tableModification
+       { _dcPkgName    = "pkg_name"
+       , _dcPkgVersion = "pkg_version"
+       , _dcCount      = "count"
+       })
+    (setEntityName "download_count__meta" <>
+     modifyTableFields tableModification
+       { _dmToday = "today"
+       })
+
+dlCountsTable :: DatabaseEntity Postgres DlDb (TableEntity DlCountT)
+dlCountsTable = _dlCounts dlDb
+
+dlMetaTable :: DatabaseEntity Postgres DlDb (TableEntity DlMetaT)
+dlMetaTable = _dlMeta dlDb
+
+loadInMemStats :: PgTx InMemStats
+loadInMemStats = do
+  metaRows <- beamTx $
+    runSelectReturningList $ select $ all_ dlMetaTable
+  countRows <- beamTx $
+    runSelectReturningList $ select $ all_ dlCountsTable
+  let today = case metaRows of
+        (DlMetaRow d : _) -> d
+        [] -> error "download_count__meta table empty"
+      counts = foldl' (\m (DlCountRow pkgN verT cnt) ->
+                         case (simpleParse (T.unpack pkgN), simpleParse (T.unpack verT)) of
+                           (Just pn, Just pv) ->
+                             let pkgId = PackageIdentifier pn pv
+                             in cmInsert pkgId (fromIntegral cnt) m
+                           _ -> m)
+                       cmEmpty countRows
+  return $ InMemStats today counts
+
+saveInMemStats :: InMemStats -> PgTx ()
+saveInMemStats (InMemStats today counts) =
+  do
+    beamTx $ do
+      runDelete $ delete dlCountsTable (\_ -> val_ True)
+      runDelete $ delete dlMetaTable (\_ -> val_ True)
+    let rows = [ DlCountRow (T.pack $ display (Distribution.Package.packageName pkgId))
+                             (T.pack $ display (packageVersion pkgId))
+                             (fromIntegral cnt)
+               | (pkgId, cnt) <- cmToList counts ]
+    mapM_ (\chunk -> beamTx $
+      runInsert $ insert dlCountsTable $ insertValues chunk)
+      (dlChunksOf 1000 rows)
+    beamTx $
+      runInsert $ insert dlMetaTable $ insertValues [DlMetaRow today]
+
+dlChunksOf :: Int -> [a] -> [[a]]
+dlChunksOf _ [] = []
+dlChunksOf n xs = let (h, t) = splitAt n xs in h : dlChunksOf n t
+
+------------------------------------------------------------------------
+
+inMemStateComponent :: PgConnection -> IO (StateComponent AcidState InMemStats)
+inMemStateComponent serverPgConn = do
+  -- Seed meta if empty
+  metaRows <- runBeamPg serverPgConn $
+    runSelectReturningList $ select $ all_ dlMetaTable
   initSt <- initInMemStats <$> getToday
-  st <- openLocalStateFrom (dcPath stateDir </> "inmem") initSt
+  case metaRows of
+    [] -> runBeamPg serverPgConn $
+      runInsert $ insert dlMetaTable $ insertValues [DlMetaRow (inMemToday initSt)]
+    _ -> return ()
+
+  -- Load state
+  st <- runPgTx serverPgConn loadInMemStats
+
+  pgSt <- mkAcidState serverPgConn st saveInMemStats
   return StateComponent {
       stateDesc    = "Today's download counts"
-    , stateHandle  = st
-    , getState     = query st GetInMemStats
-    , putState     = update st . ReplaceInMemStats
+    , stateHandle  = pgSt
+    , getState     = queryPg pgSt (runQueryEvent GetInMemStats)
+    , putState     = \s -> do
+        runPgTx serverPgConn (saveInMemStats s)
+        _ <- swapMVar (pgMVar pgSt) s
+        return ()
     , backupState  = \_ -> inMemBackup
     , restoreState = inMemRestore
-    , resetState   = inMemStateComponent
+    , resetState   = \_ -> inMemStateComponent serverPgConn
     }
 
 onDiskStateComponent :: FilePath -> StateComponent OnDiskState OnDiskStats
@@ -167,7 +291,7 @@ downloadFeature CoreFeature{}
     registerDownloads = forever $ do
         pkg    <- readChan downloadStream
         today  <- getToday
-        today' <- query (stateHandle inMemState) RecordedToday
+        today' <- queryPg (stateHandle inMemState) (runQueryEvent RecordedToday)
 
         --TODO: do this asyncronously rather than blocking this request
         when (today /= today') $ do

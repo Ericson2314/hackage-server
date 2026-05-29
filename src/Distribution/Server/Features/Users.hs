@@ -1,5 +1,11 @@
+{-# LANGUAGE DeriveAnyClass #-}
+{-# LANGUAGE DeriveGeneric #-}
+{-# LANGUAGE FlexibleInstances #-}
+{-# LANGUAGE MultiParamTypeClasses #-}
 {-# LANGUAGE RankNTypes, NamedFieldPuns, RecordWildCards, RecursiveDo,
              BangPatterns, OverloadedStrings, TemplateHaskell, FlexibleContexts #-}
+{-# LANGUAGE StandaloneDeriving #-}
+{-# LANGUAGE TypeFamilies #-}
 {-# OPTIONS_GHC -fno-warn-orphans #-}
 module Distribution.Server.Features.Users (
     initUserFeature,
@@ -15,6 +21,7 @@ import Distribution.Server.Framework.Templating
 import qualified Distribution.Server.Framework.Auth as Auth
 
 import Distribution.Server.Users.Types
+import Distribution.Server.Users.AuthToken (renderAuthToken, parseAuthToken)
 import qualified Distribution.Server.Users.State as Acid
 import Distribution.Server.Users.Backup
 import qualified Distribution.Server.Users.Users as Acid
@@ -28,6 +35,7 @@ import Data.Map (Map)
 import qualified Data.Map as Map
 import Data.Set (Set)
 import qualified Data.Set as Set
+import Data.List (foldl')
 import Data.Maybe (fromMaybe)
 import Data.Function (fix)
 import Control.Applicative (optional)
@@ -38,6 +46,13 @@ import qualified Data.Text as T
 import Distribution.Text (display, simpleParse)
 
 import Happstack.Server.Cookie (addCookie, mkCookie, CookieLife(Session))
+
+import GHC.Generics (Generic)
+import Data.Int (Int32)
+import Database.Beam
+import Database.Beam.Postgres
+import Control.Concurrent.MVar (swapMVar)
+import qualified Database.PostgreSQL.Simple as PG
 
 -- | A feature to allow manipulation of the database of users.
 --
@@ -228,10 +243,10 @@ deriveJSON (compatAesonOptionsDropPrefix "ui_")  ''UserGroupResource
 
 -- TODO: add renaming
 initUserFeature :: ServerEnv -> IO (IO UserFeature)
-initUserFeature serverEnv@ServerEnv{serverStateDir, serverTemplatesDir, serverTemplatesMode} = do
+initUserFeature serverEnv@ServerEnv{serverStateDir, serverPgConn, serverTemplatesDir, serverTemplatesMode} = do
   -- Canonical state
-  usersState  <- usersStateComponent  serverStateDir
-  adminsState <- adminsStateComponent serverStateDir
+  usersState  <- usersStateComponent  serverPgConn
+  adminsState <- adminsStateComponent serverPgConn
 
   -- Ephemeral state
   groupIndex   <- newMemStateWHNF emptyGroupIndex
@@ -268,30 +283,215 @@ initUserFeature serverEnv@ServerEnv{serverStateDir, serverTemplatesDir, serverTe
 
     return feature
 
-usersStateComponent :: FilePath -> IO (StateComponent AcidState Acid.Users)
-usersStateComponent stateDir = do
-  st <- openLocalStateFrom (stateDir </> "db" </> "Users") Acid.initialUsers
+------------------------------------------------------------------------
+-- Beam tables for Users
+
+-- User accounts table
+data UserAccountT f = UserAccountRow
+  { _uaUserId   :: C f Int32
+  , _uaUserName :: C f T.Text
+  , _uaStatus   :: C f T.Text
+  , _uaAuthHash :: C f (Maybe T.Text)
+  } deriving (Generic, Beamable)
+
+instance Table UserAccountT where
+  data PrimaryKey UserAccountT f =
+    UserAccountId (C f Int32)
+    deriving (Generic, Beamable)
+  primaryKey r = UserAccountId (_uaUserId r)
+
+deriving instance Show (UserAccountT Identity)
+
+-- User tokens table
+data UserTokenT f = UserTokenRow
+  { _utUserId      :: C f Int32
+  , _utToken       :: C f T.Text
+  , _utDescription :: C f T.Text
+  } deriving (Generic, Beamable)
+
+instance Table UserTokenT where
+  data PrimaryKey UserTokenT f =
+    UserTokenId (C f Int32) (C f T.Text)
+    deriving (Generic, Beamable)
+  primaryKey r = UserTokenId (_utUserId r) (_utToken r)
+
+deriving instance Show (UserTokenT Identity)
+
+-- Admin table
+data AdminT f = AdminRow
+  { _adUserId :: C f Int32
+  } deriving (Generic, Beamable)
+
+instance Table AdminT where
+  data PrimaryKey AdminT f =
+    AdminId (C f Int32)
+    deriving (Generic, Beamable)
+  primaryKey r = AdminId (_adUserId r)
+
+deriving instance Show (AdminT Identity)
+
+data UsersDb f = UsersDb
+  { _usersAccounts :: f (TableEntity UserAccountT)
+  , _usersTokens   :: f (TableEntity UserTokenT)
+  , _usersAdmins   :: f (TableEntity AdminT)
+  } deriving (Generic, Database Postgres)
+
+usersDb :: DatabaseSettings Postgres UsersDb
+usersDb = defaultDbSettings `withDbModification`
+  UsersDb
+    (setEntityName "users__accounts" <>
+     modifyTableFields tableModification
+       { _uaUserId   = "user_id"
+       , _uaUserName = "user_name"
+       , _uaStatus   = "user_status"
+       , _uaAuthHash = "auth_hash"
+       })
+    (setEntityName "users__tokens" <>
+     modifyTableFields tableModification
+       { _utUserId      = "user_id"
+       , _utToken       = "token"
+       , _utDescription = "description"
+       })
+    (setEntityName "users__admins" <>
+     modifyTableFields tableModification
+       { _adUserId = "user_id"
+       })
+
+userAccountsTable :: DatabaseEntity Postgres UsersDb (TableEntity UserAccountT)
+userAccountsTable = _usersAccounts usersDb
+
+userTokensTable :: DatabaseEntity Postgres UsersDb (TableEntity UserTokenT)
+userTokensTable = _usersTokens usersDb
+
+adminsTable :: DatabaseEntity Postgres UsersDb (TableEntity AdminT)
+adminsTable = _usersAdmins usersDb
+
+------------------------------------------------------------------------
+-- Load/save Users
+
+statusToText :: UserStatus -> T.Text
+statusToText (AccountEnabled _)  = "enabled"
+statusToText (AccountDisabled _) = "disabled"
+statusToText AccountDeleted      = "deleted"
+
+authHashFromStatus :: UserStatus -> Maybe T.Text
+authHashFromStatus (AccountEnabled (UserAuth (PasswdHash h)))  = Just (T.pack h)
+authHashFromStatus (AccountDisabled (Just (UserAuth (PasswdHash h)))) = Just (T.pack h)
+authHashFromStatus _ = Nothing
+
+textToStatus :: T.Text -> Maybe T.Text -> UserStatus
+textToStatus "enabled"  (Just h) = AccountEnabled (UserAuth (PasswdHash (T.unpack h)))
+textToStatus "enabled"  Nothing  = AccountEnabled (UserAuth (PasswdHash ""))
+textToStatus "disabled" mh       = AccountDisabled (fmap (\h -> UserAuth (PasswdHash (T.unpack h))) mh)
+textToStatus _          _        = AccountDeleted
+
+loadUsers :: PgTx Acid.Users
+loadUsers = do
+  accountRows <- beamTx $
+    runSelectReturningList $ select $ all_ userAccountsTable
+  tokenRows <- beamTx $
+    runSelectReturningList $ select $ all_ userTokensTable
+
+  -- Build token map per user
+  let tokensByUser = foldl' addToken IntMap.empty tokenRows
+      addToken acc (UserTokenRow uid tok desc) =
+        case parseAuthToken tok of
+          Right authTok ->
+            IntMap.insertWith Map.union (fromIntegral uid) (Map.singleton authTok desc) acc
+          Left _ -> acc
+
+  -- Build Users from account rows using insertUserAccount
+  -- insertUserAccount handles nextId computation automatically
+  let users = foldl' (addAccount tokensByUser) Acid.emptyUsers accountRows
+  return users
+  where
+    addAccount tokensByUser acc (UserAccountRow uid name status mhash) =
+      let uname = UserName (T.unpack name)
+          ustatus = textToStatus status mhash
+          tokens = IntMap.findWithDefault Map.empty (fromIntegral uid) tokensByUser
+          uinfo = UserInfo { userName = uname, userStatus = ustatus, userTokens = tokens }
+      in case Acid.insertUserAccount (UserId (fromIntegral uid)) uinfo acc of
+           Right u -> u
+           Left _  -> acc  -- skip duplicates
+
+saveUsers :: Acid.Users -> PgTx ()
+saveUsers users = do
+    beamTx $ runDelete $ delete userAccountsTable (\_ -> val_ True)
+    beamTx $ runDelete $ delete userTokensTable (\_ -> val_ True)
+
+    let allUsers = Acid.enumerateAllUsers users
+        accountRows =
+          [ UserAccountRow (fromIntegral uid) (T.pack $ (\(UserName n) -> n) (userName uinfo))
+                           (statusToText (userStatus uinfo))
+                           (authHashFromStatus (userStatus uinfo))
+          | (UserId uid, uinfo) <- allUsers ]
+    mapM_ (\chunk -> beamTx $
+      runInsert $ insert userAccountsTable $ insertValues chunk) (chunksOf 1000 accountRows)
+
+    let tokenRows =
+          [ UserTokenRow (fromIntegral uid) (renderAuthToken tok) desc
+          | (UserId uid, uinfo) <- allUsers
+          , (tok, desc) <- Map.toList (userTokens uinfo) ]
+    mapM_ (\chunk -> beamTx $
+      runInsert $ insert userTokensTable $ insertValues chunk) (chunksOf 1000 tokenRows)
+
+------------------------------------------------------------------------
+-- Load/save Admins
+
+loadAdmins :: PgTx Acid.HackageAdmins
+loadAdmins = do
+  rows <- beamTx $
+    runSelectReturningList $ select $ all_ adminsTable
+  let uids = [ UserId (fromIntegral uid) | AdminRow uid <- rows ]
+  return $ Acid.HackageAdmins (Group.fromList uids)
+
+saveAdmins :: Acid.HackageAdmins -> PgTx ()
+saveAdmins (Acid.HackageAdmins admins) = do
+    beamTx $ runDelete $ delete adminsTable (\_ -> val_ True)
+    let rows = [ AdminRow (fromIntegral uid) | UserId uid <- Group.toList admins ]
+    mapM_ (\chunk -> beamTx $
+      runInsert $ insert adminsTable $ insertValues chunk) (chunksOf 1000 rows)
+
+chunksOf :: Int -> [a] -> [[a]]
+chunksOf _ [] = []
+chunksOf n xs = let (h, t) = splitAt n xs in h : chunksOf n t
+
+------------------------------------------------------------------------
+
+usersStateComponent :: PgConnection -> IO (StateComponent AcidState Acid.Users)
+usersStateComponent serverPgConn = do
+  st <- runPgTx serverPgConn loadUsers
+
+  pgSt <- mkAcidState serverPgConn st saveUsers
   return StateComponent {
       stateDesc    = "List of users"
-    , stateHandle  = st
-    , getState     = query st Acid.GetUserDb
-    , putState     = update st . Acid.ReplaceUserDb
+    , stateHandle  = pgSt
+    , getState     = queryPg pgSt (runQueryEvent Acid.GetUserDb)
+    , putState     = \s -> do
+        runPgTx serverPgConn (saveUsers s)
+        _ <- swapMVar (pgMVar pgSt) s
+        return ()
     , backupState  = usersBackup
     , restoreState = usersRestore
-    , resetState   = usersStateComponent
+    , resetState   = \_ -> usersStateComponent serverPgConn
     }
 
-adminsStateComponent :: FilePath -> IO (StateComponent AcidState Acid.HackageAdmins)
-adminsStateComponent stateDir = do
-  st <- openLocalStateFrom (stateDir </> "db" </> "HackageAdmins") Acid.initialHackageAdmins
+adminsStateComponent :: PgConnection -> IO (StateComponent AcidState Acid.HackageAdmins)
+adminsStateComponent serverPgConn = do
+  st <- runPgTx serverPgConn loadAdmins
+
+  pgSt <- mkAcidState serverPgConn st saveAdmins
   return StateComponent {
       stateDesc    = "Admins"
-    , stateHandle  = st
-    , getState     = query st Acid.GetHackageAdmins
-    , putState     = update st . Acid.ReplaceHackageAdmins . Acid.adminList
+    , stateHandle  = pgSt
+    , getState     = queryPg pgSt (runQueryEvent Acid.GetHackageAdmins)
+    , putState     = \s -> do
+        runPgTx serverPgConn (saveAdmins s)
+        _ <- swapMVar (pgMVar pgSt) s
+        return ()
     , backupState  = \_ (Acid.HackageAdmins admins) -> [csvToBackup ["admins.csv"] (groupToCSV admins)]
     , restoreState = Acid.HackageAdmins <$> groupBackup ["admins.csv"]
-    , resetState   = adminsStateComponent
+    , resetState   = \_ -> adminsStateComponent serverPgConn
     }
 
 userFeature :: Templates
@@ -927,14 +1127,14 @@ userFeature templates usersState adminsState
     addGroupIndex (UserId uid) uri desc =
         modifyMemState groupIndex $
           adjustGroupIndex
-            (IntMap.insertWith Set.union uid (Set.singleton uri))
+            (IntMap.insertWith Set.union (fromIntegral uid) (Set.singleton uri))
             (Map.insert uri desc)
 
     removeGroupIndex :: MonadIO m => UserId -> String -> m ()
     removeGroupIndex (UserId uid) uri =
         modifyMemState groupIndex $
           adjustGroupIndex
-            (IntMap.update (keepSet . Set.delete uri) uid)
+            (IntMap.update (keepSet . Set.delete uri) (fromIntegral uid))
             id
       where
         keepSet m = if Set.null m then Nothing else Just m
@@ -946,11 +1146,11 @@ userFeature templates usersState adminsState
             (IntMap.unionWith Set.union (IntMap.fromList . map mkEntry $ Group.toList ulist))
             (Map.insert uri desc)
       where
-        mkEntry (UserId uid) = (uid, Set.singleton uri)
+        mkEntry (UserId uid) = (fromIntegral uid, Set.singleton uri)
 
     getGroupIndex :: (Functor m, MonadIO m) => UserId -> m [String]
     getGroupIndex (UserId uid) =
-      liftM (maybe [] Set.toList . IntMap.lookup uid . usersToGroupUri) $ readMemState groupIndex
+      liftM (maybe [] Set.toList . IntMap.lookup (fromIntegral uid) . usersToGroupUri) $ readMemState groupIndex
 
     getIndexDesc :: MonadIO m => String -> m GroupDescription
     getIndexDesc uri =

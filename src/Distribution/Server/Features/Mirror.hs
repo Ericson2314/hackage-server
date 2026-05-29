@@ -1,5 +1,11 @@
+{-# LANGUAGE DeriveAnyClass #-}
+{-# LANGUAGE DeriveGeneric #-}
+{-# LANGUAGE FlexibleInstances #-}
+{-# LANGUAGE MultiParamTypeClasses #-}
 {-# LANGUAGE RecursiveDo, RankNTypes, ScopedTypeVariables,
-             NamedFieldPuns, RecordWildCards #-}
+             NamedFieldPuns, RecordWildCards, OverloadedStrings #-}
+{-# LANGUAGE StandaloneDeriving #-}
+{-# LANGUAGE TypeFamilies #-}
 module Distribution.Server.Features.Mirror (
     MirrorFeature(..),
     MirrorResource(..),
@@ -20,6 +26,7 @@ import Distribution.Server.Users.Backup
 import Distribution.Server.Users.Types
 import Distribution.Server.Users.Users hiding (lookupUserName)
 import Distribution.Server.Users.Group (UserGroup(..), GroupDescription(..), nullDescription)
+import qualified Distribution.Server.Users.Group as Group
 import qualified Distribution.Server.Framework.BlobStorage as BlobStorage
 import qualified Distribution.Server.Packages.Unpack as Upload
 import Distribution.Server.Framework.BackupDump
@@ -36,6 +43,14 @@ import qualified Distribution.Server.Util.GZip as GZip
 
 import Distribution.Package
 import Distribution.Text
+
+import GHC.Generics (Generic)
+import Data.Int (Int32)
+import Database.Beam
+import Database.Beam.Postgres
+import Control.Concurrent.MVar (swapMVar)
+import qualified Database.PostgreSQL.Simple as PG
+import qualified Data.Text as T
 
 
 data MirrorFeature = MirrorFeature {
@@ -60,9 +75,9 @@ initMirrorFeature :: ServerEnv
                   -> IO (CoreFeature
                       -> UserFeature
                       -> IO MirrorFeature)
-initMirrorFeature env@ServerEnv{serverStateDir} = do
+initMirrorFeature env@ServerEnv{serverPgConn} = do
     -- Canonical state
-    mirrorersState <- mirrorersStateComponent serverStateDir
+    mirrorersState <- mirrorersStateComponent serverPgConn
 
     return $ \core user@UserFeature{..} -> do
       -- Tie the knot with a do-rec
@@ -74,17 +89,74 @@ initMirrorFeature env@ServerEnv{serverStateDir} = do
 
       return feature
 
-mirrorersStateComponent :: FilePath -> IO (StateComponent AcidState MirrorClients)
-mirrorersStateComponent stateDir = do
-  st <- openLocalStateFrom (stateDir </> "db" </> "MirrorClients") initialMirrorClients
+------------------------------------------------------------------------
+-- Beam table: mirror clients
+
+data MirrorClientT f = MirrorClientRow
+  { _mcUserId :: C f Int32
+  } deriving (Generic, Beamable)
+
+instance Table MirrorClientT where
+  data PrimaryKey MirrorClientT f =
+    MirrorClientId (C f Int32)
+    deriving (Generic, Beamable)
+  primaryKey r = MirrorClientId (_mcUserId r)
+
+deriving instance Show (MirrorClientT Identity)
+
+data MirrorDb f = MirrorDb
+  { _mirrorClients :: f (TableEntity MirrorClientT)
+  } deriving (Generic, Database Postgres)
+
+mirrorDb :: DatabaseSettings Postgres MirrorDb
+mirrorDb = defaultDbSettings `withDbModification`
+  MirrorDb (setEntityName "mirror__clients" <>
+            modifyTableFields tableModification
+              { _mcUserId = "user_id"
+              })
+
+mirrorClientsTable :: DatabaseEntity Postgres MirrorDb (TableEntity MirrorClientT)
+mirrorClientsTable = _mirrorClients mirrorDb
+
+loadMirrorClients :: PgTx MirrorClients
+loadMirrorClients = do
+  rows <- beamTx $
+    runSelectReturningList $ select $ all_ mirrorClientsTable
+  let uids = [ UserId (fromIntegral uid) | MirrorClientRow uid <- rows ]
+  return $ MirrorClients (Group.fromList uids)
+
+saveMirrorClients :: MirrorClients -> PgTx ()
+saveMirrorClients (MirrorClients clients) =
+  do
+    beamTx $
+      runDelete $ delete mirrorClientsTable (\_ -> val_ True)
+    let rows = [ MirrorClientRow (fromIntegral uid) | UserId uid <- Group.toList clients ]
+    mapM_ (\chunk -> beamTx $
+      runInsert $ insert mirrorClientsTable $ insertValues chunk) (chunksOf 1000 rows)
+
+chunksOf :: Int -> [a] -> [[a]]
+chunksOf _ [] = []
+chunksOf n xs = let (h, t) = splitAt n xs in h : chunksOf n t
+
+------------------------------------------------------------------------
+
+mirrorersStateComponent :: PgConnection -> IO (StateComponent AcidState MirrorClients)
+mirrorersStateComponent serverPgConn = do
+  -- Load state
+  st <- runPgTx serverPgConn loadMirrorClients
+
+  pgSt <- mkAcidState serverPgConn st saveMirrorClients
   return StateComponent {
       stateDesc    = "Mirror clients"
-    , stateHandle  = st
-    , getState     = query st GetMirrorClients
-    , putState     = update st . ReplaceMirrorClients . mirrorClients
+    , stateHandle  = pgSt
+    , getState     = queryPg pgSt (runQueryEvent GetMirrorClients)
+    , putState     = \s -> do
+        runPgTx serverPgConn (saveMirrorClients s)
+        _ <- swapMVar (pgMVar pgSt) s
+        return ()
     , backupState  = \_ (MirrorClients clients) -> [csvToBackup ["clients.csv"] $ groupToCSV clients]
     , restoreState = MirrorClients <$> groupBackup ["clients.csv"]
-    , resetState   = mirrorersStateComponent
+    , resetState   = \_ -> mirrorersStateComponent serverPgConn
     }
 
 mirrorFeature :: ServerEnv

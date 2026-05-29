@@ -37,11 +37,18 @@ import qualified HttpUtils as Http
 import qualified Paths_hackage_server as Paths
 
 withServerRunning :: FilePath -> IO () -> IO ()
-withServerRunning root f
+withServerRunning root f =
+    withTempPostgres $ \cluster ->
+      withFreshDb cluster "hackage_test" $ \connStr ->
+        withServerRunning' root connStr f
+
+-- | Like 'withServerRunning' but uses an already-running PostgreSQL instance.
+withServerRunning' :: FilePath -> String -> IO () -> IO ()
+withServerRunning' root connStr f
     = do info "Forking server thread"
          mv <- newEmptyMVar
          bracket (forkIO (do info "Server thread started"
-                             void $ runServer root serverRunningArgs
+                             void $ runServer root (serverRunningArgs connStr)
                           `finally` putMVar mv ()))
                  (\t -> do killThread t
                            takeMVar mv
@@ -51,14 +58,86 @@ withServerRunning root f
                            f
                            info "Finished with server")
 
-serverRunningArgs :: [String]
-serverRunningArgs =
+-- | Start a temporary PostgreSQL cluster for testing.
+-- The cluster runs for the duration of the action.
+-- Use 'withFreshDb' inside to create/reset databases.
+withTempPostgres :: (PgCluster -> IO a) -> IO a
+withTempPostgres action = do
+    cwd <- getCurrentDirectory
+    let pgdata = cwd </> "pgdata"
+        socketDir = cwd
+    -- Find PostgreSQL executables
+    initdbPath    <- findExe "initdb"
+    pgctlPath     <- findExe "pg_ctl"
+    pgisreadyPath <- findExe "pg_isready"
+    createdbPath  <- findExe "createdb"
+    dropdbPath    <- findExe "dropdb"
+    -- Initialize the cluster
+    info "Initialising temporary PostgreSQL cluster"
+    initEc <- run initdbPath ["-D", pgdata, "--no-locale", "-E", "UTF8"]
+    case initEc of
+      Just ExitSuccess -> return ()
+      _ -> die "initdb failed"
+    -- Enable query logging
+    appendFile (pgdata </> "postgresql.conf") "\nlog_statement = 'all'\n"
+    -- Start PostgreSQL
+    info "Starting temporary PostgreSQL"
+    startEc <- run pgctlPath ["-D", pgdata, "-l", pgdata </> "log",
+                               "-o", "-k " ++ socketDir ++ " -h ''",
+                               "start"]
+    case startEc of
+      Just ExitSuccess -> return ()
+      _ -> die "pg_ctl start failed"
+    -- Wait for PostgreSQL to be ready
+    let waitPg n = do
+          ec <- run pgisreadyPath ["-h", socketDir]
+          case ec of
+            Just ExitSuccess -> info "PostgreSQL is ready"
+            _ | n <= (0 :: Int) -> die "PostgreSQL didn't start"
+              | otherwise -> do
+                  info "Waiting for PostgreSQL..."
+                  threadDelay 500000
+                  waitPg (n - 1)
+    waitPg 20
+    let cluster = PgCluster socketDir createdbPath dropdbPath
+    -- Run the action, then stop PostgreSQL
+    action cluster
+      `onException` do
+        info "PostgreSQL log on failure:"
+        readFile (pgdata </> "log") >>= putStr
+      `finally` do
+        info "Stopping temporary PostgreSQL"
+        void $ run pgctlPath ["-D", pgdata, "stop", "-m", "immediate"]
+  where
+    findExe name = findExecutable name >>= maybe (die (name ++ " not found in PATH")) return
+
+-- | Handle for a running PostgreSQL cluster.
+data PgCluster = PgCluster
+  { pgSocketDir   :: FilePath
+  , pgCreatedbExe :: FilePath
+  , pgDropdbExe   :: FilePath
+  }
+
+-- | Create a fresh database, run the action, then drop it.
+-- Returns the connection string for use with @--db-conn-str@.
+withFreshDb :: PgCluster -> String -> (String -> IO a) -> IO a
+withFreshDb cluster dbName action = do
+    info $ "Creating database " ++ dbName
+    void $ run (pgCreatedbExe cluster) ["-h", pgSocketDir cluster, dbName]
+    let connStr = "host=" ++ pgSocketDir cluster ++ " dbname=" ++ dbName
+    action connStr `finally` do
+      info $ "Dropping database " ++ dbName
+      void $ run (pgDropdbExe cluster) ["-h", pgSocketDir cluster, "--force", dbName]
+
+serverRunningArgs :: String -> [String]
+serverRunningArgs connStr =
   ["run", "--ip", "127.0.0.1"
   , "--port", show testPort
   , "--delay-cache-updates", "0"
   , "--base-uri", "http://127.0.0.1:" <> show testPort
   , "--user-content-uri", "http://localhost:" <> show testPort
   , "--required-base-host-header", "127.0.0.1:" <> show testPort
+  , "--db-conn-str", connStr
   ]
 
 waitForServer :: IO ()
@@ -78,8 +157,12 @@ waitForServer = f 10
                               f (n - 1)
 
 createBackup :: FilePath -> FilePath -> FilePath -> IO FilePath
-createBackup testName root suffix = do
-    runServerChecked root ["backup", "-o", root </> "tests" </> testName </> suffix]
+createBackup = createBackup' ""
+
+createBackup' :: String -> FilePath -> FilePath -> FilePath -> IO FilePath
+createBackup' connStr testName root suffix = do
+    runServerChecked root (["backup", "-o", root </> "tests" </> testName </> suffix]
+                          ++ if null connStr then [] else ["--db-conn-str", connStr])
     findTarGz (root </> "tests" </> testName </> suffix)
   where
     findTarGz :: FilePath -> IO FilePath

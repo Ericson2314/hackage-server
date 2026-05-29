@@ -1,6 +1,14 @@
-{-# LANGUAGE RankNTypes, FlexibleContexts,
-             NamedFieldPuns, RecordWildCards, PatternGuards #-}
+{-# LANGUAGE DeriveAnyClass #-}
+{-# LANGUAGE DeriveGeneric #-}
+{-# LANGUAGE FlexibleContexts #-}
+{-# LANGUAGE FlexibleInstances #-}
 {-# LANGUAGE LambdaCase, MultiWayIf #-}
+{-# LANGUAGE MultiParamTypeClasses #-}
+{-# LANGUAGE NamedFieldPuns, RecordWildCards, PatternGuards #-}
+{-# LANGUAGE OverloadedStrings #-}
+{-# LANGUAGE RankNTypes #-}
+{-# LANGUAGE StandaloneDeriving #-}
+{-# LANGUAGE TypeFamilies #-}
 module Distribution.Server.Features.Documentation (
     DocumentationFeature(..),
     DocumentationResource(..),
@@ -20,7 +28,7 @@ import Distribution.Version (Version, nullVersion)
 
 import Distribution.Server.Framework.BackupRestore
 import qualified Distribution.Server.Framework.ResponseContentTypes as Resource
-import Distribution.Server.Framework.BlobStorage (BlobId)
+import Distribution.Server.Framework.BlobStorage (BlobId, blobMd5, readBlobId)
 import qualified Distribution.Server.Framework.BlobStorage as BlobStorage
 import qualified Distribution.Server.Util.ServeTarball as ServerTarball
 import qualified Distribution.Server.Util.DocMeta as DocMeta
@@ -41,6 +49,7 @@ import qualified Data.ByteString.Lazy.Search as BSL
 import qualified Data.ByteString.Char8 as BS
 import qualified Data.Map as Map
 import Data.Function (fix)
+import Data.List (foldl')
 
 import Data.Aeson (toJSON)
 import Data.Maybe
@@ -50,6 +59,13 @@ import System.Directory (getModificationTime)
 import Control.Applicative
 import Distribution.Server.Features.PreferredVersions
 import Distribution.Server.Packages.Types
+
+import qualified Data.Text as T
+import GHC.Generics (Generic)
+import Database.Beam
+import Database.Beam.Postgres
+import Control.Concurrent.MVar (swapMVar)
+import qualified Database.PostgreSQL.Simple as PG
 -- TODO:
 -- 1. Write an HTML view for organizing uploads
 -- 2. Have cabal generate a standard doc tarball, and serve that here
@@ -96,9 +112,9 @@ initDocumentationFeature :: String
                              -> VersionsFeature
                              -> IO DocumentationFeature)
 initDocumentationFeature name
-                         env@ServerEnv{serverStateDir} = do
+                         env@ServerEnv{serverPgConn} = do
     -- Canonical state
-    documentationState <- documentationStateComponent name serverStateDir
+    documentationState <- documentationStateComponent name serverPgConn
 
     -- Hooks
     documentationChangeHook <- newHook
@@ -110,17 +126,90 @@ initDocumentationFeature name
                                          documentationChangeHook
       return feature
 
-documentationStateComponent :: String -> FilePath -> IO (StateComponent AcidState Acid.Documentation)
-documentationStateComponent name stateDir = do
-  st <- openLocalStateFrom (stateDir </> "db" </> name) Acid.initialDocumentation
+------------------------------------------------------------------------
+-- Beam table
+--
+
+data DocRowT f = DocRow
+  { _drPkgName    :: C f T.Text
+  , _drPkgVersion :: C f T.Text
+  , _drBlobId     :: C f T.Text
+  } deriving (Generic, Beamable)
+
+instance Table DocRowT where
+  data PrimaryKey DocRowT f =
+    DocRowId (C f T.Text) (C f T.Text)
+    deriving (Generic, Beamable)
+  primaryKey r = DocRowId (_drPkgName r) (_drPkgVersion r)
+
+deriving instance Show (DocRowT Identity)
+
+data DocDb f = DocDb
+  { _docRows :: f (TableEntity DocRowT)
+  } deriving (Generic, Database Postgres)
+
+docDb :: DatabaseSettings Postgres DocDb
+docDb = defaultDbSettings `withDbModification`
+  DocDb (setEntityName "documentation__docs" <>
+         modifyTableFields tableModification
+           { _drPkgName    = "pkg_name"
+           , _drPkgVersion = "pkg_version"
+           , _drBlobId     = "blob_id"
+           })
+
+docTable :: DatabaseEntity Postgres DocDb (TableEntity DocRowT)
+docTable = _docRows docDb
+
+loadDocumentation :: PgTx Acid.Documentation
+loadDocumentation = do
+  rows <- beamTx $
+    runSelectReturningList $ select $ all_ docTable
+  let addRow m (DocRow name ver blobHex) =
+        case (simpleParse (T.unpack name), simpleParse (T.unpack ver), readBlobId (T.unpack blobHex)) of
+          (Just pkgName, Just pkgVer, Right blobId) ->
+            Map.insert (PackageIdentifier pkgName pkgVer) blobId m
+          _ -> m  -- skip unparseable rows
+  return $ Acid.Documentation $ foldl' addRow Map.empty rows
+
+saveDocumentation :: Acid.Documentation -> PgTx ()
+saveDocumentation (Acid.Documentation docs) =
+  do
+    beamTx $
+      runDelete $ delete docTable (\_ -> val_ True)
+    let rows = [ DocRow (T.pack $ display (pkgName pkgid))
+                        (T.pack $ display (pkgVersion pkgid))
+                        (T.pack $ blobMd5 blob)
+               | (pkgid, blob) <- Map.toList docs ]
+    mapM_ insertDocChunk (chunksOf 1000 rows)
+
+insertDocChunk :: [DocRowT Identity] -> PgTx ()
+insertDocChunk chunk =
+  beamTx $
+    runInsert $ insert docTable $ insertValues chunk
+
+chunksOf :: Int -> [a] -> [[a]]
+chunksOf _ [] = []
+chunksOf n xs = let (h, t) = splitAt n xs in h : chunksOf n t
+
+------------------------------------------------------------------------
+
+documentationStateComponent :: String -> PgConnection -> IO (StateComponent AcidState Acid.Documentation)
+documentationStateComponent name serverPgConn = do
+  -- Load state
+  loaded <- runPgTx serverPgConn loadDocumentation
+
+  pgSt <- mkAcidState serverPgConn loaded saveDocumentation
   return StateComponent {
       stateDesc    = "Package documentation"
-    , stateHandle  = st
-    , getState     = query st Acid.GetDocumentation
-    , putState     = update st . Acid.ReplaceDocumentation
+    , stateHandle  = pgSt
+    , getState     = queryPg pgSt (runQueryEvent Acid.GetDocumentation)
+    , putState     = \s -> do
+        runPgTx serverPgConn (saveDocumentation s)
+        _ <- swapMVar (pgMVar pgSt) s
+        return ()
     , backupState  = \_ -> dumpBackup
     , restoreState = updateDocumentation (Acid.Documentation Map.empty)
-    , resetState   = documentationStateComponent name
+    , resetState   = \_ -> documentationStateComponent name serverPgConn
     }
   where
     dumpBackup doc =

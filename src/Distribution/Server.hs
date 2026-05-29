@@ -43,6 +43,9 @@ import qualified Distribution.Server.Users.Group as Group
 
 import Distribution.Text
 import Distribution.Verbosity as Verbosity
+import qualified Data.ByteString as BS
+import qualified Data.ByteString.Char8 as BS8
+import System.Environment (lookupEnv)
 
 import System.Directory (createDirectoryIfMissing, doesDirectoryExist)
 import Control.Concurrent
@@ -75,7 +78,8 @@ data ServerConfig = ServerConfig {
   confStaticDir :: FilePath,
   confTmpDir    :: FilePath,
   confCacheDelay:: Int,
-  confLiveTemplates :: Bool
+  confLiveTemplates :: Bool,
+  confDbConnStr :: BS.ByteString
 } deriving (Show)
 
 confDbStateDir, confBlobStoreDir :: ServerConfig -> FilePath
@@ -108,7 +112,8 @@ defaultServerConfig = do
     confStaticDir = dataDir,
     confTmpDir    = "state" </> "tmp",
     confCacheDelay= 0,
-    confLiveTemplates = False
+    confLiveTemplates = False,
+    confDbConnStr = BS8.pack "dbname=hackage"
   }
 
 data Server = Server {
@@ -128,7 +133,7 @@ hasSavedState = doesDirectoryExist . confDbStateDir
 mkServerEnv :: ServerConfig -> IO ServerEnv
 mkServerEnv config@(ServerConfig verbosity hostURI userContentURI requiredBaseHostHeader _
                                     stateDir _ tmpDir
-                                    cacheDelay liveTemplates) = do
+                                    cacheDelay liveTemplates dbConnStr) = do
     createDirectoryIfMissing False stateDir
     let blobStoreDir  = confBlobStoreDir   config
         staticDir     = confStaticFilesDir config
@@ -138,6 +143,12 @@ mkServerEnv config@(ServerConfig verbosity hostURI userContentURI requiredBaseHo
     store   <- BlobStorage.open blobStoreDir
     cron    <- newCron verbosity
     tufDir  <- Sec.makeAbsolute $ Sec.fromFilePath tufDir'
+    pgConn  <- connectPg dbConnStr
+
+    -- Execute schema DDL to ensure all tables exist
+    let schemaPath = confStaticDir config </> "schema.sql"
+    schemaFile <- readFile schemaPath
+    executeSchema pgConn schemaFile
 
     let env = ServerEnv {
             serverStaticDir     = staticDir,
@@ -153,7 +164,8 @@ mkServerEnv config@(ServerConfig verbosity hostURI userContentURI requiredBaseHo
             serverBaseURI       = hostURI,
             serverUserContentBaseURI = userContentURI,
             serverRequiredBaseHostHeader = requiredBaseHostHeader,
-            serverVerbosity     = verbosity
+            serverVerbosity     = verbosity,
+            serverPgConn        = pgConn
          }
     return env
 

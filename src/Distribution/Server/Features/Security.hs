@@ -1,5 +1,12 @@
-{-# LANGUAGE RecordWildCards #-}
-{-# LANGUAGE BangPatterns    #-}
+{-# LANGUAGE BangPatterns        #-}
+{-# LANGUAGE DeriveAnyClass      #-}
+{-# LANGUAGE DeriveGeneric       #-}
+{-# LANGUAGE FlexibleInstances   #-}
+{-# LANGUAGE MultiParamTypeClasses #-}
+{-# LANGUAGE OverloadedStrings   #-}
+{-# LANGUAGE RecordWildCards     #-}
+{-# LANGUAGE StandaloneDeriving  #-}
+{-# LANGUAGE TypeFamilies        #-}
 
 -- | TUF security features
 module Distribution.Server.Features.Security (
@@ -9,7 +16,21 @@ module Distribution.Server.Features.Security (
 -- Standard libraries
 import Control.Exception
 import Data.Time
+import qualified Data.ByteString as BS
 import qualified Data.ByteString.Lazy.Char8 as BS.Lazy
+import qualified Data.ByteString.Lazy as BSL
+import qualified Data.Text as T
+
+import GHC.Generics (Generic)
+import           Data.Int (Int32, Int64)
+import Database.Beam
+import Database.Beam.Backend.SQL.BeamExtensions (insertOnConflict, conflictingFields, onConflictUpdateAll)
+import Database.Beam.Postgres
+import qualified Database.PostgreSQL.Simple as PG
+import Control.Concurrent.MVar (swapMVar)
+import Data.SafeCopy (safeGet, safePut)
+import Data.Serialize.Get (runGetLazy)
+import Data.Serialize.Put (runPutLazy)
 
 -- Hackage
 import Distribution.Server.Features.Core
@@ -18,6 +39,7 @@ import Distribution.Server.Features.Security.Layout
 import Distribution.Server.Features.Security.ResponseContentTypes
 import Distribution.Server.Features.Security.State
 import Distribution.Server.Features.Security.FileInfo
+import Distribution.Server.Util.ReadDigest (readDigest)
 import Distribution.Server.Framework
 import Distribution.Server.Packages.Index
 import Distribution.Server.Packages.Types
@@ -37,7 +59,7 @@ instance IsHackageFeature SecurityFeature where
 
 initSecurityFeature :: ServerEnv -> IO (CoreFeature -> IO SecurityFeature)
 initSecurityFeature env = do
-    securityState <- securityStateComponent env (serverStateDir env)
+    securityState <- securityStateComponent env (serverPgConn env)
     return $ \coreFeature -> do
 
        -- Update the security state whenever the main package index changes
@@ -86,7 +108,7 @@ initSecurityFeature env = do
       case pkgLatestTarball pkgInfo of
         Nothing -> []
         Just (_tarball, (uploadTime, _uploadUserId), latestRev) ->
-          [MetadataEntry (pkgInfoId pkgInfo) (TarballRevIx latestRev) uploadTime]
+          [MetadataEntry (pkgInfoId pkgInfo) (TarballRevIx (fromIntegral latestRev)) uploadTime]
 
 -- | The main security feature
 --
@@ -157,19 +179,177 @@ securityFeature env securityState =
           enableRange
           return $ toResponse tufFile
 
+------------------------------------------------------------------------
+-- Beam tables for Security state (typed columns)
+--
+
+-- | Scalar fields of SecurityState
+data SecurityScalarT f = SecurityScalarRow
+  { _sscId               :: C f Int32
+  , _sscTarGzLength      :: C f Int64
+  , _sscTarGzSha256      :: C f T.Text
+  , _sscTarGzMd5         :: C f (Maybe T.Text)
+  , _sscTarLength        :: C f Int64
+  , _sscTarSha256        :: C f T.Text
+  , _sscTarMd5           :: C f (Maybe T.Text)
+  , _sscSnapshotVersion  :: C f Int32
+  , _sscTimestampVersion :: C f Int32
+  , _sscTimestampTime    :: C f UTCTime
+  } deriving (Generic, Beamable)
+
+instance Table SecurityScalarT where
+  data PrimaryKey SecurityScalarT f =
+    SecurityScalarId (C f Int32)
+    deriving (Generic, Beamable)
+  primaryKey r = SecurityScalarId (_sscId r)
+
+deriving instance Show (SecurityScalarT Identity)
+
+-- | SecurityStateFiles stored as SafeCopy BYTEA.
+-- This is the ONE remaining SafeCopy blob in the schema. It can't be
+-- decomposed because `Some Sec.Key` is an existential type from
+-- hackage-security that has no public serializer other than SafeCopy.
+-- The scalar fields (versions, timestamps, file info) are in
+-- SecurityScalarT with proper typed columns.
+data SecurityFilesT f = SecurityFilesRow
+  { _sfId        :: C f Int32
+  , _sfFilesData :: C f (Maybe BS.ByteString)
+  } deriving (Generic, Beamable)
+
+instance Table SecurityFilesT where
+  data PrimaryKey SecurityFilesT f =
+    SecurityFilesId (C f Int32)
+    deriving (Generic, Beamable)
+  primaryKey r = SecurityFilesId (_sfId r)
+
+deriving instance Show (SecurityFilesT Identity)
+
+data SecurityDb f = SecurityDb
+  { _securityScalar :: f (TableEntity SecurityScalarT)
+  , _securityFiles  :: f (TableEntity SecurityFilesT)
+  } deriving (Generic, Database Postgres)
+
+securityDb :: DatabaseSettings Postgres SecurityDb
+securityDb = defaultDbSettings `withDbModification`
+  SecurityDb
+    (setEntityName "security__state" <>
+     modifyTableFields tableModification
+       { _sscId               = "id"
+       , _sscTarGzLength      = "tar_gz_length"
+       , _sscTarGzSha256      = "tar_gz_sha256"
+       , _sscTarGzMd5         = "tar_gz_md5"
+       , _sscTarLength        = "tar_length"
+       , _sscTarSha256        = "tar_sha256"
+       , _sscTarMd5           = "tar_md5"
+       , _sscSnapshotVersion  = "snapshot_version"
+       , _sscTimestampVersion = "timestamp_version"
+       , _sscTimestampTime    = "timestamp_time"
+       })
+    (setEntityName "security__files" <>
+     modifyTableFields tableModification
+       { _sfId        = "id"
+       , _sfFilesData = "files_data"
+       })
+
+securityScalarTable :: DatabaseEntity Postgres SecurityDb (TableEntity SecurityScalarT)
+securityScalarTable = _securityScalar securityDb
+
+securityFilesTable :: DatabaseEntity Postgres SecurityDb (TableEntity SecurityFilesT)
+securityFilesTable = _securityFiles securityDb
+
+loadSecurityState :: PgTx SecurityState
+loadSecurityState = do
+  scalarRows <- beamTx $
+    runSelectReturningList $ select $ all_ securityScalarTable
+  filesRows <- beamTx $
+    runSelectReturningList $ select $ all_ securityFilesTable
+  let mfiles = case filesRows of
+        (SecurityFilesRow _ (Just bs) : _) ->
+          case runGetLazy safeGet (BSL.fromStrict bs) of
+            Right sf -> Just sf
+            Left err -> error $ "Failed to deserialize SecurityStateFiles: " ++ err
+        _ -> Nothing
+  case scalarRows of
+    (row : _) ->
+      return SecurityState
+        { securityStateFiles       = mfiles
+        , securityTarGzFileInfo    = readFileInfo (_sscTarGzLength row) (_sscTarGzSha256 row) (_sscTarGzMd5 row)
+        , securityTarFileInfo      = readFileInfo (_sscTarLength row) (_sscTarSha256 row) (_sscTarMd5 row)
+        , securitySnapshotVersion  = Sec.FileVersion (fromIntegral (_sscSnapshotVersion row))
+        , securityTimestampVersion = Sec.FileVersion (fromIntegral (_sscTimestampVersion row))
+        , securityTimestampTime    = _sscTimestampTime row
+        }
+    _ -> return initialSecurityState
+  where
+    readFileInfo :: Int64 -> T.Text -> Maybe T.Text -> FileInfo
+    readFileInfo len sha256Text md5Text =
+      FileInfo
+        { fileInfoLength = fromIntegral len
+        , fileInfoSHA256 = case readDigest (T.unpack sha256Text) of
+            Right d  -> d
+            Left err -> error $ "Failed to parse SHA256: " ++ err
+        , fileInfoMD5    = case md5Text of
+            Nothing -> Nothing
+            Just t  -> case readDigest (T.unpack t) of
+              Right d  -> Just d
+              Left err -> error $ "Failed to parse MD5: " ++ err
+        }
+
+saveSecurityState :: SecurityState -> PgTx ()
+saveSecurityState SecurityState{..} =
+  do
+    -- Upsert scalar state
+    let Sec.FileVersion snapshotVer  = securitySnapshotVersion
+        Sec.FileVersion timestampVer = securityTimestampVersion
+    beamTx $
+      runInsert $ insertOnConflict securityScalarTable
+        (insertValues
+          [ SecurityScalarRow
+              { _sscId               = 1
+              , _sscTarGzLength      = fromIntegral (fileInfoLength securityTarGzFileInfo)
+              , _sscTarGzSha256      = T.pack (show (fileInfoSHA256 securityTarGzFileInfo))
+              , _sscTarGzMd5         = fmap (T.pack . show) (fileInfoMD5 securityTarGzFileInfo)
+              , _sscTarLength        = fromIntegral (fileInfoLength securityTarFileInfo)
+              , _sscTarSha256        = T.pack (show (fileInfoSHA256 securityTarFileInfo))
+              , _sscTarMd5           = fmap (T.pack . show) (fileInfoMD5 securityTarFileInfo)
+              , _sscSnapshotVersion  = fromIntegral snapshotVer
+              , _sscTimestampVersion = fromIntegral timestampVer
+              , _sscTimestampTime    = securityTimestampTime
+              }
+          ])
+        (conflictingFields primaryKey)
+        onConflictUpdateAll
+    -- Insert files (SafeCopy blob -- TODO: decompose into typed columns)
+    case securityStateFiles of
+      Nothing -> return ()
+      Just files -> do
+        let bs = BSL.toStrict $ runPutLazy (safePut files)
+        beamTx $
+          runInsert $ insertOnConflict securityFilesTable
+            (insertValues [SecurityFilesRow 1 (Just bs)])
+            (conflictingFields primaryKey)
+            onConflictUpdateAll
+
+------------------------------------------------------------------------
+
 securityStateComponent :: ServerEnv
-                       -> FilePath
+                       -> PgConnection
                        -> IO (StateComponent AcidState SecurityState)
-securityStateComponent env stateDir = do
-    let stateFile = stateDir </> "db" </> "TUF"
+securityStateComponent env serverPgConn = do
+    -- Load state
     st <- logTiming (serverVerbosity env) "Loaded SecurityState" $
-            openLocalStateFrom stateFile initialSecurityState
+            runPgTx serverPgConn loadSecurityState
+
+    pgSt <- mkAcidState serverPgConn st saveSecurityState
     return StateComponent {
         stateDesc    = "TUF specific state"
-      , stateHandle  = st
-      , getState     = query st GetSecurityState
-      , putState     = update st . ReplaceSecurityState
-      , resetState   = securityStateComponent env
+      , stateHandle  = pgSt
+      , getState     = queryPg pgSt (runQueryEvent GetSecurityState)
+      , putState     = \s -> do
+          runPgTx serverPgConn (saveSecurityState s)
+          _ <- swapMVar (pgMVar pgSt) s
+          return ()
+      , resetState   = \_ -> securityStateComponent env serverPgConn
       , backupState  = \_ -> securityBackup
       , restoreState = securityRestore
       }

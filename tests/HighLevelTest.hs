@@ -54,38 +54,42 @@ testDir root = root </> "tests" </> testName
 
 doit :: FilePath -> IO ()
 doit root
-    = do info "initialising hackage database"
-         runServerChecked root ["init"]
-         withServerRunning root $ do void $ validate NoAuth "/"
-                                     void $ validate NoAuth "/accounts"
-                                     void $ validate (Auth "admin" "admin") "/admin"
-                                     void $ validate NoAuth "/upload"
-                                     runUserTests
-                                     runPackageUploadTests
-                                     runPackageTests
-         withServerRunning root runPackageTests
-         info "Making database backup"
-         tarGz1 <- createBackup testName root "1"
-         info "Removing old state"
-         removeDirectoryRecursive "state"
-         info "Checking server doesn't work"
-         mec <- runServer root serverRunningArgs
-         case mec of
-             Just (ExitFailure 1) -> return ()
-             Just (ExitFailure _) -> die "Server failed with wrong exit code"
-             Just ExitSuccess     -> die "Server worked unexpectedly"
-             Nothing              -> die "Got a signal?"
-         info $ "Restoring database from " ++ tarGz1
-         runServerChecked root ["restore", tarGz1]
-         info "Making another database backup"
-         tarGz2 <- createBackup testName root "2"
-         info "Checking databases match"
-         db1 <- LBS.readFile tarGz1
-         db2 <- LBS.readFile tarGz2
-         unless (db1 == db2) $ die "Databases don't match"
-         info "Checking server still works, and data is intact"
-         withServerRunning root runPackageTests
-         withServerRunning root runRevisionTests
+    = withTempPostgres $ \cluster -> do
+
+      -- Phase 1: init, run tests, backup
+      tarGz1 <- withFreshDb cluster "hackage_test" $ \connStr -> do
+        info "initialising hackage database"
+        runServerChecked root ["init", "--db-conn-str", connStr]
+        withServerRunning' root connStr $ do
+          void $ validate NoAuth "/"
+          void $ validate NoAuth "/accounts"
+          void $ validate (Auth "admin" "admin") "/admin"
+          void $ validate NoAuth "/upload"
+          runUserTests
+          runPackageUploadTests
+          runPackageTests
+        withServerRunning' root connStr runPackageTests
+        info "Making database backup"
+        createBackup' connStr testName root "1"
+
+      -- Phase 2: restore into fresh db, verify backup round-trips
+      info "Resetting filesystem state for restore test"
+      exists <- doesDirectoryExist "state"
+      when exists $ removeDirectoryRecursive "state"
+      createDirectory "state"
+
+      withFreshDb cluster "hackage_restore" $ \connStr2 -> do
+        info $ "Restoring database from " ++ tarGz1
+        runServerChecked root ["restore", "--db-conn-str", connStr2, tarGz1]
+        info "Making another database backup"
+        tarGz2 <- createBackup' connStr2 testName root "2"
+        info "Checking databases match"
+        db1 <- LBS.readFile tarGz1
+        db2 <- LBS.readFile tarGz2
+        unless (db1 == db2) $ die "Databases don't match"
+        info "Checking server still works, and data is intact"
+        withServerRunning' root connStr2 runPackageTests
+        withServerRunning' root connStr2 runRevisionTests
 
 
 runUserTests :: IO ()

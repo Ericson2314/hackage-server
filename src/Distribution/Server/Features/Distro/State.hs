@@ -1,4 +1,4 @@
-{-# LANGUAGE DeriveDataTypeable, TypeFamilies, TemplateHaskell, RecordWildCards #-}
+{-# LANGUAGE OverloadedStrings, MultiParamTypeClasses, FlexibleInstances, DeriveAnyClass, DeriveGeneric, DerivingStrategies, DeriveDataTypeable, TypeFamilies, TemplateHaskell, RecordWildCards #-}
 
 module Distribution.Server.Features.Distro.State where
 
@@ -14,7 +14,8 @@ import Distribution.Server.Users.Types (UserId)
 import Distribution.Server.Users.State ()
 import Distribution.Server.Framework.MemSize
 
-import Data.Acid     (Query, Update, makeAcidic)
+import Distribution.Server.Framework.EventSourcing (Query, Update, makeAcidic)
+import Distribution.Server.Framework.BeamInstances ()
 import Data.SafeCopy (base, deriveSafeCopy)
 
 import Data.Maybe (fromMaybe)

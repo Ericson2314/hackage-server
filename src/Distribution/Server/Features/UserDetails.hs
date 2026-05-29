@@ -1,7 +1,13 @@
+{-# LANGUAGE DeriveAnyClass, FlexibleContexts    #-}
+{-# LANGUAGE DeriveGeneric     #-}
+{-# LANGUAGE FlexibleInstances #-}
+{-# LANGUAGE MultiParamTypeClasses #-}
 {-# LANGUAGE NamedFieldPuns    #-}
 {-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE RankNTypes        #-}
 {-# LANGUAGE RecordWildCards   #-}
+{-# LANGUAGE StandaloneDeriving #-}
+{-# LANGUAGE TypeFamilies      #-}
 
 module Distribution.Server.Features.UserDetails (
     initUserDetailsFeature,
@@ -24,8 +30,17 @@ import Distribution.Server.Util.Validators (guardValidLookingEmail, guardValidLo
 
 import qualified Data.Text as T
 import qualified Data.Aeson as Aeson
+import qualified Data.IntMap as IntMap
+import Data.List (foldl')
 
 import Distribution.Text (display)
+
+import GHC.Generics (Generic)
+import Database.Beam
+import Database.Beam.Postgres
+import Control.Concurrent.MVar (swapMVar)
+import qualified Database.PostgreSQL.Simple as PG
+import Data.Int (Int32)
 
 
 -- | A feature to store extra information about users like email addresses.
@@ -45,18 +60,102 @@ instance IsHackageFeature UserDetailsFeature where
 -- State components
 --
 
-userDetailsStateComponent :: FilePath -> IO (StateComponent AcidState Acid.UserDetailsTable)
-userDetailsStateComponent stateDir = do
-  st <- openLocalStateFrom (stateDir </> "db" </> "UserDetails") Acid.emptyUserDetailsTable
+------------------------------------------------------------------------
+-- Beam table
+--
+
+data UserDetailRowT f = UserDetailRow
+  { _udUserId       :: C f Int32
+  , _udName         :: C f T.Text
+  , _udContactEmail :: C f T.Text
+  , _udAccountKind  :: C f (Maybe T.Text)
+  , _udAdminNotes   :: C f T.Text
+  } deriving (Generic, Beamable)
+
+instance Table UserDetailRowT where
+  data PrimaryKey UserDetailRowT f =
+    UserDetailRowId (C f Int32)
+    deriving (Generic, Beamable)
+  primaryKey r = UserDetailRowId (_udUserId r)
+
+deriving instance Show (UserDetailRowT Identity)
+
+data UserDetailsDb f = UserDetailsDb
+  { _userDetails :: f (TableEntity UserDetailRowT)
+  } deriving (Generic, Database Postgres)
+
+userDetailsDbSettings :: DatabaseSettings Postgres UserDetailsDb
+userDetailsDbSettings = defaultDbSettings `withDbModification`
+  UserDetailsDb (setEntityName "user_details__details" <>
+                 modifyTableFields tableModification
+                   { _udUserId       = "user_id"
+                   , _udName         = "name"
+                   , _udContactEmail = "contact_email"
+                   , _udAccountKind  = "account_kind"
+                   , _udAdminNotes   = "admin_notes"
+                   })
+
+userDetailsDbTable :: DatabaseEntity Postgres UserDetailsDb (TableEntity UserDetailRowT)
+userDetailsDbTable = _userDetails userDetailsDbSettings
+
+parseAccountKind :: Maybe T.Text -> Maybe AccountKind
+parseAccountKind (Just "AccountKindRealUser") = Just AccountKindRealUser
+parseAccountKind (Just "AccountKindSpecial")  = Just AccountKindSpecial
+parseAccountKind _                            = Nothing
+
+showAccountKind :: Maybe AccountKind -> Maybe T.Text
+showAccountKind (Just AccountKindRealUser) = Just "AccountKindRealUser"
+showAccountKind (Just AccountKindSpecial)  = Just "AccountKindSpecial"
+showAccountKind Nothing                    = Nothing
+
+loadUserDetailsTable :: PgTx Acid.UserDetailsTable
+loadUserDetailsTable = do
+  rows <- beamTx $
+    runSelectReturningList $ select $ all_ userDetailsDbTable
+  let addRow m (UserDetailRow uid name email akind notes) =
+        IntMap.insert (fromIntegral uid) (AccountDetails name email (parseAccountKind akind) notes) m
+  return $ Acid.UserDetailsTable $ foldl' addRow IntMap.empty rows
+
+saveUserDetailsTable :: Acid.UserDetailsTable -> PgTx ()
+saveUserDetailsTable (Acid.UserDetailsTable tbl) =
+  do
+    beamTx $
+      runDelete $ delete userDetailsDbTable (\_ -> val_ True)
+    let rows = [ UserDetailRow (fromIntegral uid)
+                   (accountName d) (accountContactEmail d)
+                   (showAccountKind (accountKind d)) (accountAdminNotes d)
+               | (uid, d) <- IntMap.toList tbl ]
+    mapM_ insertUserDetailChunk (chunksOf 1000 rows)
+
+insertUserDetailChunk :: [UserDetailRowT Identity] -> PgTx ()
+insertUserDetailChunk chunk =
+  beamTx $
+    runInsert $ insert userDetailsDbTable $ insertValues chunk
+
+chunksOf :: Int -> [a] -> [[a]]
+chunksOf _ [] = []
+chunksOf n xs = let (h, t) = splitAt n xs in h : chunksOf n t
+
+------------------------------------------------------------------------
+
+userDetailsStateComponent :: PgConnection -> IO (StateComponent AcidState Acid.UserDetailsTable)
+userDetailsStateComponent serverPgConn = do
+  -- Load state
+  loaded <- runPgTx serverPgConn loadUserDetailsTable
+
+  pgSt <- mkAcidState serverPgConn loaded saveUserDetailsTable
   return StateComponent {
       stateDesc    = "Extra details associated with user accounts, email addresses etc"
-    , stateHandle  = st
-    , getState     = query st Acid.GetUserDetailsTable
-    , putState     = update st . Acid.ReplaceUserDetailsTable
+    , stateHandle  = pgSt
+    , getState     = queryPg pgSt (runQueryEvent Acid.GetUserDetailsTable)
+    , putState     = \s -> do
+        runPgTx serverPgConn (saveUserDetailsTable s)
+        _ <- swapMVar (pgMVar pgSt) s
+        return ()
     , backupState  = \backuptype users ->
         [csvToBackup ["users.csv"] (userDetailsToCSV backuptype users)]
     , restoreState = userDetailsBackup
-    , resetState   = userDetailsStateComponent
+    , resetState   = \_ -> userDetailsStateComponent serverPgConn
     }
 
 ----------------------------------------
@@ -68,9 +167,9 @@ initUserDetailsFeature :: ServerEnv
                            -> CoreFeature
                            -> UploadFeature
                            -> IO UserDetailsFeature)
-initUserDetailsFeature ServerEnv{serverStateDir, serverTemplatesDir, serverTemplatesMode} = do
+initUserDetailsFeature ServerEnv{serverPgConn, serverTemplatesDir, serverTemplatesMode} = do
     -- Canonical state
-    usersDetailsState <- userDetailsStateComponent serverStateDir
+    usersDetailsState <- userDetailsStateComponent serverPgConn
 
     --TODO: link up to user feature to delete
 

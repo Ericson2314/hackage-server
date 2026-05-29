@@ -45,6 +45,9 @@ module Distribution.Server.Features.BuildReports.BuildReport (
     BooleanCovg(..),
   ) where
 
+import Database.Beam.Backend.SQL (HasSqlValueSyntax(..))
+import Database.Beam.Postgres.Syntax (PgValueSyntax)
+import qualified Data.Text as T
 import Distribution.Compat.Newtype
 import Distribution.Compat.Lens (Lens')
 import Distribution.Package
@@ -116,7 +119,6 @@ import Data.Scientific
 import qualified Distribution.Text as DT
 import qualified Prelude
 import Data.Attoparsec.Text (Parser, char, decimal, parseOnly, takeTill)
-import qualified Data.Text as T
 
 
 data BuildReport
@@ -264,7 +266,7 @@ data BooleanCovg = BooleanCovg {
   guards        :: (Int,Int),
   ifConditions  :: (Int,Int),
   qualifiers    :: (Int,Int)
-} deriving (Eq, Show)
+} deriving (Eq, Read, Show)
 
 data BuildCovg = BuildCovg {
   expressions       :: (Int,Int),
@@ -272,7 +274,7 @@ data BuildCovg = BuildCovg {
   alternatives      :: (Int,Int),
   localDeclarations :: (Int,Int),
   topLevel          :: (Int,Int)
-} deriving (Eq, Show)
+} deriving (Eq, Read, Show)
 
 instance MemSize BuildCovg where
     memSize (BuildCovg a (BooleanCovg b c d) e f g) = memSize7 a b c d e f g
@@ -682,3 +684,6 @@ deriveSafeCopy 3 'extension ''BuildReport
 deriveSafeCopy 1 'base      ''BuildStatus
 deriveSafeCopy 1 'base      ''BooleanCovg
 deriveSafeCopy 1 'base      ''BuildCovg
+
+instance HasSqlValueSyntax PgValueSyntax BuildReport where sqlValueSyntax = sqlValueSyntax . T.pack . Prelude.show
+instance HasSqlValueSyntax PgValueSyntax BuildCovg where sqlValueSyntax = sqlValueSyntax . T.pack . Prelude.show

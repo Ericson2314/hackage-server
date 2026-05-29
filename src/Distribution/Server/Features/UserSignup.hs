@@ -1,6 +1,13 @@
-{-# LANGUAGE NamedFieldPuns  #-}
-{-# LANGUAGE RankNTypes      #-}
-{-# LANGUAGE RecordWildCards #-}
+{-# LANGUAGE DeriveAnyClass      #-}
+{-# LANGUAGE DeriveGeneric       #-}
+{-# LANGUAGE FlexibleInstances   #-}
+{-# LANGUAGE MultiParamTypeClasses #-}
+{-# LANGUAGE NamedFieldPuns      #-}
+{-# LANGUAGE OverloadedStrings   #-}
+{-# LANGUAGE RankNTypes          #-}
+{-# LANGUAGE RecordWildCards     #-}
+{-# LANGUAGE StandaloneDeriving  #-}
+{-# LANGUAGE TypeFamilies        #-}
 
 {-# OPTIONS_GHC -fno-warn-incomplete-uni-patterns #-}
 
@@ -24,7 +31,7 @@ import Distribution.Server.Features.Users
 import Distribution.Server.Features.UserDetails
 import Distribution.Server.Features.UserDetails.Types
 
-import Distribution.Server.Users.Group
+import Distribution.Server.Users.Group hiding (insert, delete)
 import Distribution.Server.Users.Types
 import Distribution.Server.Util.Nonce
 import Distribution.Server.Util.Validators
@@ -38,6 +45,13 @@ import qualified Data.ByteString.Char8 as BS -- Only used for ASCII data
 import qualified Data.ByteString.Lazy as BSL
 
 import Distribution.Text (display)
+
+import GHC.Generics (Generic)
+import           Data.Int (Int32)
+import Database.Beam
+import Database.Beam.Postgres
+import qualified Database.PostgreSQL.Simple as PG
+import Control.Concurrent.MVar (swapMVar)
 import Data.Time
 import Network.Mail.Mime
 import Network.URI (URI(..), URIAuth(..))
@@ -94,19 +108,132 @@ instance IsHackageFeature UserSignupFeature where
 -- State components
 --
 
-signupResetStateComponent :: FilePath -> IO (StateComponent AcidState Acid.SignupResetTable)
-signupResetStateComponent stateDir = do
-  st <- openLocalStateFrom (stateDir </> "db" </> "UserSignupReset") Acid.emptySignupResetTable
+------------------------------------------------------------------------
+-- Beam table definition
+--
+
+data SignupResetEntryT f = SignupResetEntryRow
+  { _sreNonce          :: C f T.Text
+  , _sreEntryType      :: C f T.Text
+  , _sreSignupUserName :: C f (Maybe T.Text)
+  , _sreSignupRealName :: C f (Maybe T.Text)
+  , _sreSignupContactEmail :: C f (Maybe T.Text)
+  , _sreResetUserId    :: C f (Maybe Int32)
+  , _sreTimestamp      :: C f UTCTime
+  } deriving (Generic, Beamable)
+
+instance Table SignupResetEntryT where
+  data PrimaryKey SignupResetEntryT f =
+    SignupResetEntryId (C f T.Text)
+    deriving (Generic, Beamable)
+  primaryKey r = SignupResetEntryId (_sreNonce r)
+
+deriving instance Show (SignupResetEntryT Identity)
+
+data SignupResetDb f = SignupResetDb
+  { _signupResetEntries :: f (TableEntity SignupResetEntryT)
+  } deriving (Generic, Database Postgres)
+
+signupResetDb :: DatabaseSettings Postgres SignupResetDb
+signupResetDb = defaultDbSettings `withDbModification`
+  SignupResetDb (setEntityName "user_signup__entries" <>
+                 modifyTableFields tableModification
+                   { _sreNonce              = "nonce"
+                   , _sreEntryType          = "entry_type"
+                   , _sreSignupUserName     = "signup_user_name"
+                   , _sreSignupRealName     = "signup_real_name"
+                   , _sreSignupContactEmail = "signup_contact_email"
+                   , _sreResetUserId        = "reset_user_id"
+                   , _sreTimestamp           = "timestamp"
+                   })
+
+signupResetEntriesTable :: DatabaseEntity Postgres SignupResetDb (TableEntity SignupResetEntryT)
+signupResetEntriesTable = _signupResetEntries signupResetDb
+
+rowToSignupResetEntry :: SignupResetEntryT Identity -> Maybe (Nonce, SignupResetInfo)
+rowToSignupResetEntry (SignupResetEntryRow nonceText entryType mUserName mRealName mEmail mUserId ts) =
+  case parseNonceM (T.unpack nonceText) of
+    Nothing -> Nothing
+    Just nonce -> case entryType of
+      "signup" | Just uname <- mUserName
+               , Just rname <- mRealName
+               , Just email <- mEmail ->
+        Just (nonce, SignupInfo { signupUserName = uname
+                                , signupRealName = rname
+                                , signupContactEmail = email
+                                , nonceTimestamp = ts })
+      "reset" | Just uid <- mUserId ->
+        Just (nonce, ResetInfo { resetUserId = UserId (fromIntegral uid)
+                               , nonceTimestamp = ts })
+      _ -> Nothing
+
+signupResetToRow :: Nonce -> SignupResetInfo -> SignupResetEntryT Identity
+signupResetToRow nonce (SignupInfo uname rname email ts) =
+  SignupResetEntryRow
+    { _sreNonce              = T.pack (renderNonce nonce)
+    , _sreEntryType          = "signup"
+    , _sreSignupUserName     = Just uname
+    , _sreSignupRealName     = Just rname
+    , _sreSignupContactEmail = Just email
+    , _sreResetUserId        = Nothing
+    , _sreTimestamp           = ts
+    }
+signupResetToRow nonce (ResetInfo (UserId uid) ts) =
+  SignupResetEntryRow
+    { _sreNonce              = T.pack (renderNonce nonce)
+    , _sreEntryType          = "reset"
+    , _sreSignupUserName     = Nothing
+    , _sreSignupRealName     = Nothing
+    , _sreSignupContactEmail = Nothing
+    , _sreResetUserId        = Just (fromIntegral uid)
+    , _sreTimestamp           = ts
+    }
+
+loadSignupResetTable :: PgTx Acid.SignupResetTable
+loadSignupResetTable = do
+  rows <- beamTx $
+    runSelectReturningList $ select $ all_ signupResetEntriesTable
+  let entries = concatMap (maybe [] (:[]) . rowToSignupResetEntry) rows
+  return $ Acid.SignupResetTable (Map.fromList entries)
+
+saveSignupResetTable :: Acid.SignupResetTable -> PgTx ()
+saveSignupResetTable (Acid.SignupResetTable tbl) =
+  do
+    beamTx $
+      runDelete $ delete signupResetEntriesTable (\_ -> val_ True)
+    let rows = [ signupResetToRow nonce info | (nonce, info) <- Map.toList tbl ]
+    mapM_ insertSignupResetChunk (chunksOf 1000 rows)
+
+insertSignupResetChunk :: [SignupResetEntryT Identity] -> PgTx ()
+insertSignupResetChunk chunk =
+  beamTx $
+    runInsert $ insert signupResetEntriesTable $ insertValues chunk
+
+chunksOf :: Int -> [a] -> [[a]]
+chunksOf _ [] = []
+chunksOf n xs = let (h, t) = splitAt n xs in h : chunksOf n t
+
+------------------------------------------------------------------------
+
+signupResetStateComponent :: PgConnection -> IO (StateComponent AcidState Acid.SignupResetTable)
+signupResetStateComponent serverPgConn = do
+  -- Load state
+  st <- runPgTx serverPgConn loadSignupResetTable
+
+  pgSt <- mkAcidState serverPgConn st saveSignupResetTable
   return StateComponent {
       stateDesc    = "State to keep track of outstanding requests for user signup and password resets"
-    , stateHandle  = st
-    , getState     = query st Acid.GetSignupResetTable
-    , putState     = update st . Acid.ReplaceSignupResetTable
+    , stateHandle  = pgSt
+    , getState     = queryPg pgSt (runQueryEvent Acid.GetSignupResetTable)
+    , putState     = \s -> do
+        runPgTx serverPgConn (saveSignupResetTable s)
+        _ <- swapMVar (pgMVar pgSt) s
+        return ()
     , backupState  = \backuptype tbl ->
         [csvToBackup ["signups.csv"] (signupInfoToCSV backuptype tbl)
         ,csvToBackup ["resets.csv"]  (resetInfoToCSV backuptype tbl)]
     , restoreState = signupResetBackup
-    , resetState   = signupResetStateComponent
+    , resetState   = \_ -> signupResetStateComponent serverPgConn
     }
 
 
@@ -119,10 +246,10 @@ initUserSignupFeature :: ServerEnv
                           -> UserDetailsFeature
                           -> UploadFeature
                           -> IO UserSignupFeature)
-initUserSignupFeature env@ServerEnv{ serverStateDir, serverTemplatesDir,
+initUserSignupFeature env@ServerEnv{ serverPgConn, serverTemplatesDir,
                                      serverTemplatesMode } = do
     -- Canonical state
-    signupResetState <- signupResetStateComponent serverStateDir
+    signupResetState <- signupResetStateComponent serverPgConn
 
     -- Page templates
     templates <- loadTemplates serverTemplatesMode

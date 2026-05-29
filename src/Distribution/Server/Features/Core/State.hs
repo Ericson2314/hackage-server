@@ -1,4 +1,4 @@
-{-# LANGUAGE DeriveDataTypeable, TypeFamilies, TemplateHaskell, BangPatterns #-}
+{-# LANGUAGE OverloadedStrings, MultiParamTypeClasses, FlexibleInstances, DeriveAnyClass, DeriveGeneric, DerivingStrategies, DeriveDataTypeable, TypeFamilies, TemplateHaskell, BangPatterns #-}
 {-# LANGUAGE FlexibleContexts #-}
 
 module Distribution.Server.Features.Core.State (
@@ -36,7 +36,8 @@ import Distribution.Server.Users.Users (Users, lookupUserId)
 import Distribution.Server.Framework.MemSize
 
 import Data.Coerce (Coercible, coerce)
-import Data.Acid     (Query, Update, makeAcidic)
+import Distribution.Server.Framework.EventSourcing (Query, Update, makeAcidic)
+import Distribution.Server.Framework.BeamInstances ()
 import Data.SafeCopy (Migrate(..), base, extension, deriveSafeCopy)
 import Control.Monad.Reader
 import qualified Control.Monad.State as State
@@ -163,7 +164,7 @@ addPackageRevision2 pkgid cabalfile uploadinfo@(timestamp, uid) username = do
                                      `Vec.snoc` (cabalfile, uploadinfo)
             }
             pkgindex'   = PackageIndex.insert pkginfo' pkgindex
-            newrevision = MetadataRevIx $ Vec.length (pkgMetadataRevisions pkginfo)
+            newrevision = MetadataRevIx $ fromIntegral $ Vec.length (pkgMetadataRevisions pkginfo)
             !pkgentry   = CabalFileEntry pkgid newrevision timestamp uid username
             updatelog'  = fmap (Seq.|> pkgentry) updatelog
         State.put $! PackagesState pkgindex' updatelog'
@@ -298,8 +299,8 @@ initialUpdateLog oldExtras users pkgs =
     entryTimestamp (MetadataEntry  _ _ timestamp    ) = timestamp
     entryTimestamp (ExtraEntry     _ _ timestamp    ) = timestamp
 
-    vecToList :: Coercible Int ix => Vec.Vector a -> [(ix, a)]
-    vecToList = coerce . zip [(0 :: Int)..] . Vec.toList
+    vecToList :: (Num ix, Enum ix) => Vec.Vector a -> [(ix, a)]
+    vecToList = zip [0..] . Vec.toList
 
 ------------------------------------------------------------------------------
 

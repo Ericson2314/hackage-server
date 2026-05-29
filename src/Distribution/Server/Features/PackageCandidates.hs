@@ -1,4 +1,14 @@
-{-# LANGUAGE RankNTypes, NamedFieldPuns, RecordWildCards, LambdaCase #-}
+{-# LANGUAGE DeriveAnyClass #-}
+{-# LANGUAGE DeriveGeneric #-}
+{-# LANGUAGE FlexibleInstances #-}
+{-# LANGUAGE LambdaCase #-}
+{-# LANGUAGE MultiParamTypeClasses #-}
+{-# LANGUAGE NamedFieldPuns #-}
+{-# LANGUAGE OverloadedStrings #-}
+{-# LANGUAGE RankNTypes #-}
+{-# LANGUAGE RecordWildCards #-}
+{-# LANGUAGE StandaloneDeriving #-}
+{-# LANGUAGE TypeFamilies #-}
 module Distribution.Server.Features.PackageCandidates (
     PackageCandidatesFeature(..),
     PackageCandidatesResource(..),
@@ -10,6 +20,7 @@ module Distribution.Server.Features.PackageCandidates (
 
 import Distribution.Server.Framework
 
+import Distribution.Server.Features.PackageCandidates.Db
 import Distribution.Server.Features.PackageCandidates.Types
 import Distribution.Server.Features.PackageCandidates.State
 import Distribution.Server.Features.PackageCandidates.Backup
@@ -42,15 +53,32 @@ import Distribution.Text
 import Distribution.Package
 import Distribution.Version
 
+import GHC.Generics (Generic)
+import           Data.Time.Clock (UTCTime)
+import           Data.Int (Int32, Int64)
+import Database.Beam
+import Database.Beam.Postgres
+import qualified Database.PostgreSQL.Simple as PG
+import Control.Concurrent.MVar (swapMVar)
+import qualified Data.ByteString as StrictBS
+import qualified Data.Text.Encoding as T
+import Distribution.Server.Users.Types (UserId(..))
+import Distribution.Server.Framework.BlobStorage (BlobId, blobMd5, readBlobId)
+import Distribution.Server.Util.ReadDigest (readDigest)
+import Distribution.Server.Features.Security.SHA256 (SHA256Digest)
+
 import Data.Maybe (maybeToList)
 import qualified Data.ByteString.Lazy     as BS (toStrict, fromStrict)
 import qualified Data.Text                as T
 import qualified Text.XHtml.Strict        as XHtml
 import           Text.XHtml.Strict        ((<<), (!))
+import qualified Data.Aeson
 import           Data.Aeson               (Value (..), object, toJSON, (.=))
 import qualified Data.Aeson.Key           as Key
 import           Data.Function            (fix)
-import           Data.List                (find, intersperse)
+import           Data.List                (find, intersperse, sortBy, foldl')
+import           Data.Ord                 (comparing)
+import qualified Data.Map                 as Map
 import           Data.Time.Clock          (getCurrentTime)
 import qualified Data.Vector               as Vec
 
@@ -138,8 +166,8 @@ initPackageCandidatesFeature :: ServerEnv
                                  -> UploadFeature
                                  -> TarIndexCacheFeature
                                  -> IO PackageCandidatesFeature)
-initPackageCandidatesFeature env@ServerEnv{serverStateDir} = do
-    candidatesState <- candidatesStateComponent False serverStateDir
+initPackageCandidatesFeature env@ServerEnv{serverPgConn} = do
+    candidatesState <- candidatesStateComponent False serverPgConn
 
     return $ \user core upload@UploadFeature{..} tarIndexCache -> do
       -- one-off migration
@@ -156,16 +184,23 @@ initPackageCandidatesFeature env@ServerEnv{serverStateDir} = do
                                       candidatesState
       return feature
 
-candidatesStateComponent :: Bool -> FilePath -> IO (StateComponent AcidState CandidatePackages)
-candidatesStateComponent freshDB stateDir = do
-  st <- openLocalStateFrom (stateDir </> "db" </> "CandidatePackages")
-                           (initialCandidatePackages freshDB)
+------------------------------------------------------------------------
+
+candidatesStateComponent :: Bool -> PgConnection -> IO (StateComponent AcidState CandidatePackages)
+candidatesStateComponent freshDB serverPgConn = do
+  -- Load state
+  st <- runPgTx serverPgConn loadCandidatePackages
+
+  pgSt <- mkAcidState serverPgConn st saveCandidatePackages
   return StateComponent {
       stateDesc    = "Candidate packages"
-    , stateHandle  = st
-    , getState     = query st GetCandidatePackages
-    , putState     = update st . ReplaceCandidatePackages
-    , resetState   = candidatesStateComponent True
+    , stateHandle  = pgSt
+    , getState     = queryPg pgSt (runQueryEvent GetCandidatePackages)
+    , putState     = \s -> do
+        runPgTx serverPgConn (saveCandidatePackages s)
+        _ <- swapMVar (pgMVar pgSt) s
+        return ()
+    , resetState   = \_ -> candidatesStateComponent True serverPgConn
     , backupState  = \_ -> backupCandidates
     , restoreState = restoreCandidates
   }

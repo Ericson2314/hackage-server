@@ -130,7 +130,7 @@ writeIncremental pkgs =
         Tar.entryOwnership = Tar.Ownership {
           Tar.ownerName = username,
           Tar.groupName = "Hackage",
-          Tar.ownerId = uid,
+          Tar.ownerId = fromIntegral uid,
           Tar.groupId = 0
         }
       }

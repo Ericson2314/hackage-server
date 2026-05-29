@@ -125,7 +125,7 @@ hoogleDataFeature docsUpdatedState hoogleBundleUpdateJob
 
     postInit :: IO ()
     postInit = do
-        createDirectoryIfMissing False featureStateDir
+        createDirectoryIfMissing True featureStateDir
         prodFileCacheUpdate
         registerHook documentationChangeHook $ \pkgid -> do
           modifyMemState docsUpdatedState (Set.insert pkgid)

@@ -37,6 +37,8 @@ tested-with:
 
 data-dir: datafiles
 data-files:
+  schema.sql
+
   templates/**/*.st
 
   static/**/*.css
@@ -219,8 +221,6 @@ library
     Paths_hackage_server
 
   exposed-modules:
-    Data.Acid.Compat
-
     Distribution.Server
 
     Distribution.Server.Prelude
@@ -235,7 +235,11 @@ library
     Distribution.Server.Framework.CSRF
     Distribution.Server.Framework.Error
     Distribution.Server.Framework.Logging
+    Distribution.Server.Framework.BeamInstances
+    Distribution.Server.Framework.EventSourcing
     Distribution.Server.Framework.Feature
+    Distribution.Server.Framework.PostgreSQL
+    Distribution.Server.Framework.PgTx
     Distribution.Server.Framework.Hook
     Distribution.Server.Framework.HtmlFormWrapper
     Distribution.Server.Framework.Instances
@@ -309,6 +313,7 @@ library
     Distribution.Server.Features.Browse.Options
     Distribution.Server.Features.Browse.Parsers
     Distribution.Server.Features.Core
+    Distribution.Server.Features.Core.Db
     Distribution.Server.Features.Core.State
     Distribution.Server.Features.Core.Backup
     Distribution.Server.Features.Security
@@ -352,6 +357,7 @@ library
       Distribution.Server.Features.BuildReports.Render
       Distribution.Server.Features.BuildReports.State
       Distribution.Server.Features.PackageCandidates
+      Distribution.Server.Features.PackageCandidates.Db
       Distribution.Server.Features.PackageCandidates.Types
       Distribution.Server.Features.PackageCandidates.State
       Distribution.Server.Features.PackageCandidates.Backup
@@ -436,7 +442,9 @@ library
     , http-client-tls       ^>= 0.3
     , http-types             >= 0.10      && < 0.13
     , QuickCheck             >= 2.14      && < 2.19
-    , acid-state            ^>= 0.16
+    , beam-core             ^>= 0.11
+    , beam-postgres         ^>= 0.6
+    , postgresql-simple     ^>= 0.7
     , safecopy               >= 0.6       && < 0.11
     , async                 ^>= 2.2.1
     -- requires bumping http-io-streams
@@ -476,6 +484,8 @@ library
     , safecopy              ^>= 0.10
     , split                 ^>= 0.2
     , stm                   ^>= 2.5.0
+    , resource-pool         ^>= 0.4 || ^>= 0.5
+    , template-haskell
     , stringsearch          ^>= 0.3.6.6
     , transformers          ^>= 0.6
     , xhtml                  >= 3000.2.0.0 && < 3000.5

@@ -1,4 +1,4 @@
-{-# LANGUAGE DeriveDataTypeable, TypeFamilies, TemplateHaskell #-}
+{-# LANGUAGE OverloadedStrings, MultiParamTypeClasses, FlexibleInstances, DeriveAnyClass, DeriveGeneric, DerivingStrategies, DeriveDataTypeable, TypeFamilies, TemplateHaskell #-}
 
 module Distribution.Server.Features.PreferredVersions.State where
 
@@ -8,7 +8,8 @@ import Distribution.Server.Framework.MemSize
 import Distribution.Package
 import Distribution.Version
 
-import Data.Acid  (Query, Update, makeAcidic)
+import Distribution.Server.Framework.EventSourcing (Query, Update, makeAcidic)
+import Distribution.Server.Framework.BeamInstances ()
 import Data.Maybe (fromMaybe)
 import Control.Monad.State (put, modify)
 import Control.Monad.Reader (ask, asks)

@@ -1,4 +1,4 @@
-{-# LANGUAGE CPP #-}
+{-# LANGUAGE OverloadedStrings, MultiParamTypeClasses, CPP #-}
 {-# LANGUAGE DeriveDataTypeable #-}
 {-# LANGUAGE GeneralizedNewtypeDeriving #-}
 {-# LANGUAGE RecordWildCards #-}
@@ -35,6 +35,9 @@ module Distribution.Server.Framework.BlobStorage (
     find,
   ) where
 
+import Database.Beam.Backend.SQL (HasSqlValueSyntax(..))
+import Database.Beam.Postgres.Syntax (PgValueSyntax)
+import qualified Data.Text as T
 import Distribution.Server.Prelude
 
 import Distribution.Server.Features.Security.MD5
@@ -315,3 +318,5 @@ find BlobStores{..} blobId = do
      where
        pathHere = filepath store          blobId
        pathMain = filepath blobStoresMain blobId
+
+instance HasSqlValueSyntax PgValueSyntax BlobId where sqlValueSyntax = sqlValueSyntax . T.pack . blobMd5

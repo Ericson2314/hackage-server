@@ -47,7 +47,7 @@ importUserDetails = concatM . map fromRecord . drop 2
                         accountKind         = akind,
                         accountAdminNotes   = T.pack notesStr
                       }
-        return $! Acid.UserDetailsTable (IntMap.insert uid udetails tbl)
+        return $! Acid.UserDetailsTable (IntMap.insert (fromIntegral uid) udetails tbl)
 
     fromRecord x _ = fail $ "Error processing user details record: " ++ show x
 
@@ -62,7 +62,7 @@ userDetailsToCSV backuptype (Acid.UserDetailsTable tbl)
       (userdetailsCSVKey:) $
 
       flip map (IntMap.toList tbl) $ \(uid, udetails) ->
-      [ display (UserId uid)
+      [ display (UserId (fromIntegral uid))
       , T.unpack (accountName udetails)  --FIXME: apparently the csv lib doesn't do unicode properly
       , if backuptype == FullBackup
         then T.unpack (accountContactEmail udetails)

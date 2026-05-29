@@ -1,4 +1,10 @@
-{-# LANGUAGE BangPatterns, RankNTypes, NamedFieldPuns, RecordWildCards #-}
+{-# LANGUAGE BangPatterns, RankNTypes, NamedFieldPuns, RecordWildCards, OverloadedStrings #-}
+{-# LANGUAGE DeriveAnyClass #-}
+{-# LANGUAGE DeriveGeneric #-}
+{-# LANGUAGE FlexibleInstances #-}
+{-# LANGUAGE MultiParamTypeClasses #-}
+{-# LANGUAGE StandaloneDeriving #-}
+{-# LANGUAGE TypeFamilies #-}
 
 module Distribution.Server.Features.Tags (
     TagsFeature(..),
@@ -40,6 +46,13 @@ import qualified Data.Map as Map
 import Data.Function (fix)
 import Data.List (foldl')
 import Data.Char (toLower)
+
+import qualified Data.Text as T
+import GHC.Generics (Generic)
+import Database.Beam
+import Database.Beam.Postgres
+import Control.Concurrent.MVar (swapMVar)
+import qualified Database.PostgreSQL.Simple as PG
 
 data TagsFeature = TagsFeature {
     tagsFeatureInterface :: HackageFeature,
@@ -95,9 +108,9 @@ initTagsFeature :: ServerEnv
                     -> UploadFeature
                     -> UserFeature
                     -> IO TagsFeature)
-initTagsFeature ServerEnv{serverStateDir} = do
-    tagsState <- tagsStateComponent serverStateDir
-    tagAlias <- tagsAliasComponent serverStateDir
+initTagsFeature ServerEnv{serverPgConn} = do
+    tagsState <- tagsStateComponent serverPgConn
+    tagAlias <- tagsAliasComponent serverPgConn
     specials  <- newMemStateWHNF Acid.emptyPackageTags
     updateTag <- newHook
     tagProposalLog <- newMemStateWHNF Map.empty
@@ -119,30 +132,228 @@ initTagsFeature ServerEnv{serverStateDir} = do
 
       return feature
 
-tagsStateComponent :: FilePath -> IO (StateComponent AcidState Acid.PackageTags)
-tagsStateComponent stateDir = do
-  st <- openLocalStateFrom (stateDir </> "db" </> "Tags" </> "Existing") Acid.initialPackageTags
+------------------------------------------------------------------------
+-- Beam tables
+--
+
+-- Tag assignments: (pkg_name, tag)
+data TagAssignmentT f = TagAssignmentRow
+  { _taPkgName :: C f T.Text
+  , _taTag     :: C f T.Text
+  } deriving (Generic, Beamable)
+
+instance Table TagAssignmentT where
+  data PrimaryKey TagAssignmentT f =
+    TagAssignmentId (C f T.Text) (C f T.Text)
+    deriving (Generic, Beamable)
+  primaryKey r = TagAssignmentId (_taPkgName r) (_taTag r)
+
+deriving instance Show (TagAssignmentT Identity)
+
+-- Tag reviews: (pkg_name, tag, is_addition)
+data TagReviewT f = TagReviewRow
+  { _trPkgName    :: C f T.Text
+  , _trTag        :: C f T.Text
+  , _trIsAddition :: C f Bool
+  } deriving (Generic, Beamable)
+
+instance Table TagReviewT where
+  data PrimaryKey TagReviewT f =
+    TagReviewId (C f T.Text) (C f T.Text) (C f Bool)
+    deriving (Generic, Beamable)
+  primaryKey r = TagReviewId (_trPkgName r) (_trTag r) (_trIsAddition r)
+
+deriving instance Show (TagReviewT Identity)
+
+-- Tag aliases: (canonical_tag, alias_tag)
+data TagAliasRowT f = TagAliasRow
+  { _talCanonical :: C f T.Text
+  , _talAlias     :: C f T.Text
+  } deriving (Generic, Beamable)
+
+instance Table TagAliasRowT where
+  data PrimaryKey TagAliasRowT f =
+    TagAliasRowId (C f T.Text) (C f T.Text)
+    deriving (Generic, Beamable)
+  primaryKey r = TagAliasRowId (_talCanonical r) (_talAlias r)
+
+deriving instance Show (TagAliasRowT Identity)
+
+-- Database definitions
+
+data TagsDbAll f = TagsDbAll
+  { _tagAssignments :: f (TableEntity TagAssignmentT)
+  , _tagReviews     :: f (TableEntity TagReviewT)
+  , _tagAliases     :: f (TableEntity TagAliasRowT)
+  } deriving (Generic, Database Postgres)
+
+tagsDbAll :: DatabaseSettings Postgres TagsDbAll
+tagsDbAll = defaultDbSettings `withDbModification`
+  TagsDbAll
+    (setEntityName "tags__assignments" <>
+     modifyTableFields tableModification
+       { _taPkgName = "pkg_name"
+       , _taTag     = "tag"
+       })
+    (setEntityName "tags__reviews" <>
+     modifyTableFields tableModification
+       { _trPkgName    = "pkg_name"
+       , _trTag        = "tag"
+       , _trIsAddition = "is_addition"
+       })
+    (setEntityName "tags__aliases" <>
+     modifyTableFields tableModification
+       { _talCanonical = "canonical_tag"
+       , _talAlias     = "alias_tag"
+       })
+
+tagAssignmentsTable :: DatabaseEntity Postgres TagsDbAll (TableEntity TagAssignmentT)
+tagAssignmentsTable = _tagAssignments tagsDbAll
+
+tagReviewsTable :: DatabaseEntity Postgres TagsDbAll (TableEntity TagReviewT)
+tagReviewsTable = _tagReviews tagsDbAll
+
+tagAliasesTable :: DatabaseEntity Postgres TagsDbAll (TableEntity TagAliasRowT)
+tagAliasesTable = _tagAliases tagsDbAll
+
+-- Rebuild tagPackages (reverse index) from packageTags
+rebuildTagPackages :: Map PackageName (Set Tag) -> Map Tag (Set PackageName)
+rebuildTagPackages pkgTags =
+  Map.foldlWithKey' addPkg Map.empty pkgTags
+  where
+    addPkg acc pkgName tags =
+      Set.foldl' (\m t -> Map.insertWith Set.union t (Set.singleton pkgName) m) acc tags
+
+loadPackageTags :: PgTx Acid.PackageTags
+loadPackageTags = do
+  -- Load tag assignments
+  assignRows <- beamTx $
+    runSelectReturningList $ select $ all_ tagAssignmentsTable
+  let pkgTags = foldl' addAssign Map.empty assignRows
+      addAssign m (TagAssignmentRow name tag) =
+        case simpleParse (T.unpack name) of
+          Just pkgName ->
+            Map.insertWith Set.union pkgName
+              (Set.singleton (Tag (T.unpack tag))) m
+          Nothing -> m
+
+  -- Load review tags
+  reviewRows <- beamTx $
+    runSelectReturningList $ select $ all_ tagReviewsTable
+  let reviews = foldl' addReview Map.empty reviewRows
+      addReview m (TagReviewRow name tag isAdd) =
+        case simpleParse (T.unpack name) of
+          Just pkgName ->
+            let t = Tag (T.unpack tag)
+                update (adds, dels) = if isAdd
+                  then (Set.insert t adds, dels)
+                  else (adds, Set.insert t dels)
+            in Map.alter (Just . update . maybe (Set.empty, Set.empty) id) pkgName m
+          Nothing -> m
+
+  -- Compute reverse index
+  let tagPkgs = rebuildTagPackages pkgTags
+
+  return $ Acid.PackageTags pkgTags tagPkgs reviews
+
+savePackageTags :: Acid.PackageTags -> PgTx ()
+savePackageTags (Acid.PackageTags pkgTags _tagPkgs reviews) =
+  do
+    -- Delete and reinsert assignments
+    beamTx $
+      runDelete $ delete tagAssignmentsTable (\_ -> val_ True)
+    let assignRows =
+          [ TagAssignmentRow (T.pack $ display pkgName) (T.pack tagStr)
+          | (pkgName, tags) <- Map.toList pkgTags
+          , Tag tagStr <- Set.toList tags ]
+    mapM_ (insertAssignChunk) (chunksOf 1000 assignRows)
+
+    -- Delete and reinsert reviews
+    beamTx $
+      runDelete $ delete tagReviewsTable (\_ -> val_ True)
+    let reviewRows =
+          [ TagReviewRow (T.pack $ display pkgName) (T.pack tagStr) isAdd
+          | (pkgName, (adds, dels)) <- Map.toList reviews
+          , (Tag tagStr, isAdd) <- map (\t -> (t, True)) (Set.toList adds)
+                                ++ map (\t -> (t, False)) (Set.toList dels) ]
+    mapM_ (insertReviewChunk) (chunksOf 1000 reviewRows)
+
+insertAssignChunk :: [TagAssignmentT Identity] -> PgTx ()
+insertAssignChunk chunk =
+  beamTx $
+    runInsert $ insert tagAssignmentsTable $ insertValues chunk
+
+insertReviewChunk :: [TagReviewT Identity] -> PgTx ()
+insertReviewChunk chunk =
+  beamTx $
+    runInsert $ insert tagReviewsTable $ insertValues chunk
+
+loadTagAlias :: PgTx Acid.TagAlias
+loadTagAlias = do
+  rows <- beamTx $
+    runSelectReturningList $ select $ all_ tagAliasesTable
+  let addRow m (TagAliasRow canonical alias) =
+        Map.insertWith Set.union (Tag (T.unpack canonical))
+          (Set.singleton (Tag (T.unpack alias))) m
+  return $ Acid.TagAlias $ foldl' addRow Map.empty rows
+
+saveTagAlias :: Acid.TagAlias -> PgTx ()
+saveTagAlias (Acid.TagAlias aliases) =
+  do
+    beamTx $
+      runDelete $ delete tagAliasesTable (\_ -> val_ True)
+    let rows = [ TagAliasRow (T.pack canonical) (T.pack alias)
+               | (Tag canonical, aliasSet) <- Map.toList aliases
+               , Tag alias <- Set.toList aliasSet ]
+    mapM_ (insertAliasChunk) (chunksOf 1000 rows)
+
+insertAliasChunk :: [TagAliasRowT Identity] -> PgTx ()
+insertAliasChunk chunk =
+  beamTx $
+    runInsert $ insert tagAliasesTable $ insertValues chunk
+
+chunksOf :: Int -> [a] -> [[a]]
+chunksOf _ [] = []
+chunksOf n xs = let (h, t) = splitAt n xs in h : chunksOf n t
+
+------------------------------------------------------------------------
+
+tagsStateComponent :: PgConnection -> IO (StateComponent AcidState Acid.PackageTags)
+tagsStateComponent serverPgConn = do
+  -- Load state
+  loaded <- runPgTx serverPgConn loadPackageTags
+
+  pgSt <- mkAcidState serverPgConn loaded savePackageTags
   return StateComponent {
       stateDesc    = "Package tags"
-    , stateHandle  = st
-    , getState     = query st Acid.GetPackageTags
-    , putState     = update st . Acid.ReplacePackageTags
+    , stateHandle  = pgSt
+    , getState     = queryPg pgSt (runQueryEvent Acid.GetPackageTags)
+    , putState     = \s -> do
+        runPgTx serverPgConn (savePackageTags s)
+        _ <- swapMVar (pgMVar pgSt) s
+        return ()
     , backupState  = \_ pkgTags -> [csvToBackup ["tags.csv"] $ tagsToCSV pkgTags]
     , restoreState = tagsBackup
-    , resetState   = tagsStateComponent
+    , resetState   = \_ -> tagsStateComponent serverPgConn
     }
 
-tagsAliasComponent :: FilePath -> IO (StateComponent AcidState Acid.TagAlias)
-tagsAliasComponent stateDir = do
-  st <- openLocalStateFrom (stateDir </> "db" </> "Tags" </> "Alias") Acid.emptyTagAlias
+tagsAliasComponent :: PgConnection -> IO (StateComponent AcidState Acid.TagAlias)
+tagsAliasComponent serverPgConn = do
+  -- Load state
+  loaded <- runPgTx serverPgConn loadTagAlias
+
+  pgSt <- mkAcidState serverPgConn loaded saveTagAlias
   return StateComponent {
       stateDesc    = "Tags Alias"
-    , stateHandle  = st
-    , getState     = query st Acid.GetTagAliasesState
-    , putState     = update st . Acid.AddTagAliasesState
+    , stateHandle  = pgSt
+    , getState     = queryPg pgSt (runQueryEvent Acid.GetTagAliasesState)
+    , putState     = \s -> do
+        runPgTx serverPgConn (saveTagAlias s)
+        _ <- swapMVar (pgMVar pgSt) s
+        return ()
     , backupState  = \_ aliases -> [csvToBackup ["aliases.csv"] $ aliasToCSV aliases]
     , restoreState = aliasBackup
-    , resetState   = tagsAliasComponent
+    , resetState   = \_ -> tagsAliasComponent serverPgConn
     }
 
 tagsFeature :: CoreFeature
@@ -366,7 +577,7 @@ constructImmutableTags genDesc =
 tagify :: String -> Tag
 tagify (x:xs) = Tag $ (if tagInitialChar x then (x:) else id) $ tagify' xs
   where tagify' (c:cs) | tagLaterChar c = c:tagify' cs
-        tagify' (c:cs) | c `elem` " /\\" = '-':tagify' cs -- dash is the preferred word separator?
+        tagify' (c:cs) | c `elem` (" /\\" :: String) = '-':tagify' cs -- dash is the preferred word separator?
         tagify' (_:cs) = tagify' cs
         tagify' [] = []
 tagify [] = Tag ""

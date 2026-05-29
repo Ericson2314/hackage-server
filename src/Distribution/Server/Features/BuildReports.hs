@@ -1,4 +1,13 @@
-{-# LANGUAGE RankNTypes, NamedFieldPuns, RecordWildCards #-}
+{-# LANGUAGE DeriveAnyClass #-}
+{-# LANGUAGE DeriveGeneric #-}
+{-# LANGUAGE FlexibleInstances #-}
+{-# LANGUAGE MultiParamTypeClasses #-}
+{-# LANGUAGE NamedFieldPuns #-}
+{-# LANGUAGE OverloadedStrings #-}
+{-# LANGUAGE RankNTypes #-}
+{-# LANGUAGE RecordWildCards #-}
+{-# LANGUAGE StandaloneDeriving #-}
+{-# LANGUAGE TypeFamilies #-}
 module Distribution.Server.Features.BuildReports (
     BuildReportId(..),
     ReportsFeature(..),
@@ -16,7 +25,7 @@ import Distribution.Server.Features.BuildReports.Backup
 import qualified Distribution.Server.Features.BuildReports.State as Acid
 import qualified Distribution.Server.Features.BuildReports.BuildReport as BuildReport
 import Distribution.Server.Features.BuildReports.BuildReport (BuildReport(..))
-import Distribution.Server.Features.BuildReports.BuildReports (BuildReports, BuildReportId(..), BuildCovg(..), BuildLog(..), TestLog(..))
+import Distribution.Server.Features.BuildReports.BuildReports (BuildReports(..), BuildReportId(..), PkgBuildReports(..), BuildCovg(..), BuildLog(..), TestLog(..))
 import qualified Distribution.Server.Framework.ResponseContentTypes as Resource
 
 import Distribution.Server.Packages.Types
@@ -31,8 +40,19 @@ import Control.Arrow (second)
 import Data.ByteString.Lazy (toStrict)
 import Data.String (fromString)
 import Data.Maybe
+import Data.List (foldl')
+import qualified Data.Map as Map
+import qualified Data.Text as T
+import qualified Data.Text.Encoding as T
 import Distribution.Compiler ( CompilerId(..) )
 import Data.Aeson (toJSON)
+
+import GHC.Generics (Generic)
+import           Data.Int (Int32)
+import Database.Beam hiding (time)
+import Database.Beam.Postgres
+import qualified Database.PostgreSQL.Simple as PG
+import Control.Concurrent.MVar (swapMVar)
 
 
 -- TODO:
@@ -76,8 +96,8 @@ initBuildReportsFeature :: String
                             -> UploadFeature
                             -> CoreResource
                             -> IO ReportsFeature)
-initBuildReportsFeature name env@ServerEnv{serverStateDir} = do
-    reportsState <- reportsStateComponent name serverStateDir
+initBuildReportsFeature name env@ServerEnv{serverPgConn} = do
+    reportsState <- reportsStateComponent name serverPgConn
 
     return $ \user upload core -> do
       let feature = buildReportsFeature name env
@@ -85,17 +105,196 @@ initBuildReportsFeature name env@ServerEnv{serverStateDir} = do
                                         reportsState
       return feature
 
-reportsStateComponent :: String -> FilePath -> IO (StateComponent AcidState BuildReports)
-reportsStateComponent name stateDir = do
-  st  <- openLocalStateFrom (stateDir </> "db" </> name) Acid.initialBuildReports
+------------------------------------------------------------------------
+-- Beam tables for build reports (typed columns)
+--
+
+-- | Individual build reports
+data BuildReportsReportT f = BuildReportsReportRow
+  { _brrPkgName       :: C f T.Text
+  , _brrPkgVersion    :: C f T.Text
+  , _brrReportId      :: C f Int32
+  , _brrReportText    :: C f T.Text           -- BuildReport rendered as text
+  , _brrBuildLogBlobId:: C f (Maybe T.Text)   -- hex MD5, nullable
+  , _brrTestLogBlobId :: C f (Maybe T.Text)   -- hex MD5, nullable
+  , _brrBuildCovgText :: C f (Maybe T.Text)   -- BuildCovg rendered via Show, nullable
+  } deriving (Generic, Beamable)
+
+instance Table BuildReportsReportT where
+  data PrimaryKey BuildReportsReportT f =
+    BuildReportsReportId (C f T.Text) (C f T.Text) (C f Int32)
+    deriving (Generic, Beamable)
+  primaryKey r = BuildReportsReportId (_brrPkgName r) (_brrPkgVersion r) (_brrReportId r)
+
+deriving instance Show (BuildReportsReportT Identity)
+
+-- | Per-package build metadata (fail count, run tests)
+data BuildReportsMetaT f = BuildReportsMetaRow
+  { _brmPkgName    :: C f T.Text
+  , _brmPkgVersion :: C f T.Text
+  , _brmFailCount  :: C f (Maybe Int32)  -- NULL means BuildOK, non-null is BuildFailCnt
+  , _brmRunTests   :: C f Bool
+  } deriving (Generic, Beamable)
+
+instance Table BuildReportsMetaT where
+  data PrimaryKey BuildReportsMetaT f =
+    BuildReportsMetaId (C f T.Text) (C f T.Text)
+    deriving (Generic, Beamable)
+  primaryKey r = BuildReportsMetaId (_brmPkgName r) (_brmPkgVersion r)
+
+deriving instance Show (BuildReportsMetaT Identity)
+
+data BuildReportsDb f = BuildReportsDb
+  { _buildReportsReports :: f (TableEntity BuildReportsReportT)
+  , _buildReportsMeta    :: f (TableEntity BuildReportsMetaT)
+  } deriving (Generic, Database Postgres)
+
+buildReportsDb :: DatabaseSettings Postgres BuildReportsDb
+buildReportsDb = defaultDbSettings `withDbModification`
+  BuildReportsDb
+    (setEntityName "build_reports__reports" <>
+     modifyTableFields tableModification
+       { _brrPkgName        = "pkg_name"
+       , _brrPkgVersion     = "pkg_version"
+       , _brrReportId       = "report_id"
+       , _brrReportText     = "report_text"
+       , _brrBuildLogBlobId = "build_log_blob_id"
+       , _brrTestLogBlobId  = "test_log_blob_id"
+       , _brrBuildCovgText  = "build_covg_text"
+       })
+    (setEntityName "build_reports__package_meta" <>
+     modifyTableFields tableModification
+       { _brmPkgName    = "pkg_name"
+       , _brmPkgVersion = "pkg_version"
+       , _brmFailCount  = "fail_count"
+       , _brmRunTests   = "run_tests"
+       })
+
+buildReportsReportTable :: DatabaseEntity Postgres BuildReportsDb (TableEntity BuildReportsReportT)
+buildReportsReportTable = _buildReportsReports buildReportsDb
+
+buildReportsMetaTable :: DatabaseEntity Postgres BuildReportsDb (TableEntity BuildReportsMetaT)
+buildReportsMetaTable = _buildReportsMeta buildReportsDb
+
+-- | Parse a BlobId from its hex MD5 string representation
+parseBlobId :: T.Text -> BlobStorage.BlobId
+parseBlobId t = case BlobStorage.readBlobId (T.unpack t) of
+  Right bid -> bid
+  Left err  -> error $ "Failed to parse BlobId: " ++ err
+
+loadBuildReports :: PgTx BuildReports
+loadBuildReports = do
+  reportRows <- beamTx $
+    runSelectReturningList $ select $ all_ buildReportsReportTable
+  metaRows <- beamTx $
+    runSelectReturningList $ select $ all_ buildReportsMetaTable
+  let -- Build the meta map: PackageId -> (BuildStatus, Bool)
+      metaMap = Map.fromList
+        [ (makePackageId (T.unpack (_brmPkgName m)) (T.unpack (_brmPkgVersion m)),
+           ( case _brmFailCount m of
+               Nothing -> BuildReport.BuildOK
+               Just n  -> BuildReport.BuildFailCnt (fromIntegral n)
+           , _brmRunTests m
+           ))
+        | m <- metaRows
+        ]
+      -- Group reports by package
+      reportMap = foldl' addReportRow Map.empty reportRows
+      -- Combine into BuildReports
+      allPkgIds = Map.keys reportMap ++ Map.keys metaMap
+      reportsIndex = Map.fromList
+        [ (pkgid, let rpts = Map.findWithDefault Map.empty pkgid reportMap
+                      (status, rTests) = Map.findWithDefault (BuildReport.BuildFailCnt 0, True) pkgid metaMap
+                      nextId = if Map.null rpts
+                                 then BuildReportId 1
+                                 else let BuildReportId maxId = fst (Map.findMax rpts)
+                                      in BuildReportId (maxId + 1)
+                  in PkgBuildReports rpts nextId status rTests)
+        | pkgid <- nub allPkgIds
+        ]
+  return $ BuildReports { reportsIndex = reportsIndex }
+  where
+    nub = Map.keys . Map.fromList . map (\x -> (x, ()))
+
+    makePackageId :: String -> String -> PackageId
+    makePackageId name ver = case (simpleParse name, simpleParse ver) of
+      (Just n, Just v) -> PackageIdentifier n v
+      _ -> error $ "Failed to parse package id: " ++ name ++ "-" ++ ver
+
+    addReportRow :: Map.Map PackageId (Map.Map BuildReportId (BuildReport, Maybe BuildLog, Maybe TestLog, Maybe BuildCovg))
+                 -> BuildReportsReportT Identity
+                 -> Map.Map PackageId (Map.Map BuildReportId (BuildReport, Maybe BuildLog, Maybe TestLog, Maybe BuildCovg))
+    addReportRow m row =
+      let pkgid = makePackageId (T.unpack (_brrPkgName row)) (T.unpack (_brrPkgVersion row))
+          rid = BuildReportId (fromIntegral (_brrReportId row))
+          report = case BuildReport.parse (T.encodeUtf8 (_brrReportText row)) of
+            Right r -> r
+            Left err -> error $ "Failed to parse BuildReport: " ++ err
+          buildLog = fmap (BuildLog . parseBlobId) (_brrBuildLogBlobId row)
+          testLog  = fmap (TestLog . parseBlobId) (_brrTestLogBlobId row)
+          covg = fmap (\t -> read (T.unpack t)) (_brrBuildCovgText row)
+      in Map.insertWith Map.union pkgid (Map.singleton rid (report, buildLog, testLog, covg)) m
+
+saveBuildReports :: BuildReports -> PgTx ()
+saveBuildReports (BuildReports idx) =
+  do
+    -- Clear old data
+    beamTx $
+      runDelete $ delete buildReportsReportTable (\_ -> val_ True)
+    beamTx $
+      runDelete $ delete buildReportsMetaTable (\_ -> val_ True)
+    -- Insert reports
+    let reportRows =
+          [ BuildReportsReportRow
+              { _brrPkgName        = T.pack (display (packageName pkgid))
+              , _brrPkgVersion     = T.pack (display (packageVersion pkgid))
+              , _brrReportId       = fromIntegral rid
+              , _brrReportText     = T.pack (BuildReport.show report)
+              , _brrBuildLogBlobId = fmap (\(BuildLog bid) -> T.pack (BlobStorage.blobMd5 bid)) mlog
+              , _brrTestLogBlobId  = fmap (\(TestLog bid) -> T.pack (BlobStorage.blobMd5 bid)) mtest
+              , _brrBuildCovgText  = fmap (\c -> T.pack (show c)) mcovg
+              }
+          | (pkgid, pkgReports) <- Map.toList idx
+          , (BuildReportId rid, (report, mlog, mtest, mcovg)) <- Map.toList (reports pkgReports)
+          ]
+    unless (null reportRows) $
+      beamTx $
+        runInsert $ insert buildReportsReportTable $ insertValues reportRows
+    -- Insert meta
+    let metaRows =
+          [ BuildReportsMetaRow
+              { _brmPkgName    = T.pack (display (packageName pkgid))
+              , _brmPkgVersion = T.pack (display (packageVersion pkgid))
+              , _brmFailCount  = case buildStatus pkgReports of
+                  BuildReport.BuildOK       -> Nothing
+                  BuildReport.BuildFailCnt n -> Just (fromIntegral n)
+              , _brmRunTests   = runTests pkgReports
+              }
+          | (pkgid, pkgReports) <- Map.toList idx
+          ]
+    unless (null metaRows) $
+      beamTx $
+        runInsert $ insert buildReportsMetaTable $ insertValues metaRows
+
+------------------------------------------------------------------------
+
+reportsStateComponent :: String -> PgConnection -> IO (StateComponent AcidState BuildReports)
+reportsStateComponent name serverPgConn = do
+  -- Load state
+  st <- runPgTx serverPgConn loadBuildReports
+
+  pgSt <- mkAcidState serverPgConn st saveBuildReports
   return StateComponent {
       stateDesc    = "Build reports"
-    , stateHandle  = st
-    , getState     = query st Acid.GetBuildReports
-    , putState     = update st . Acid.ReplaceBuildReports
+    , stateHandle  = pgSt
+    , getState     = queryPg pgSt (runQueryEvent Acid.GetBuildReports)
+    , putState     = \s -> do
+        runPgTx serverPgConn (saveBuildReports s)
+        _ <- swapMVar (pgMVar pgSt) s
+        return ()
     , backupState  = \_ -> dumpBackup
     , restoreState = restoreBackup
-    , resetState   = reportsStateComponent name
+    , resetState   = \_ -> reportsStateComponent name serverPgConn
     }
 
 buildReportsFeature :: String

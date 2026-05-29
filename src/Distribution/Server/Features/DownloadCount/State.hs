@@ -1,4 +1,4 @@
-{-# LANGUAGE TemplateHaskell, StandaloneDeriving, GeneralizedNewtypeDeriving,
+{-# LANGUAGE OverloadedStrings, DeriveAnyClass, DeriveGeneric, DerivingStrategies, TemplateHaskell, StandaloneDeriving, GeneralizedNewtypeDeriving,
              DeriveDataTypeable, TypeFamilies, FlexibleInstances,
              MultiParamTypeClasses, BangPatterns #-}
 module Distribution.Server.Features.DownloadCount.State where
@@ -23,7 +23,8 @@ import System.IO.Unsafe (unsafeInterleaveIO)
 import Text.CSV (printCSV)
 import Control.Exception (evaluate)
 
-import Data.Acid (Update, Query, makeAcidic)
+import Distribution.Server.Framework.EventSourcing (Query, Update, makeAcidic)
+import Distribution.Server.Framework.BeamInstances ()
 import Data.SafeCopy (base, deriveSafeCopy, safeGet, safePut)
 import Data.Serialize.Get (runGetLazy)
 import Data.Serialize.Put (runPutLazy)
@@ -55,7 +56,8 @@ data InMemStats = InMemStats {
 newtype OnDiskStats = OnDiskStats {
     onDiskStats :: NestedCountingMap PackageName OnDiskPerPkg
   }
-  deriving (Show, Eq, MemSize)
+  deriving stock (Show, Eq)
+  deriving newtype (MemSize)
 
 instance CountingMap (PackageName, (Day, Version)) OnDiskStats where
   cmEmpty                            = OnDiskStats cmEmpty
@@ -71,7 +73,8 @@ instance CountingMap (PackageName, (Day, Version)) OnDiskStats where
 newtype OnDiskPerPkg = OnDiskPerPkg {
     onDiskPerPkgCounts :: NestedCountingMap Day (SimpleCountingMap Version)
   }
-  deriving (Show, Eq, Ord, MemSize)
+  deriving stock (Show, Eq, Ord)
+  deriving newtype (MemSize)
 
 instance CountingMap (Day, Version) OnDiskPerPkg where
   cmEmpty  = OnDiskPerPkg cmEmpty
@@ -86,7 +89,8 @@ instance CountingMap (Day, Version) OnDiskPerPkg where
 newtype RecentDownloads = RecentDownloads {
     recentDownloads :: SimpleCountingMap PackageName
   }
-  deriving (Show, Eq, MemSize)
+  deriving stock (Show, Eq)
+  deriving newtype (MemSize)
 
 instance CountingMap PackageName RecentDownloads where
   cmEmpty  = RecentDownloads cmEmpty
@@ -101,7 +105,8 @@ instance CountingMap PackageName RecentDownloads where
 newtype TotalDownloads = TotalDownloads {
     totalDownloads :: SimpleCountingMap PackageName
   }
-  deriving (Show, Eq, MemSize)
+  deriving stock (Show, Eq)
+  deriving newtype (MemSize)
 
 instance CountingMap PackageName TotalDownloads where
   cmEmpty  = TotalDownloads cmEmpty

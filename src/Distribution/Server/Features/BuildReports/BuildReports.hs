@@ -1,5 +1,5 @@
-{-# LANGUAGE DeriveDataTypeable, GeneralizedNewtypeDeriving, TemplateHaskell,
-             TypeFamilies #-}
+{-# LANGUAGE OverloadedStrings, DeriveDataTypeable, DerivingStrategies, GeneralizedNewtypeDeriving, TemplateHaskell,
+             MultiParamTypeClasses, TypeFamilies #-}
 {-# OPTIONS_GHC -fno-warn-orphans #-}
 module Distribution.Server.Features.BuildReports.BuildReports (
     BuildReport(..),
@@ -42,6 +42,12 @@ import qualified Distribution.Parsec as P
 import qualified Distribution.Compat.Parsing as P
 import qualified Distribution.Compat.CharParsing as P
 
+import Data.Int (Int32)
+import qualified Data.Text as T
+import Database.Beam.Backend (FromBackendRow(..))
+import Database.Beam.Backend.SQL (HasSqlValueSyntax(..))
+import Database.Beam.Postgres (Postgres)
+import Database.Beam.Postgres.Syntax (PgValueSyntax)
 import Distribution.Server.Framework.MemSize
 import Distribution.Server.Framework.Instances
 
@@ -57,8 +63,11 @@ import Data.Maybe (fromMaybe)
 import Text.StringTemplate (ToSElem(..))
 
 
-newtype BuildReportId = BuildReportId Int
-  deriving (Eq, Ord, Show, MemSize, Pretty)
+newtype BuildReportId = BuildReportId Int32
+  deriving newtype (Eq, Ord, Show, Num, HasSqlValueSyntax PgValueSyntax, FromBackendRow Postgres)
+
+instance MemSize BuildReportId where memSize _ = 1
+instance Pretty BuildReportId where pretty (BuildReportId n) = Distribution.Pretty.pretty (fromIntegral n :: Int)
 
 incrementReportId :: BuildReportId -> BuildReportId
 incrementReportId (BuildReportId n) = BuildReportId (n+1)
@@ -67,7 +76,7 @@ incrementReportId (BuildReportId n) = BuildReportId (n+1)
 instance Parsec BuildReportId where
   -- parse a non-negative integer. No redundant leading zeros allowed.
   -- (this is effectively a relabeled versionDigitParser)
-  parsec = (P.some d >>= (fmap BuildReportId . toNumber)) P.<?> "BuildReportId (natural number without redunant leading zeroes)"
+  parsec = (P.some d >>= (fmap (BuildReportId . fromIntegral) . toNumber)) P.<?> "BuildReportId (natural number without redunant leading zeroes)"
     where
       toNumber :: P.CabalParsing m => [Int] -> m Int
       toNumber [0]   = return 0
@@ -256,7 +265,7 @@ instance SafeCopy BuildReportId_v0 where
 
 instance Migrate BuildReportId where
     type MigrateFrom BuildReportId = BuildReportId_v0
-    migrate (BuildReportId_v0 bid) = BuildReportId bid
+    migrate (BuildReportId_v0 bid) = BuildReportId (fromIntegral bid)
 
 deriveSafeCopy 2 'extension ''BuildReportId
 
@@ -431,3 +440,8 @@ instance MemSize BuildReports where
     memSize (BuildReports a) = memSize1 a
 
 deriveSafeCopy 4 'extension ''BuildReports
+
+instance HasSqlValueSyntax PgValueSyntax BuildLog where sqlValueSyntax = sqlValueSyntax . T.pack . show
+instance HasSqlValueSyntax PgValueSyntax TestLog where sqlValueSyntax = sqlValueSyntax . T.pack . show
+instance HasSqlValueSyntax PgValueSyntax BuildStatus where sqlValueSyntax = sqlValueSyntax . T.pack . show
+instance HasSqlValueSyntax PgValueSyntax BuildReports where sqlValueSyntax = sqlValueSyntax . T.pack . show

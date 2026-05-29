@@ -1,4 +1,10 @@
-{-# LANGUAGE NamedFieldPuns, RecordWildCards #-}
+{-# LANGUAGE DeriveAnyClass #-}
+{-# LANGUAGE DeriveGeneric #-}
+{-# LANGUAGE FlexibleInstances #-}
+{-# LANGUAGE MultiParamTypeClasses #-}
+{-# LANGUAGE NamedFieldPuns, OverloadedStrings, RecordWildCards #-}
+{-# LANGUAGE StandaloneDeriving #-}
+{-# LANGUAGE TypeFamilies #-}
 -- | The tar index cache provides generic support for caching a tarball's
 -- TarIndex; this is used by various other modules.
 module Distribution.Server.Features.TarIndexCache (
@@ -28,7 +34,15 @@ import Distribution.Package (packageId)
 import Distribution.Text (display)
 
 import qualified Data.Map as Map
+import qualified Data.Text as T
 import Data.Aeson (toJSON)
+import Data.List (foldl')
+
+import GHC.Generics (Generic)
+import Database.Beam
+import Database.Beam.Postgres
+import Control.Concurrent.MVar (swapMVar)
+import qualified Database.PostgreSQL.Simple as PG
 
 data TarIndexCacheFeature = TarIndexCacheFeature {
     tarIndexCacheFeatureInterface :: HackageFeature
@@ -45,22 +59,87 @@ instance IsHackageFeature TarIndexCacheFeature where
 initTarIndexCacheFeature :: ServerEnv
                          -> IO (UserFeature
                              -> IO TarIndexCacheFeature)
-initTarIndexCacheFeature env@ServerEnv{serverStateDir} = do
-    tarIndexCache <- tarIndexCacheStateComponent serverStateDir
+initTarIndexCacheFeature env@ServerEnv{serverPgConn} = do
+    tarIndexCache <- tarIndexCacheStateComponent serverPgConn
 
     return $ \users -> do
       let feature = tarIndexCacheFeature env users tarIndexCache
       return feature
 
-tarIndexCacheStateComponent :: FilePath -> IO (StateComponent AcidState Acid.TarIndexCache)
-tarIndexCacheStateComponent stateDir = do
-  st <- openLocalStateFrom (stateDir </> "db" </> "TarIndexCache") Acid.initialTarIndexCache
+------------------------------------------------------------------------
+-- Beam table
+--
+
+data TarIndexRowT f = TarIndexRow
+  { _tiTarballBlobId :: C f T.Text
+  , _tiIndexBlobId   :: C f T.Text
+  } deriving (Generic, Beamable)
+
+instance Table TarIndexRowT where
+  data PrimaryKey TarIndexRowT f =
+    TarIndexRowId (C f T.Text)
+    deriving (Generic, Beamable)
+  primaryKey r = TarIndexRowId (_tiTarballBlobId r)
+
+deriving instance Show (TarIndexRowT Identity)
+
+data TarIndexDb f = TarIndexDb
+  { _tarIndexRows :: f (TableEntity TarIndexRowT)
+  } deriving (Generic, Database Postgres)
+
+tarIndexDb :: DatabaseSettings Postgres TarIndexDb
+tarIndexDb = defaultDbSettings `withDbModification`
+  TarIndexDb (setEntityName "tar_index_cache__cache" <>
+              modifyTableFields tableModification
+                { _tiTarballBlobId = "tarball_blob_id"
+                , _tiIndexBlobId   = "index_blob_id"
+                })
+
+tarIndexTable :: DatabaseEntity Postgres TarIndexDb (TableEntity TarIndexRowT)
+tarIndexTable = _tarIndexRows tarIndexDb
+
+loadTarIndexCache :: PgTx Acid.TarIndexCache
+loadTarIndexCache = do
+  rows <- beamTx $
+    runSelectReturningList $ select $ all_ tarIndexTable
+  let addRow m (TarIndexRow tarHex idxHex) =
+        case (readBlobId (T.unpack tarHex), readBlobId (T.unpack idxHex)) of
+          (Right tarId, Right idxId) -> Map.insert tarId idxId m
+          _ -> m  -- skip unparseable rows
+  return $ Acid.TarIndexCache $ foldl' addRow Map.empty rows
+
+saveTarIndexCache :: Acid.TarIndexCache -> PgTx ()
+saveTarIndexCache (Acid.TarIndexCache cache) = do
+    beamTx $ runDelete $ delete tarIndexTable (\_ -> val_ True)
+    let rows = [ TarIndexRow (T.pack $ blobMd5 tarId) (T.pack $ blobMd5 idxId)
+               | (tarId, idxId) <- Map.toList cache ]
+    mapM_ insertTarIndexChunk (chunksOf 1000 rows)
+
+insertTarIndexChunk :: [TarIndexRowT Identity] -> PgTx ()
+insertTarIndexChunk chunk =
+    beamTx $ runInsert $ insert tarIndexTable $ insertValues chunk
+
+chunksOf :: Int -> [a] -> [[a]]
+chunksOf _ [] = []
+chunksOf n xs = let (h, t) = splitAt n xs in h : chunksOf n t
+
+------------------------------------------------------------------------
+
+tarIndexCacheStateComponent :: PgConnection -> IO (StateComponent AcidState Acid.TarIndexCache)
+tarIndexCacheStateComponent conn = do
+  -- Load state
+  loaded <- runPgTx conn loadTarIndexCache
+
+  pgSt <- mkAcidState conn loaded saveTarIndexCache
   return StateComponent {
       stateDesc    = "Mapping from tarball blob IDs to tarindex blob IDs"
-    , stateHandle  = st
-    , getState     = query st Acid.GetTarIndexCache
-    , putState     = update st . Acid.ReplaceTarIndexCache
-    , resetState   = tarIndexCacheStateComponent
+    , stateHandle  = pgSt
+    , getState     = queryPg pgSt (runQueryEvent Acid.GetTarIndexCache)
+    , putState     = \s -> do
+        runPgTx conn (saveTarIndexCache s)
+        _ <- swapMVar (pgMVar pgSt) s
+        return ()
+    , resetState   = \_ -> tarIndexCacheStateComponent conn
     -- We don't backup the tar indices, but reconstruct them on demand
     , backupState  = \_ _ -> []
     , restoreState = RestoreBackup {

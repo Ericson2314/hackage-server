@@ -1,22 +1,38 @@
-{-# LANGUAGE NamedFieldPuns  #-}
-{-# LANGUAGE RankNTypes      #-}
-{-# LANGUAGE RecordWildCards #-}
+{-# LANGUAGE DeriveAnyClass      #-}
+{-# LANGUAGE DeriveGeneric       #-}
+{-# LANGUAGE FlexibleInstances   #-}
+{-# LANGUAGE MultiParamTypeClasses #-}
+{-# LANGUAGE NamedFieldPuns      #-}
+{-# LANGUAGE OverloadedStrings   #-}
+{-# LANGUAGE RankNTypes          #-}
+{-# LANGUAGE RecordWildCards     #-}
+{-# LANGUAGE StandaloneDeriving  #-}
+{-# LANGUAGE TypeFamilies        #-}
 
 module Distribution.Server.Features.AdminLog where
 
 import qualified Distribution.Server.Features.AdminLog.Acid as Acid
 import Distribution.Server.Features.AdminLog.Backup
 import Distribution.Server.Features.AdminLog.Types
-import Distribution.Server.Users.Types (UserId)
-import Distribution.Server.Users.Group
+import Distribution.Server.Users.Types (UserId(..))
+import Distribution.Server.Users.Group hiding (delete, insert)
 import Distribution.Server.Framework
 import Distribution.Server.Framework.BackupRestore
 
 import Distribution.Server.Pages.AdminLog
 import Distribution.Server.Features.Users
 
-import Data.Time.Clock (getCurrentTime)
+import Data.Time.Clock (getCurrentTime, UTCTime)
 import Distribution.Server.Util.Parse
+
+import GHC.Generics (Generic)
+import Data.Int (Int32)
+import Database.Beam
+import Database.Beam.Postgres
+import Control.Concurrent.MVar (swapMVar)
+import qualified Database.PostgreSQL.Simple as PG
+import qualified Data.Text as T
+import qualified Data.ByteString.Lazy.Char8 as BS
 
 --TODO Maybe Reason
 
@@ -36,8 +52,8 @@ instance IsHackageFeature AdminLogFeature where
     getFeatureInterface = adminLogFeatureInterface
 
 initAdminLogFeature :: ServerEnv -> IO (UserFeature -> IO AdminLogFeature)
-initAdminLogFeature ServerEnv{serverStateDir} = do
-  adminLogState <- adminLogStateComponent serverStateDir
+initAdminLogFeature ServerEnv{serverPgConn} = do
+  adminLogState <- adminLogStateComponent serverPgConn
   return $ \users@UserFeature{groupChangedHook} -> do
 
     let feature = adminLogFeature users adminLogState
@@ -88,17 +104,124 @@ adminLogFeature UserFeature{..} adminLogState
     nameIt TrusteeGroup         = "Trustees"
     nameIt (OtherGroup s)       = unpackUTF8 s
 
-adminLogStateComponent :: FilePath -> IO (StateComponent AcidState Acid.AdminLog)
-adminLogStateComponent stateDir = do
-  st <- openLocalStateFrom (stateDir </> "db" </> "AdminLog") Acid.initialAdminLog
+------------------------------------------------------------------------
+-- Beam table for AdminLog
+
+data AdminLogEntryT f = AdminLogEntryRow
+  { _aleId                :: C f Int32
+  , _aleTimestamp         :: C f UTCTime
+  , _aleUserId            :: C f Int32
+  , _aleActionType        :: C f T.Text
+  , _aleActionTargetUserId :: C f (Maybe Int32)
+  , _aleGroupType         :: C f T.Text
+  , _aleGroupData         :: C f (Maybe T.Text)
+  } deriving (Generic, Beamable)
+
+instance Table AdminLogEntryT where
+  data PrimaryKey AdminLogEntryT f =
+    AdminLogEntryId (C f Int32)
+    deriving (Generic, Beamable)
+  primaryKey r = AdminLogEntryId (_aleId r)
+
+deriving instance Show (AdminLogEntryT Identity)
+
+data AdminLogDb f = AdminLogDb
+  { _adminLogEntries :: f (TableEntity AdminLogEntryT)
+  } deriving (Generic, Database Postgres)
+
+adminLogDb :: DatabaseSettings Postgres AdminLogDb
+adminLogDb = defaultDbSettings `withDbModification`
+  AdminLogDb (setEntityName "admin_log__entries" <>
+              modifyTableFields tableModification
+                { _aleId                 = "id"
+                , _aleTimestamp          = "timestamp"
+                , _aleUserId             = "user_id"
+                , _aleActionType         = "action_type"
+                , _aleActionTargetUserId = "action_target_user_id"
+                , _aleGroupType          = "group_type"
+                , _aleGroupData          = "group_data"
+                })
+
+adminLogEntriesTable :: DatabaseEntity Postgres AdminLogDb (TableEntity AdminLogEntryT)
+adminLogEntriesTable = _adminLogEntries adminLogDb
+
+-- Convert AdminAction to DB fields
+actionToFields :: AdminAction -> (T.Text, Maybe Int32, T.Text, Maybe T.Text)
+actionToFields (Admin_GroupAddUser (UserId targetUid) gd) =
+  ("add", Just (fromIntegral targetUid), groupTypeToText gd, groupDataToText gd)
+actionToFields (Admin_GroupDelUser (UserId targetUid) gd) =
+  ("del", Just (fromIntegral targetUid), groupTypeToText gd, groupDataToText gd)
+
+groupTypeToText :: GroupDesc -> T.Text
+groupTypeToText (MaintainerGroup _) = "maintainer"
+groupTypeToText AdminGroup          = "admin"
+groupTypeToText TrusteeGroup        = "trustee"
+groupTypeToText (OtherGroup _)      = "other"
+
+groupDataToText :: GroupDesc -> Maybe T.Text
+groupDataToText (MaintainerGroup bs') = Just (T.pack $ unpackUTF8 bs')
+groupDataToText AdminGroup            = Nothing
+groupDataToText TrusteeGroup          = Nothing
+groupDataToText (OtherGroup bs')      = Just (T.pack $ unpackUTF8 bs')
+
+-- Convert DB fields back to AdminAction
+fieldsToAction :: T.Text -> Maybe Int32 -> T.Text -> Maybe T.Text -> AdminAction
+fieldsToAction actionType mTargetUid groupType groupData =
+  let targetUid = UserId (maybe 0 fromIntegral mTargetUid)
+      gd = case T.unpack groupType of
+             "maintainer" -> MaintainerGroup (maybe BS.empty (packUTF8 . T.unpack) groupData)
+             "admin"      -> AdminGroup
+             "trustee"    -> TrusteeGroup
+             _            -> OtherGroup (maybe BS.empty (packUTF8 . T.unpack) groupData)
+      mkAction = case T.unpack actionType of
+                   "add" -> Admin_GroupAddUser
+                   _     -> Admin_GroupDelUser
+  in mkAction targetUid gd
+
+loadAdminLog :: PgTx Acid.AdminLog
+loadAdminLog = do
+  rows <- beamTx $
+    runSelectReturningList $ select $
+      orderBy_ (\r -> desc_ (_aleId r)) $
+        all_ adminLogEntriesTable
+  let entries = [ (ts, UserId (fromIntegral uid), fieldsToAction at mtu gt gd, packUTF8 "")
+                | AdminLogEntryRow _id ts uid at mtu gt gd <- rows ]
+  return $ Acid.AdminLog entries
+
+saveAdminLog :: Acid.AdminLog -> PgTx ()
+saveAdminLog (Acid.AdminLog entries) = do
+    beamTx $ runDelete $ delete adminLogEntriesTable (\_ -> val_ True)
+    let rows = zipWith mkRow [(1::Int32)..] (reverse entries)
+    mapM_ (\chunk -> beamTx $
+      runInsert $ insert adminLogEntriesTable $ insertValues chunk) (chunksOf 1000 rows)
+  where
+    mkRow :: Int32 -> (UTCTime, UserId, AdminAction, BS.ByteString) -> AdminLogEntryT Identity
+    mkRow idx (ts, UserId uid, action, _reason) =
+      let (at, mtu, gt, gd) = actionToFields action
+      in AdminLogEntryRow idx ts (fromIntegral uid) at mtu gt gd
+
+chunksOf :: Int -> [a] -> [[a]]
+chunksOf _ [] = []
+chunksOf n xs = let (h, t) = splitAt n xs in h : chunksOf n t
+
+------------------------------------------------------------------------
+
+adminLogStateComponent :: PgConnection -> IO (StateComponent AcidState Acid.AdminLog)
+adminLogStateComponent serverPgConn = do
+  st <- runPgTx serverPgConn loadAdminLog
+
+  pgSt <- mkAcidState serverPgConn st saveAdminLog
   return StateComponent {
       stateDesc    = "AdminLog"
-    , stateHandle  = st
-    , getState     = query st Acid.GetAdminLog
-    , putState     = update st . Acid.ReplaceAdminLog
+    , stateHandle  = pgSt
+    , getState     = queryPg pgSt (runQueryEvent Acid.GetAdminLog)
+    , putState     = \s -> do
+        runPgTx serverPgConn (saveAdminLog s)
+        _ <- swapMVar (pgMVar pgSt) s
+        return ()
     , backupState  = \_ (Acid.AdminLog xs) ->
                       [BackupByteString ["adminLog.txt"] . backupLogEntries $ xs]
     , restoreState = restoreAdminLogBackup
-    , resetState   = adminLogStateComponent
+    , resetState   = \_ -> adminLogStateComponent serverPgConn
     }
 
