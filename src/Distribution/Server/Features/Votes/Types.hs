@@ -1,3 +1,5 @@
 module Distribution.Server.Features.Votes.Types where
 
-type Score = Int
+import Data.Int (Int32)
+
+type Score = Int32

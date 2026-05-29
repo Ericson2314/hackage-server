@@ -1,4 +1,4 @@
-{-# LANGUAGE DeriveDataTypeable, TypeFamilies, TemplateHaskell,
+{-# LANGUAGE OverloadedStrings, DeriveAnyClass, DeriveGeneric, DerivingStrategies, DeriveDataTypeable, TypeFamilies, TemplateHaskell,
              FlexibleInstances, FlexibleContexts, MultiParamTypeClasses,
              TypeOperators #-}
 {-# OPTIONS_GHC -fno-warn-orphans #-}
@@ -12,7 +12,8 @@ import Distribution.Package
 
 import Control.Monad.Reader
 import qualified Control.Monad.State as State
-import Data.Acid     (Query, Update, makeAcidic)
+import Distribution.Server.Framework.EventSourcing (Query, Update, makeAcidic)
+import Distribution.Server.Framework.BeamInstances ()
 
 initialBuildReports :: BuildReports
 initialBuildReports = BuildReports.emptyReports

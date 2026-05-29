@@ -47,8 +47,8 @@ data DistroResource = DistroResource {
 
 initDistroFeature :: ServerEnv
                   -> IO (UserFeature -> CoreFeature -> IO DistroFeature)
-initDistroFeature ServerEnv{serverStateDir} = do
-    distrosBackend <- Acid.acidStore serverStateDir
+initDistroFeature ServerEnv{serverPgConn} = do
+    distrosBackend <- Acid.acidStore serverPgConn
     let distrosStore = Store.backendStore distrosBackend
 
     return $ \user@UserFeature{adminGroup, groupResourcesAt} core@CoreFeature{coreResource} -> do

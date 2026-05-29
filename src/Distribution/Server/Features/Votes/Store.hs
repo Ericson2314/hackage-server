@@ -12,7 +12,6 @@ import Distribution.Server.Users.Types (UserId)
 
 import Distribution.Package (PackageName)
 
-import Control.Arrow ((&&&))
 import Control.Monad.Trans (MonadIO)
 import Data.List (group, sort)
 import Data.Map (Map)
@@ -36,7 +35,7 @@ data Store = Store {
 -- Using a Bayesian average (m=1.5, C=2) to calculate scoring
 votesScore :: Map UserId Score -> Float
 votesScore m =
-     let grouping = map (head &&& length) . group . sort . Map.elems $ m
+     let grouping = map (\g -> (head g, fromIntegral (length g) :: Score)) . group . sort . Map.elems $ m
          score :: Float
          score = fromIntegral ((sum $ map (uncurry (*)) grouping) + 3)/
                  fromIntegral (2 + sum (map snd grouping))

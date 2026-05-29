@@ -33,7 +33,7 @@ import Distribution.Server.Features.UserDetails.Types (AccountDetails(..))
 import Distribution.Server.Features.UserNotify
 import Distribution.Server.Features.UserNotify.Acid
 import Distribution.Server.Features.UserNotify.Types
-import Distribution.Server.Framework.BackupRestore (runRestore)
+
 import Distribution.Server.Framework.Hook (newHook)
 import Distribution.Server.Framework.MemState (newMemStateWHNF)
 import Distribution.Server.Framework.ServerEnv (ServerEnv(..))
@@ -565,7 +565,7 @@ getNotificationEmailsTests =
     genVersion = mkVersion <$> Gen.list (Range.linear 1 4) (Gen.int $ Range.linear 0 50)
     genPackageId = PackageIdentifier <$> genPackageName <*> genVersion
     genCabalFileText = CabalFileText <$> Gen.utf8 (Range.linear 0 50000) Gen.unicode
-    genNonExistentUserId = UserId <$> Gen.int (Range.linear (-1000) (-1))
+    genNonExistentUserId = UserId . fromIntegral <$> Gen.int (Range.linear (-1000) (-1))
     genOldUploadInfo = (,) <$> genUTCTime <*> genNonExistentUserId
     genUploadInfo = fmap fromOldUploadInfo genOldUploadInfo
     genTag = Tag <$> Gen.string (Range.linear 1 10) Gen.unicode
@@ -643,40 +643,12 @@ packsUntil allowMultipleVersions limit generated | length generated < limit = do
   packsUntil allowMultipleVersions limit added
 packsUntil _ _ generated = pure generated
 
-genRevisionRange :: MonadGen m => m NotifyRevisionRange
-genRevisionRange = Gen.enumBounded
-
-genDependencyTriggerBounds :: MonadGen m => m NotifyTriggerBounds
-genDependencyTriggerBounds = Gen.enumBounded
-
-genUidPref :: MonadGen m => m (UserId, NotifyPref)
-genUidPref = do
-  uid <- UserId <$> Gen.int (Range.linear 0 100)
-  pref <-
-    NotifyPref
-      <$> Gen.bool
-      <*> genRevisionRange
-      <*> Gen.bool
-      <*> Gen.bool
-      <*> Gen.bool
-      <*> Gen.bool
-      <*> Gen.bool
-      <*> genDependencyTriggerBounds
-  pure (uid, pref)
-
-prop_csvBackupRoundtrips :: Property
-prop_csvBackupRoundtrips = property $ do
-  prefMap <- forAll $ Gen.map (Range.linear 0 10) genUidPref
-  let csv = notifyDataToCSV (error "unused backupType") (NotifyData (prefMap, error "unused timestamp"))
-  Right listOfMappings <- liftIO $ runRestore (error "unused blobStores") (importNotifyPref csv)
-  prefMap === Map.fromList listOfMappings
 
 hedgehogTests :: IO Bool
 hedgehogTests =
   checkSequential $ Group "hedgehogTests"
     [ ("prop_constructRevDeps", prop_constructRevDeps)
     , ("prop_statsEqualsDeps",  prop_statsEqualsDeps)
-    , ("prop_csvBackupRoundtrips", prop_csvBackupRoundtrips)
     ]
 
 testGolden :: TestName -> FilePath -> IO Lazy.ByteString -> TestTree

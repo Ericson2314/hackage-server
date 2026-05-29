@@ -9,9 +9,7 @@
 module Distribution.Server.Features.UserNotify (
     UserNotifyFeature(..),
     getUserNotificationsOnRelease,
-    importNotifyPref,
     initUserNotifyFeature,
-    notifyDataToCSV,
 
     -- * getNotificationEmails
     getNotificationEmails,
@@ -23,7 +21,6 @@ import qualified Distribution.Server.Features.UserNotify.Acid.Component as AcidC
 import qualified Distribution.Server.Features.UserNotify.Acid as Acid
 import qualified Distribution.Server.Features.UserNotify.Store as Store
 import Distribution.Server.Features.UserNotify.Acid (NotifyPref(..))
-import Distribution.Server.Features.UserNotify.Backup
 import Distribution.Server.Features.UserNotify.Types
 import Prelude hiding (lookup)
 import Distribution.Package
@@ -225,10 +222,10 @@ initUserNotifyFeature :: ServerEnv
                           -> ReverseFeature
                           -> VouchFeature
                           -> IO UserNotifyFeature)
-initUserNotifyFeature ServerEnv{ serverStateDir, serverTemplatesDir,
+initUserNotifyFeature ServerEnv{ serverPgConn, serverTemplatesDir,
                                      serverTemplatesMode } = do
     -- Canonical state
-    notifyBackend <- AcidComponent.acidStore serverStateDir
+    notifyBackend <- AcidComponent.acidStore serverPgConn
 
     -- Page templates
     templates <- loadTemplates serverTemplatesMode

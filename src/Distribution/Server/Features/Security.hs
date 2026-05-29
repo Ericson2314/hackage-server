@@ -38,7 +38,7 @@ instance IsHackageFeature SecurityFeature where
 
 initSecurityFeature :: ServerEnv -> IO (CoreFeature -> IO SecurityFeature)
 initSecurityFeature env = do
-    securityBackend <- Acid.acidStore env (serverStateDir env)
+    securityBackend <- Acid.acidStore env (serverPgConn env)
     return $ \coreFeature -> do
        let securityStore = Store.backendStore securityBackend
 
@@ -88,7 +88,7 @@ initSecurityFeature env = do
       case pkgLatestTarball pkgInfo of
         Nothing -> []
         Just (_tarball, (uploadTime, _uploadUserId), latestRev) ->
-          [MetadataEntry (pkgInfoId pkgInfo) (TarballRevIx latestRev) uploadTime]
+          [MetadataEntry (pkgInfoId pkgInfo) (TarballRevIx (fromIntegral latestRev)) uploadTime]
 
 -- | The main security feature
 --

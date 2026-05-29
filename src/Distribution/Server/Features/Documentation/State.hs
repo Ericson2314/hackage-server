@@ -1,4 +1,4 @@
-{-# LANGUAGE DeriveDataTypeable, TypeFamilies, TemplateHaskell #-}
+{-# LANGUAGE OverloadedStrings, MultiParamTypeClasses, FlexibleInstances, DeriveAnyClass, DeriveGeneric, DerivingStrategies, DeriveDataTypeable, TypeFamilies, TemplateHaskell #-}
 
 module Distribution.Server.Features.Documentation.State where
 
@@ -7,7 +7,8 @@ import Distribution.Server.Framework.BlobStorage (BlobId)
 import Data.TarIndex () -- For SafeCopy instances
 import Distribution.Server.Framework.MemSize
 
-import Data.Acid     (Query, Update, makeAcidic)
+import Distribution.Server.Framework.EventSourcing (Query, Update, makeAcidic)
+import Distribution.Server.Framework.BeamInstances ()
 import Data.SafeCopy (base, deriveSafeCopy)
 import Control.Monad.Reader
 import qualified Control.Monad.State as State

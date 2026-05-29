@@ -1,4 +1,4 @@
-{-# LANGUAGE TemplateHaskell, TypeFamilies, DeriveDataTypeable, NamedFieldPuns #-}
+{-# LANGUAGE OverloadedStrings, MultiParamTypeClasses, FlexibleInstances, DeriveAnyClass, DeriveGeneric, DerivingStrategies, TemplateHaskell, TypeFamilies, DeriveDataTypeable, NamedFieldPuns #-}
 module Distribution.Server.Features.TarIndexCache.State (
     TarIndexCache(..)
   , initialTarIndexCache
@@ -15,7 +15,8 @@ import Control.Monad.State (put, modify)
 import Data.Map (Map)
 import qualified Data.Map as Map
 
-import Data.Acid (Query, Update, makeAcidic)
+import Distribution.Server.Framework.EventSourcing (Query, Update, makeAcidic)
+import Distribution.Server.Framework.BeamInstances ()
 import Data.SafeCopy (base, deriveSafeCopy)
 
 import Distribution.Server.Framework.BlobStorage

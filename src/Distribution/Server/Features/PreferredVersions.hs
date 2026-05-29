@@ -106,8 +106,8 @@ initVersionsFeature :: ServerEnv
                         -> TagsFeature
                         -> UserFeature
                         -> IO VersionsFeature)
-initVersionsFeature env@ServerEnv{serverStateDir} = do
-    preferredBackend <- Acid.acidStore serverStateDir
+initVersionsFeature env@ServerEnv{serverPgConn} = do
+    preferredBackend <- Acid.acidStore serverPgConn
     deprecatedHook <- newHook
     updatePreferredHook <- newHook
 

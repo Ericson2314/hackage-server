@@ -1,5 +1,11 @@
+{-# LANGUAGE DeriveAnyClass #-}
+{-# LANGUAGE DeriveGeneric #-}
+{-# LANGUAGE FlexibleInstances #-}
+{-# LANGUAGE MultiParamTypeClasses #-}
 {-# LANGUAGE RankNTypes, NamedFieldPuns, RecordWildCards, RecursiveDo,
              BangPatterns, OverloadedStrings, TemplateHaskell, FlexibleContexts #-}
+{-# LANGUAGE StandaloneDeriving #-}
+{-# LANGUAGE TypeFamilies #-}
 {-# OPTIONS_GHC -fno-warn-orphans #-}
 module Distribution.Server.Features.Users (
     initUserFeature,
@@ -37,6 +43,7 @@ import qualified Data.Text as T
 import Distribution.Text (display, simpleParse)
 
 import Happstack.Server.Cookie (addCookie, mkCookie, CookieLife(Session))
+
 
 -- | A feature to allow manipulation of the database of users.
 --
@@ -241,9 +248,9 @@ deriveJSON (compatAesonOptionsDropPrefix "ui_")  ''UserGroupResource
 
 -- TODO: add renaming
 initUserFeature :: ServerEnv -> IO (IO UserFeature)
-initUserFeature serverEnv@ServerEnv{serverStateDir, serverTemplatesDir, serverTemplatesMode} = do
+initUserFeature serverEnv@ServerEnv{serverStateDir, serverPgConn, serverTemplatesDir, serverTemplatesMode} = do
   -- Canonical state
-  userBackend <- UserAcid.acidStore serverStateDir
+  userBackend <- UserAcid.acidStore serverPgConn
 
   -- Ephemeral state
   groupIndex   <- newMemStateWHNF emptyGroupIndex
@@ -922,14 +929,14 @@ userFeature templates UserStore.Backend{backendStore = userStore, backendState =
     addGroupIndex (UserId uid) uri desc =
         modifyMemState groupIndex $
           adjustGroupIndex
-            (IntMap.insertWith Set.union uid (Set.singleton uri))
+            (IntMap.insertWith Set.union (fromIntegral uid) (Set.singleton uri))
             (Map.insert uri desc)
 
     removeGroupIndex :: MonadIO m => UserId -> String -> m ()
     removeGroupIndex (UserId uid) uri =
         modifyMemState groupIndex $
           adjustGroupIndex
-            (IntMap.update (keepSet . Set.delete uri) uid)
+            (IntMap.update (keepSet . Set.delete uri) (fromIntegral uid))
             id
       where
         keepSet m = if Set.null m then Nothing else Just m
@@ -941,11 +948,11 @@ userFeature templates UserStore.Backend{backendStore = userStore, backendState =
             (IntMap.unionWith Set.union (IntMap.fromList . map mkEntry $ Group.toList ulist))
             (Map.insert uri desc)
       where
-        mkEntry (UserId uid) = (uid, Set.singleton uri)
+        mkEntry (UserId uid) = (fromIntegral uid, Set.singleton uri)
 
     getGroupIndex :: (Functor m, MonadIO m) => UserId -> m [String]
     getGroupIndex (UserId uid) =
-      liftM (maybe [] Set.toList . IntMap.lookup uid . usersToGroupUri) $ readMemState groupIndex
+      liftM (maybe [] Set.toList . IntMap.lookup (fromIntegral uid) . usersToGroupUri) $ readMemState groupIndex
 
     getIndexDesc :: MonadIO m => String -> m GroupDescription
     getIndexDesc uri =

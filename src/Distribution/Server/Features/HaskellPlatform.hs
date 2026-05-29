@@ -44,8 +44,8 @@ data PlatformResource = PlatformResource {
 }
 
 initPlatformFeature :: ServerEnv -> IO (IO PlatformFeature)
-initPlatformFeature ServerEnv{serverStateDir} = do
-    platformState <- acidStore serverStateDir
+initPlatformFeature ServerEnv{serverPgConn} = do
+    platformState <- acidStore serverPgConn
 
     return $ do
       let feature = platformFeature platformState

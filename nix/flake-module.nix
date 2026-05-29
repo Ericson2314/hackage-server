@@ -1,4 +1,4 @@
-{ withSystem, ... }:
+{ withSystem, inputs, ... }:
 
 {
   flake.nixosModules.default = { config, lib, pkgs, ... }:
@@ -102,7 +102,9 @@
     packages.default = config.packages.hackage-server;
 
     haskellProjects.default = {
-      basePackages = pkgs.haskell.packages.ghc912;
+      basePackages = pkgs.haskell.packages.ghc912.override {
+        all-cabal-hashes = inputs.all-cabal-hashes;
+      };
       # Only include files relevant to the Haskell build so that
       # changes to nix/, flake.nix, etc. don't trigger a rebuild.
       projectRoot = lib.fileset.toSource {
@@ -130,16 +132,24 @@
         Cabal = { super, ... }:
           { custom = _: super.Cabal_3_16_1_0; };
 
+        pqueue.jailbreak = true;
+
         sandwich.check = false;
 
         threads.check = false;
 
         unicode-data.check = false;
+
+        # Tests require Docker to spin up a PostgreSQL instance
+        beam-postgres.check = false;
       };
       packages = {
         # https://community.flake.parts/haskell-flake/dependency#path
         # tls.source = "1.9.0";
         tar.source = "0.7.0.0";
+        beam-core.source = "0.11.1.0";
+        beam-migrate.source = "0.6.0.0";
+        beam-postgres.source = "0.6.1.0";
       };
       devShell = {
         tools = hp: {
@@ -161,10 +171,9 @@
             fontconfig
             freetype
             expat
-
-            # For running CsvToPostgresTest locally
             postgresql
           ;
+          inherit (pkgs.postgresql) pg_config;
         };
         hlsCheck.enable = false;
       };

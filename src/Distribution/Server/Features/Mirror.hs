@@ -59,9 +59,9 @@ initMirrorFeature :: ServerEnv
                   -> IO (CoreFeature
                       -> UserFeature
                       -> IO MirrorFeature)
-initMirrorFeature env@ServerEnv{serverStateDir} = do
+initMirrorFeature env@ServerEnv{serverPgConn} = do
     -- Canonical state
-    mirrorersState <- acidStore serverStateDir
+    mirrorersState <- acidStore serverPgConn
 
     return $ \core user@UserFeature{..} -> do
       -- Tie the knot with a do-rec

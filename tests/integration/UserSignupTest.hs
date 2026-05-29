@@ -9,7 +9,6 @@
   3. Read the confirmation email from the maildir
   4. POST to the confirmation URL with a password
   5. Verify the user appears in /users/.json
-  6. Backup/restore round-trip to verify persistence
 
   No external mail server needed — the test sets up a mock sendmail
   script and maildir automatically.
@@ -22,7 +21,6 @@ import Control.Monad
 import qualified Crypto.Hash.SHA256 as SHA256
 import qualified Data.ByteString.Base64 as Base64
 import qualified Data.ByteString.Char8 as BS8
-import qualified Data.ByteString.Lazy.Char8 as LBS
 import Data.Char (toUpper)
 import Data.List (isInfixOf)
 import Data.Maybe (mapMaybe)
@@ -31,7 +29,7 @@ import Data.Time.Clock (getCurrentTime)
 import Network.URI (parseURI, uriPath)
 import System.Directory (createDirectoryIfMissing, doesDirectoryExist,
                          getCurrentDirectory, getDirectoryContents,
-                         removeDirectoryRecursive, setPermissions,
+                         setPermissions,
                          getPermissions, setOwnerExecutable)
 import System.Environment (setEnv)
 import System.Exit (die)
@@ -52,48 +50,35 @@ main = do
   ts <- initTestServer
   info $ "Using port " ++ show (testServerPort ts)
   root <- getCurrentDirectory
-  withSystemTempDirectory "hackage-signup-test" $ \workDir -> do
-    info $ "Using test directory " ++ workDir
-    createDirectoryIfMissing True (workDir </> "tmp")
+  withSystemTempDirectory "hackage-signup-test" $ \workDir ->
+    withTempPostgres $ \cluster ->
+      withFreshDb cluster "hackage_signup_test" $ \connStr -> do
+        info $ "Using test directory " ++ workDir
+        createDirectoryIfMissing True (workDir </> "tmp")
 
-    -- Set up mock sendmail and maildir
-    let maildir = workDir </> "maildir"
-        mockSendmail = workDir </> "mock-sendmail"
-    createDirectoryIfMissing True (maildir </> "new")
-    createDirectoryIfMissing True (maildir </> "cur")
-    createDirectoryIfMissing True (maildir </> "tmp")
-    writeFile mockSendmail $ unlines
-      [ "#!/bin/sh"
-      , "exec cat > \"" ++ maildir ++ "/new/$$.$(date +%s%N)\""
-      ]
-    perms <- getPermissions mockSendmail
-    setPermissions mockSendmail (setOwnerExecutable True perms)
-    setEnv "SENDMAIL_PATH" mockSendmail
+        -- Set up mock sendmail and maildir
+        let maildir = workDir </> "maildir"
+            mockSendmail = workDir </> "mock-sendmail"
+        createDirectoryIfMissing True (maildir </> "new")
+        createDirectoryIfMissing True (maildir </> "cur")
+        createDirectoryIfMissing True (maildir </> "tmp")
+        writeFile mockSendmail $ unlines
+          [ "#!/bin/sh"
+          , "exec cat > \"" ++ maildir ++ "/new/$$.$(date +%s%N)\""
+          ]
+        perms <- getPermissions mockSendmail
+        setPermissions mockSendmail (setOwnerExecutable True perms)
+        setEnv "SENDMAIL_PATH" mockSendmail
 
-    -- Init and start server
-    runServerChecked root ["init", "--state-dir", workDir </> "state"]
-    withServerRunning ts workDir $ do
-      runSignupTest ts maildir
+        -- Init and start server
+        runServerChecked root ["init", "--state-dir", workDir </> "state"
+                              , "--db-conn-str", connStr]
+        withServerRunning ts workDir connStr $ do
+          runSignupTest ts maildir
 
-    -- Verify users survive server restart
-    info "Verifying user after server restart"
-    withServerRunning ts workDir $ verifySignedUpUser ts
-
-    -- Backup/restore round-trip
-    info "Making backup"
-    tarGz1 <- createBackup root workDir "1"
-    info "Removing state"
-    removeDirectoryRecursive (workDir </> "state")
-    info $ "Restoring from " ++ tarGz1
-    runServerChecked root ["restore", "--state-dir", workDir </> "state", tarGz1]
-    info "Making second backup"
-    tarGz2 <- createBackup root workDir "2"
-    info "Checking backups match"
-    db1 <- LBS.readFile tarGz1
-    db2 <- LBS.readFile tarGz2
-    unless (db1 == db2) $ die "Backups don't match"
-    info "Verifying user after restore"
-    withServerRunning ts workDir $ verifySignedUpUser ts
+        -- Verify users survive server restart
+        info "Verifying user after server restart"
+        withServerRunning ts workDir connStr $ verifySignedUpUser ts
 
   info "UserSignupTest: PASSED"
 

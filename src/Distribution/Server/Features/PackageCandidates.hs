@@ -138,8 +138,8 @@ initPackageCandidatesFeature :: ServerEnv
                                  -> UploadFeature
                                  -> TarIndexCacheFeature
                                  -> IO PackageCandidatesFeature)
-initPackageCandidatesFeature env@ServerEnv{serverStateDir} = do
-    candidatesBackend <- Acid.acidStore serverStateDir
+initPackageCandidatesFeature env@ServerEnv{serverPgConn} = do
+    candidatesBackend <- Acid.acidStore serverPgConn
     let candidatesStore = Store.backendStore candidatesBackend
 
     return $ \user core upload@UploadFeature{..} tarIndexCache -> do

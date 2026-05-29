@@ -1,5 +1,22 @@
 {
   "nodes": {
+    "all-cabal-hashes": {
+      "flake": false,
+      "locked": {
+        "lastModified": 1780079178,
+        "narHash": "sha256-ECz1EQBHvKwKvJ7qkHf/E5MTjamkgJoCJ2IsnlBLxS4=",
+        "owner": "commercialhaskell",
+        "repo": "all-cabal-hashes",
+        "rev": "184c09abd96d31d5b8a728a0740dcc328418b1c7",
+        "type": "github"
+      },
+      "original": {
+        "owner": "commercialhaskell",
+        "ref": "hackage",
+        "repo": "all-cabal-hashes",
+        "type": "github"
+      }
+    },
     "flake-parts": {
       "inputs": {
         "nixpkgs-lib": [
@@ -67,6 +84,7 @@
     },
     "root": {
       "inputs": {
+        "all-cabal-hashes": "all-cabal-hashes",
         "flake-parts": "flake-parts",
         "flake-root": "flake-root",
         "haskell-flake": "haskell-flake",

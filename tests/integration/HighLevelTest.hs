@@ -11,13 +11,12 @@ module Main (main) where
 
 import qualified Codec.Archive.Tar as Tar
 import qualified Codec.Compression.GZip as GZip
-import Control.Exception
 import Control.Monad
 import qualified Data.ByteString.Lazy.Char8 as LBS
 import Data.List (isInfixOf)
 import Data.String ()
 import System.Directory
-import System.Exit (ExitCode(..), die)
+import System.Exit (die)
 import System.FilePath
 import System.IO
 import System.IO.Temp (withSystemTempDirectory)
@@ -46,52 +45,26 @@ main = do hSetBuffering stdout LineBuffering
 
 doit :: TestServer -> FilePath -> FilePath -> IO ()
 doit ts root workDir
-    = do info "initialising hackage database"
-         createDirectoryIfMissing True (workDir </> "tmp")
-         runServerChecked root ["init", "--state-dir", workDir </> "state"]
-         withServerRunning ts workDir $ do
-           void $ validate ts NoAuth "/"
-           void $ validate ts NoAuth "/accounts"
-           void $ validate ts (Auth "admin" "admin") "/admin"
-           void $ validate ts NoAuth "/upload"
-           runUserTests ts
-           runPackageUploadTests ts
-           setupFeatureData ts
-           runPackageTests ts
-           runFeatureDataTests ts
-         withServerRunning ts workDir $ do
-           runPackageTests ts
-           runFeatureDataTests ts
-         info "Making database backup"
-         tarGz1 <- createBackup root workDir "1"
-         info "Removing old state"
-         removeDirectoryRecursive (workDir </> "state")
-         info "Checking server doesn't work without state"
-         let p = testServerPort ts
-         mec <- runServer root
-           ["run", "--port", show p, "--state-dir", workDir </> "state"
-           , "--base-uri", "http://127.0.0.1:" <> show p
-           , "--user-content-uri", "http://localhost:" <> show p
-           , "--required-base-host-header", "127.0.0.1:" <> show p
-           ]
-         case mec of
-             Just (ExitFailure 1) -> return ()
-             Just (ExitFailure _) -> die "Server failed with wrong exit code"
-             Just ExitSuccess     -> die "Server worked unexpectedly"
-             Nothing              -> die "Got a signal?"
-         info $ "Restoring database from " ++ tarGz1
-         runServerChecked root ["restore", "--state-dir", workDir </> "state", tarGz1]
-         info "Making another database backup"
-         tarGz2 <- createBackup root workDir "2"
-         info "Checking databases match"
-         db1 <- LBS.readFile tarGz1
-         db2 <- LBS.readFile tarGz2
-         unless (db1 == db2) $ die "Databases don't match"
-         info "Checking server still works, and data is intact"
-         withServerRunning ts workDir $ do
-           runPackageTests ts
-           runFeatureDataTests ts
-         withServerRunning ts workDir $ runRevisionTests ts
+    = withTempPostgres $ \cluster ->
+      withFreshDb cluster "hackage_test" $ \connStr -> do
+        info "initialising hackage database"
+        createDirectoryIfMissing True (workDir </> "tmp")
+        runServerChecked root ["init", "--state-dir", workDir </> "state"
+                              , "--db-conn-str", connStr]
+        withServerRunning ts workDir connStr $ do
+          void $ validate ts NoAuth "/"
+          void $ validate ts NoAuth "/accounts"
+          void $ validate ts (Auth "admin" "admin") "/admin"
+          void $ validate ts NoAuth "/upload"
+          runUserTests ts
+          runPackageUploadTests ts
+          setupFeatureData ts
+          runPackageTests ts
+          runFeatureDataTests ts
+        withServerRunning ts workDir connStr $ do
+          runPackageTests ts
+          runFeatureDataTests ts
+        withServerRunning ts workDir connStr $ runRevisionTests ts
 
 
 runUserTests :: TestServer -> IO ()

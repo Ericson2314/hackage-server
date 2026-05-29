@@ -105,9 +105,9 @@ data UploadResult = UploadResult {
 
 initUploadFeature :: ServerEnv
                   -> IO (UserFeature -> CoreFeature -> IO UploadFeature)
-initUploadFeature env@ServerEnv{serverStateDir} = do
+initUploadFeature env@ServerEnv{serverPgConn} = do
     -- Canonical state
-    uploadBackend <- UploadAcid.acidStore serverStateDir
+    uploadBackend <- UploadAcid.acidStore serverPgConn
 
     packageUploaded  <- newHook
 

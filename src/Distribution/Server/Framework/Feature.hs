@@ -1,6 +1,6 @@
 -- | This module defines a plugin interface for Hackage features.
 --
-{-# LANGUAGE ExistentialQuantification, RankNTypes, NoMonomorphismRestriction #-}
+{-# LANGUAGE ExistentialQuantification, FlexibleContexts, RankNTypes, NoMonomorphismRestriction #-}
 module Distribution.Server.Framework.Feature
   ( -- * Main datatypes
     HackageFeature(..)
@@ -8,14 +8,10 @@ module Distribution.Server.Framework.Feature
   , emptyHackageFeature
     -- * State components
   , StateComponent(..)
-  , OnDiskState(..)
   , AbstractStateComponent(..)
   , abstractAcidStateComponent
-  , abstractAcidStateComponent'
-  , abstractOnDiskStateComponent
   , queryState
   , updateState
-  , compareState
     -- * Cache components
   , CacheComponent(..)
     -- * Re-exports
@@ -24,14 +20,12 @@ module Distribution.Server.Framework.Feature
 
 import Distribution.Server.Prelude
 
-import Distribution.Server.Framework.BackupDump (BackupType (..))
-import Distribution.Server.Framework.BackupRestore (RestoreBackup(..), AbstractRestoreBackup(..), BackupEntry, abstractRestoreBackup)
 import Distribution.Server.Framework.Resource      (Resource, ServerErrorResponse)
 import Distribution.Server.Framework.BlobStorage   (BlobStorage)
 import Distribution.Server.Framework.MemSize
+import Distribution.Server.Framework.PostgreSQL
+import Distribution.Server.Framework.EventSourcing (QueryEvent(..), UpdateEvent(..), SaveEvent(..))
 
-import Data.Acid
-import Data.Acid.Advanced
 
 -- | We compose the overall Hackage server featureset from a bunch of these
 -- features. The intention is to make the Hackage server reasonably modular
@@ -90,7 +84,9 @@ class IsHackageFeature feature where
 -- State components                                                           --
 --------------------------------------------------------------------------------
 
--- | A state component encapsulates (part of) a feature's state
+-- | A state component encapsulates (part of) a feature's state.
+-- With all data in PostgreSQL, backup/restore is handled by
+-- @pg_dump@/@pg_restore@ rather than per-feature CSV code.
 data StateComponent f st = StateComponent {
     -- | Human readable description of the state component
     stateDesc    :: String
@@ -100,87 +96,25 @@ data StateComponent f st = StateComponent {
   , getState     :: IO st
     -- | Overwrite the state
   , putState     :: st -> IO ()
-    -- | (Pure) backup function
-  , backupState  :: BackupType -> st -> [BackupEntry]
-    -- | (Pure) backup restore
-  , restoreState :: RestoreBackup st
-    -- | Clone the state component in the given state directory
-  , resetState   :: FilePath -> IO (StateComponent f st)
   }
 
-data OnDiskState a = OnDiskState
-
 -- | 'AbstractStateComponent' abstracts away from a particular type of
--- 'StateComponent'
+-- 'StateComponent'. It provides checkpoint (flush event logs) and
+-- close operations.
 data AbstractStateComponent = AbstractStateComponent {
     abstractStateDesc       :: String
   , abstractStateCheckpoint :: IO ()
   , abstractStateClose      :: IO ()
-  , abstractStateBackup     :: BackupType -> IO [BackupEntry]
-  , abstractStateRestore    :: AbstractRestoreBackup
-  , abstractStateNewEmpty   :: FilePath -> IO (AbstractStateComponent, IO [String])
   , abstractStateSize       :: IO Int
   }
 
-compareState :: (Eq st, Show st) => st -> st -> [String]
-compareState old new =
-    if old /= new
-     then ["Internal state mismatch:\n" ++ difference (show old) (show new)]
-     else []
-  where
-    difference old_str new_str
-        -- = indent 2 old_str ++ "Versus:\n" ++ indent 2 new_str
-        = "After " ++ show (length common)   ++ " chars, in context:\n" ++
-            indent 2 (trunc_last 80 common)  ++ "\nOld data was:\n" ++
-            indent 2 (trunc 80 old_str_tail) ++ "\nVersus new data:\n" ++
-            indent 2 (trunc 80 new_str_tail)
-      where (common, old_str_tail, new_str_tail) = dropCommonPrefix [] old_str new_str
-
-    indent n = unlines . map (replicate n ' ' ++) . lines
-
-    trunc n xs | null zs   = ys
-               | otherwise = ys ++ "..."
-      where (ys, zs) = splitAt n xs
-
-    trunc_last n xs | null ys_rev = reverse zs_rev
-                    | otherwise   = "..." ++ reverse zs_rev
-      where (zs_rev, ys_rev) = splitAt n (reverse xs)
-
-    dropCommonPrefix common (x:xs) (y:ys) | x == y = dropCommonPrefix (x:common) xs ys
-    dropCommonPrefix common xs ys = (reverse common, xs, ys)
-
-abstractAcidStateComponent :: (Eq st, Show st, MemSize st)
-                           => StateComponent AcidState st -> AbstractStateComponent
-abstractAcidStateComponent = abstractAcidStateComponent' compareState
-
-abstractAcidStateComponent' :: MemSize st
-                            => (st -> st -> [String])
-                            -> StateComponent AcidState st -> AbstractStateComponent
-abstractAcidStateComponent' cmp st = AbstractStateComponent {
+abstractAcidStateComponent :: MemSize st
+                         => StateComponent AcidState st -> AbstractStateComponent
+abstractAcidStateComponent st = AbstractStateComponent {
     abstractStateDesc       = stateDesc st
   , abstractStateCheckpoint = createCheckpoint (stateHandle st)
   , abstractStateClose      = closeAcidState (stateHandle st)
-  , abstractStateBackup     = \t -> liftM (backupState st t) (getState st)
-  , abstractStateRestore    = abstractRestoreBackup (putState st) (restoreState st)
-  , abstractStateNewEmpty   = \stateDir -> do
-                                st' <- resetState st stateDir
-                                let cmpSt = liftM2 cmp (getState st) (getState st')
-                                return (abstractAcidStateComponent' cmp st', cmpSt)
   , abstractStateSize       = liftM memSize (getState st)
-  }
-
-abstractOnDiskStateComponent :: (Eq st, Show st) => StateComponent OnDiskState st -> AbstractStateComponent
-abstractOnDiskStateComponent st = AbstractStateComponent {
-    abstractStateDesc       = stateDesc st
-  , abstractStateCheckpoint = return ()
-  , abstractStateClose      = return ()
-  , abstractStateBackup     = \t -> liftM (backupState st t) (getState st)
-  , abstractStateRestore    = abstractRestoreBackup (putState st) (restoreState st)
-  , abstractStateNewEmpty   = \stateDir -> do
-                                st' <- resetState st stateDir
-                                let cmpSt = liftM2 compareState (getState st) (getState st')
-                                return (abstractOnDiskStateComponent st', cmpSt)
-  , abstractStateSize       = return 0
   }
 
 instance Monoid AbstractStateComponent where
@@ -188,9 +122,6 @@ instance Monoid AbstractStateComponent where
       abstractStateDesc       = ""
     , abstractStateCheckpoint = return ()
     , abstractStateClose      = return ()
-    , abstractStateBackup     = \_ -> return []
-    , abstractStateRestore    = mempty
-    , abstractStateNewEmpty   = \_stateDir -> return (mempty, return [])
     , abstractStateSize       = return 0
     }
   mappend = (<>)
@@ -200,38 +131,26 @@ instance Semigroup AbstractStateComponent where
       abstractStateDesc       = abstractStateDesc a ++ "\n" ++ abstractStateDesc b
     , abstractStateCheckpoint = abstractStateCheckpoint a >> abstractStateCheckpoint b
     , abstractStateClose      = abstractStateClose a >> abstractStateClose b
-    , abstractStateBackup     = \t -> liftM2 (++) (abstractStateBackup a t) (abstractStateBackup b t)
-    , abstractStateRestore    = abstractStateRestore a <> abstractStateRestore b
-    , abstractStateNewEmpty   = \stateDir -> do
-                                 (a', cmpA) <- abstractStateNewEmpty a stateDir
-                                 (b', cmpB) <- abstractStateNewEmpty b stateDir
-                                 return (a' <> b', liftM2 (++) cmpA cmpB)
-    , abstractStateSize       = liftM2 (+) (abstractStateSize a)
-                                           (abstractStateSize b)
+    , abstractStateSize       = liftM2 (+) (abstractStateSize a) (abstractStateSize b)
     }
 
-queryState :: (MonadIO m, QueryEvent event)
-           => StateComponent AcidState (EventState event)
-           -> event
-           -> m (EventResult event)
-queryState = query' . stateHandle
+--------------------------------------------------------------------------------
+-- Acid state wrappers                                                        --
+--------------------------------------------------------------------------------
 
-updateState :: (MonadIO m, UpdateEvent event)
-            => StateComponent AcidState (EventState event)
-            -> event
-            -> m (EventResult event)
-updateState = update' . stateHandle
+queryState :: (QueryEvent ev, MonadIO m) =>
+              StateComponent AcidState (QueryState ev) -> ev -> m (QueryResult ev)
+queryState component ev = liftIO $ queryPg (stateHandle component) (runQueryEvent ev)
 
+updateState :: (UpdateEvent ev, MonadIO m) =>
+               StateComponent AcidState (UpdateState ev) -> ev -> m (UpdateResult ev)
+updateState component ev = liftIO $ updatePg (stateHandle component) (runUpdateEvent ev)
 
 --------------------------------------------------------------------------------
 -- Cache components                                                           --
 --------------------------------------------------------------------------------
 
--- | A cache component encapsulates a cache, managed by a feature
 data CacheComponent = CacheComponent {
-    -- | Human readable description of the state component
-    cacheDesc :: String
-
-    -- | Get the current memory residency of the cache
-  , getCacheMemSize :: IO Int
+    cacheDesc       :: String,
+    getCacheMemSize :: IO Int
   }

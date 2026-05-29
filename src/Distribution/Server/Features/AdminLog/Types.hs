@@ -1,7 +1,10 @@
-{-# LANGUAGE DeriveDataTypeable, TypeFamilies, TemplateHaskell #-}
+{-# LANGUAGE OverloadedStrings, MultiParamTypeClasses, DeriveDataTypeable, TypeFamilies, TemplateHaskell #-}
 
 module Distribution.Server.Features.AdminLog.Types where
 
+import Database.Beam.Backend.SQL (HasSqlValueSyntax(..))
+import Database.Beam.Postgres.Syntax (PgValueSyntax)
+import qualified Data.Text as T
 import Distribution.Server.Users.Types (UserId)
 import Distribution.Server.Framework
 
@@ -23,3 +26,5 @@ instance MemSize AdminAction where
     memSize (Admin_GroupDelUser x y) = memSize2 x y
 
 deriveSafeCopy 0 'base ''AdminAction
+
+instance HasSqlValueSyntax PgValueSyntax AdminAction where sqlValueSyntax = sqlValueSyntax . T.pack . show

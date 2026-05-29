@@ -49,8 +49,8 @@ initUserDetailsFeature :: ServerEnv
                            -> CoreFeature
                            -> UploadFeature
                            -> IO UserDetailsFeature)
-initUserDetailsFeature ServerEnv{serverStateDir, serverTemplatesDir, serverTemplatesMode} = do
-    userDetailsBackend <- acidStore serverStateDir
+initUserDetailsFeature ServerEnv{serverPgConn, serverTemplatesDir, serverTemplatesMode} = do
+    userDetailsBackend <- acidStore serverPgConn
 
     --TODO: link up to user feature to delete
 

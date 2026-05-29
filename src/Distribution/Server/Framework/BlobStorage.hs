@@ -1,4 +1,4 @@
-{-# LANGUAGE CPP #-}
+{-# LANGUAGE OverloadedStrings, MultiParamTypeClasses, CPP #-}
 {-# LANGUAGE DeriveDataTypeable #-}
 {-# LANGUAGE GeneralizedNewtypeDeriving #-}
 {-# LANGUAGE RecordWildCards #-}
@@ -19,6 +19,7 @@
 module Distribution.Server.Framework.BlobStorage (
     BlobStorage,
     BlobId,
+    blobIdFromMd5Digest,
     blobMd5,
     readBlobId,
     blobETag,
@@ -35,6 +36,9 @@ module Distribution.Server.Framework.BlobStorage (
     find,
   ) where
 
+import Database.Beam.Backend.SQL (HasSqlValueSyntax(..))
+import Database.Beam.Postgres.Syntax (PgValueSyntax)
+import qualified Data.Text as T
 import Distribution.Server.Prelude
 
 import Distribution.Server.Features.Security.MD5
@@ -79,6 +83,9 @@ instance ToJSON BlobId where
 
 blobMd5Digest :: BlobId -> MD5Digest
 blobMd5Digest (BlobId digest) = digest
+
+blobIdFromMd5Digest :: MD5Digest -> BlobId
+blobIdFromMd5Digest = BlobId
 
 blobMd5 :: BlobId -> String
 blobMd5 (BlobId digest) = show digest
@@ -316,3 +323,5 @@ find BlobStores{..} blobId = do
      where
        pathHere = filepath store          blobId
        pathMain = filepath blobStoresMain blobId
+
+instance HasSqlValueSyntax PgValueSyntax BlobId where sqlValueSyntax = sqlValueSyntax . T.pack . blobMd5

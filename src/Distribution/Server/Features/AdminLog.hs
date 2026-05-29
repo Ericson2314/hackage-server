@@ -38,8 +38,8 @@ instance IsHackageFeature AdminLogFeature where
     getFeatureInterface = adminLogFeatureInterface
 
 initAdminLogFeature :: ServerEnv -> IO (UserFeature -> IO AdminLogFeature)
-initAdminLogFeature ServerEnv{serverStateDir} = do
-  adminLogBackend <- acidStore serverStateDir
+initAdminLogFeature ServerEnv{serverPgConn} = do
+  adminLogBackend <- acidStore serverPgConn
   return $ \users@UserFeature{groupChangedHook} -> do
 
     let feature = adminLogFeature users adminLogBackend

@@ -3,7 +3,6 @@ module Distribution.Server.Util.CountingMap (
     NestedCountingMap(..)
   , SimpleCountingMap(..)
   , CountingMap(..)
-  , cmFromCSV
   ) where
 
 import Prelude hiding (rem)
@@ -17,12 +16,9 @@ import Data.SafeCopy (SafeCopy(..), safeGet, safePut, contain)
 
 import Distribution.Parsec (Parsec(..))
 import Distribution.Pretty (Pretty(..))
-import Distribution.Text (display)
-import qualified Data.ByteString.Char8 as BS8
 
 import Distribution.Server.Framework.Instances ()
 import Distribution.Server.Framework.MemSize
-import Distribution.Server.Framework.BackupRestore (CSV, Record, parseRead, parseText)
 
 {------------------------------------------------------------------------------
   We define some generic machinery to give us functions for arbitrarily
@@ -52,9 +48,6 @@ class CountingMap k a | a -> k where
   cmUnion  :: a -> a -> a
   cmToList :: a -> [(k, Int)]
 
-  cmToCSV        :: a -> CSV
-  cmInsertRecord :: (Monad m, MonadFail m) => Record -> a -> m (a, Int)
-
 instance (Ord k, Typeable k, Parsec k, Pretty k) => CountingMap k (SimpleCountingMap k) where
   cmEmpty = SCM (NCM 0 Map.empty)
 
@@ -69,18 +62,6 @@ instance (Ord k, Typeable k, Parsec k, Pretty k) => CountingMap k (SimpleCountin
   cmFind k (SCM (NCM _ m)) = Map.findWithDefault 0 k m
 
   cmToList (SCM (NCM _ m)) = Map.toList m
-
-  cmToCSV (SCM (NCM _ m)) = map aux (Map.toList m)
-    where
-      aux :: (k, Int) -> Record
-      aux (k, n) = [BS8.pack (display k), BS8.pack (show n)]
-
-  cmInsertRecord [k, n] m = do
-     key   <- parseText "key"   k
-     count <- parseRead "count" n
-     return (cmInsert key count m, count)
-  cmInsertRecord _ _ =
-    fail "cmInsertRecord: Invalid record"
 
 instance (Typeable k, Parsec k, Pretty k, Ord k, Eq l, CountingMap l a) => CountingMap (k, l) (NestedCountingMap k a) where
   cmEmpty = NCM 0 Map.empty
@@ -100,48 +81,31 @@ instance (Typeable k, Parsec k, Pretty k, Ord k, Eq l, CountingMap l a) => Count
       aux :: (k, a) -> [((k, l), Int)]
       aux (k, m') = map (\(l, c) -> ((k, l), c)) (cmToList m')
 
-  cmToCSV (NCM _ m) = concatMap aux (Map.toList m)
-    where
-      aux :: (k, a) -> CSV
-      aux (k, m') = map (BS8.pack (display k):) (cmToCSV m')
-
-  cmInsertRecord (k : record) (NCM total m) = do
-    key <- parseText "key" k
-    let submap = Map.findWithDefault cmEmpty key m
-    (submap', added) <- cmInsertRecord record submap
-    return (NCM (total + added) (Map.insert key submap' m), added)
-  cmInsertRecord [] _ =
-    fail "cmInsertRecord: Invalid record"
-
-cmFromCSV :: (Monad m, MonadFail m, CountingMap k a) => CSV -> m a
-cmFromCSV = go cmEmpty
-  where
-    go acc []     = return acc
-    go acc (r:rs) = do
-      (acc', _) <- cmInsertRecord r acc
-      go acc' rs
-
 {------------------------------------------------------------------------------
   Auxiliary
 ------------------------------------------------------------------------------}
 
 adjustFrom :: Ord k => (a -> a) -> k -> a -> Map k a -> Map k a
-adjustFrom func key value = Map.alter (Just . func . fromMaybe value) key
+adjustFrom f k def = Map.alter (Just . f . fromMaybe def) k
 
 {------------------------------------------------------------------------------
-  Type classes instances
+  SafeCopy
 ------------------------------------------------------------------------------}
+
+instance (SafeCopy a, SafeCopy b, Ord a) => SafeCopy (NestedCountingMap a b) where
+  putCopy (NCM total m) = contain $ do safePut total; safePut m
+  getCopy = contain $ NCM <$> safeGet <*> safeGet
+
+instance (SafeCopy a, Ord a) => SafeCopy (SimpleCountingMap a) where
+  putCopy (SCM m) = contain $ safePut m
+  getCopy = contain $ SCM <$> safeGet
+
+{------------------------------------------------------------------------------
+  MemSize
+------------------------------------------------------------------------------}
+
+instance (MemSize a, MemSize b) => MemSize (NestedCountingMap a b) where
+  memSize (NCM _ m) = memSize m
 
 instance MemSize a => MemSize (SimpleCountingMap a) where
   memSize (SCM m) = memSize m
-
-instance (MemSize a, MemSize b) => MemSize (NestedCountingMap a b) where
-  memSize (NCM a b) = memSize2 a b
-
-instance (Ord a, SafeCopy a, SafeCopy b) => SafeCopy (NestedCountingMap a b) where
-  putCopy (NCM total m) = contain $ do safePut total ; safePut m
-  getCopy = contain $ NCM <$> safeGet <*> safeGet
-
-instance (Ord a, SafeCopy a) => SafeCopy (SimpleCountingMap a) where
-  putCopy (SCM m) = contain $ safePut m
-  getCopy = contain $ SCM <$> safeGet

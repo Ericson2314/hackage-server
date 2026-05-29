@@ -82,8 +82,8 @@ initBuildReportsFeature :: String
                             -> UploadFeature
                             -> CoreResource
                             -> IO ReportsFeature)
-initBuildReportsFeature name env@ServerEnv{serverStateDir} = do
-    reportsBackend <- Acid.acidStore name serverStateDir
+initBuildReportsFeature name env@ServerEnv{serverPgConn} = do
+    reportsBackend <- Acid.acidStore name serverPgConn
 
     return $ \user upload core -> do
       let feature = buildReportsFeature name env

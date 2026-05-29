@@ -37,6 +37,8 @@ tested-with:
 
 data-dir: datafiles
 data-files:
+  schema.sql
+
   templates/**/*.st
 
   static/**/*.css
@@ -220,8 +222,6 @@ library
     Paths_hackage_server
 
   exposed-modules:
-    Data.Acid.Compat
-
     Distribution.Server
 
     Distribution.Server.Prelude
@@ -236,7 +236,12 @@ library
     Distribution.Server.Framework.CSRF
     Distribution.Server.Framework.Error
     Distribution.Server.Framework.Logging
+    Distribution.Server.Framework.BeamInstances
+    Distribution.Server.Framework.BeamPrefixed
+    Distribution.Server.Framework.EventSourcing
     Distribution.Server.Framework.Feature
+    Distribution.Server.Framework.PostgreSQL
+    Distribution.Server.Framework.PgTx
     Distribution.Server.Framework.Hook
     Distribution.Server.Framework.HtmlFormWrapper
     Distribution.Server.Framework.Instances
@@ -246,9 +251,6 @@ library
     Distribution.Server.Framework.RequestContentTypes
     Distribution.Server.Framework.ResponseContentTypes
     Distribution.Server.Framework.CacheControl
-    Distribution.Server.Framework.BackupDump
-    Distribution.Server.Framework.BackupRestore
-    Distribution.Server.Framework.CsvInstances
     Distribution.Server.Framework.ServerEnv
     Distribution.Server.Framework.Templating
     Distribution.Server.Framework.HappstackUtils
@@ -281,7 +283,6 @@ library
     Distribution.Server.Users.Group
     Distribution.Server.Users.State
     Distribution.Server.Users.Types
-    Distribution.Server.Users.Backup
     Distribution.Server.Users.Users
     Distribution.Server.Users.AuthToken
     Distribution.Server.Users.UserIdSet
@@ -312,12 +313,11 @@ library
     Distribution.Server.Features.Browse.Parsers
     Distribution.Server.Features.Core
     Distribution.Server.Features.Core.Acid
+    Distribution.Server.Features.Core.Db
     Distribution.Server.Features.Core.State
     Distribution.Server.Features.Core.Store
-      Distribution.Server.Features.Core.Backup
-      Distribution.Server.Features.Security
-      Distribution.Server.Features.Security.Acid
-      Distribution.Server.Features.Security.Backup
+    Distribution.Server.Features.Security
+    Distribution.Server.Features.Security.Acid
     Distribution.Server.Features.Security.FileInfo
     Distribution.Server.Features.Security.Layout
     Distribution.Server.Features.Security.MD5
@@ -336,14 +336,12 @@ library
     Distribution.Server.Features.Upload.Acid
     Distribution.Server.Features.Upload.Store
     Distribution.Server.Features.Upload.State
-    Distribution.Server.Features.Upload.Backup
     Distribution.Server.Features.Users
     Distribution.Server.Features.Users.Acid
     Distribution.Server.Features.Users.Store
     Distribution.Server.Features.UserNotify
     Distribution.Server.Features.UserNotify.Acid
     Distribution.Server.Features.UserNotify.Acid.Component
-    Distribution.Server.Features.UserNotify.Backup
     Distribution.Server.Features.UserNotify.Store
     Distribution.Server.Features.UserNotify.Types
 
@@ -359,7 +357,6 @@ library
       Distribution.Server.Features.AdminFrontend
       Distribution.Server.Features.AdminLog
       Distribution.Server.Features.AdminLog.Acid
-      Distribution.Server.Features.AdminLog.Backup
       Distribution.Server.Features.AdminLog.State
       Distribution.Server.Features.AdminLog.Store
       Distribution.Server.Features.AdminLog.Types
@@ -367,22 +364,20 @@ library
       Distribution.Server.Features.BuildReports.BuildReport
       Distribution.Server.Features.BuildReports.BuildReports
       Distribution.Server.Features.BuildReports.Acid
-      Distribution.Server.Features.BuildReports.Backup
       Distribution.Server.Features.BuildReports.Store
       Distribution.Server.Features.BuildReports.Render
       Distribution.Server.Features.BuildReports.State
       Distribution.Server.Features.PackageCandidates
       Distribution.Server.Features.PackageCandidates.Acid
+      Distribution.Server.Features.PackageCandidates.Db
       Distribution.Server.Features.PackageCandidates.Types
       Distribution.Server.Features.PackageCandidates.State
-      Distribution.Server.Features.PackageCandidates.Backup
       Distribution.Server.Features.PackageCandidates.Store
       Distribution.Server.Features.PackageFeed
       Distribution.Server.Features.PackageList
       Distribution.Server.Features.Distro
       Distribution.Server.Features.Distro.Acid
       Distribution.Server.Features.Distro.Distributions
-      Distribution.Server.Features.Distro.Backup
       Distribution.Server.Features.Distro.State
       Distribution.Server.Features.Distro.Store
       Distribution.Server.Features.Distro.Types
@@ -394,7 +389,6 @@ library
       Distribution.Server.Features.DownloadCount.Acid
       Distribution.Server.Features.DownloadCount.State
       Distribution.Server.Features.DownloadCount.Store
-      Distribution.Server.Features.DownloadCount.Backup
       Distribution.Server.Features.EditCabalFiles
       Distribution.Server.Features.Html
       Distribution.Server.Features.Html.HtmlUtilities
@@ -418,14 +412,12 @@ library
       Distribution.Server.Features.Sitemap.Functions
       Distribution.Server.Features.Votes
       Distribution.Server.Features.Votes.Acid
-      Distribution.Server.Features.Votes.Backup
       Distribution.Server.Features.Votes.Render
       Distribution.Server.Features.Votes.State
       Distribution.Server.Features.Votes.Store
       Distribution.Server.Features.Votes.Types
       Distribution.Server.Features.Vouch
       Distribution.Server.Features.Vouch.Acid
-      Distribution.Server.Features.Vouch.Backup
       Distribution.Server.Features.Vouch.State
       Distribution.Server.Features.Vouch.Store
       Distribution.Server.Features.Vouch.Types
@@ -434,31 +426,26 @@ library
       Distribution.Server.Features.PreferredVersions.Acid
       Distribution.Server.Features.PreferredVersions.State
       Distribution.Server.Features.PreferredVersions.Types
-      Distribution.Server.Features.PreferredVersions.Backup
       Distribution.Server.Features.PreferredVersions.Store
       Distribution.Server.Features.ReverseDependencies
       Distribution.Server.Features.ReverseDependencies.State
       Distribution.Server.Features.Tags
       Distribution.Server.Features.Tags.Acid
-      Distribution.Server.Features.Tags.Backup
       Distribution.Server.Features.Tags.Store
       Distribution.Server.Features.Tags.State
       Distribution.Server.Features.Tags.Types
       Distribution.Server.Features.AnalyticsPixels
       Distribution.Server.Features.AnalyticsPixels.Acid
-      Distribution.Server.Features.AnalyticsPixels.Backup
       Distribution.Server.Features.AnalyticsPixels.State
       Distribution.Server.Features.AnalyticsPixels.Store
       Distribution.Server.Features.AnalyticsPixels.Types
       Distribution.Server.Features.UserDetails
       Distribution.Server.Features.UserDetails.Acid
-      Distribution.Server.Features.UserDetails.Backup
       Distribution.Server.Features.UserDetails.State
       Distribution.Server.Features.UserDetails.Store
       Distribution.Server.Features.UserDetails.Types
       Distribution.Server.Features.UserSignup
       Distribution.Server.Features.UserSignup.Acid
-      Distribution.Server.Features.UserSignup.Backup
       Distribution.Server.Features.UserSignup.State
       Distribution.Server.Features.UserSignup.Store
       Distribution.Server.Features.UserSignup.Types
@@ -483,7 +470,9 @@ library
     , http-client-tls       ^>= 0.3
     , http-types             >= 0.10      && < 0.13
     , QuickCheck             >= 2.14      && < 2.19
-    , acid-state            ^>= 0.16
+    , beam-core             ^>= 0.11
+    , beam-postgres         ^>= 0.6
+    , postgresql-simple     ^>= 0.7
     , safecopy               >= 0.6       && < 0.11
     , async                 ^>= 2.2.1
     -- requires bumping http-io-streams
@@ -523,6 +512,8 @@ library
     , safecopy              ^>= 0.10
     , split                 ^>= 0.2
     , stm                   ^>= 2.5.0
+    , resource-pool         ^>= 0.4 || ^>= 0.5
+    , template-haskell
     , stringsearch          ^>= 0.3.6.6
     , systemd               ^>= 2.4
     , transformers          ^>= 0.6
@@ -616,7 +607,6 @@ executable hackage-import
       -- version constraints inherited from hackage-server
     , HTTP
     , async
-    , cassava
 
 ----------------------------------------------------------------------------
 
@@ -703,16 +693,6 @@ test-suite UserTest
 
   type:           exitcode-stdio-1.0
   main-is:        UserTest.hs
-
--- Built here but run in a Nix derivation that provides PostgreSQL.
-test-suite CsvToPostgresTest
-  import:         integration-test-defaults
-
-  type:           exitcode-stdio-1.0
-  main-is:        CsvToPostgresTest.hs
-
-  build-depends:
-    , process
 
 -- Built here but run in a Nix derivation that provides a local mail server.
 test-suite UserSignupTest

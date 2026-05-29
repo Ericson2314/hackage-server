@@ -1,4 +1,4 @@
-{-# LANGUAGE DeriveDataTypeable, GeneralizedNewtypeDeriving, TypeFamilies, TemplateHaskell #-}
+{-# LANGUAGE OverloadedStrings, MultiParamTypeClasses, FlexibleInstances, DeriveAnyClass, DeriveGeneric, DerivingStrategies, DeriveDataTypeable, GeneralizedNewtypeDeriving, TypeFamilies, TemplateHaskell #-}
 {-# OPTIONS_GHC -Wno-orphans                                                               #-}
 
 module Distribution.Server.Features.AnalyticsPixels.State
@@ -21,7 +21,8 @@ import Distribution.Server.Users.State ()
 
 import Data.Map (Map)
 import qualified Data.Map.Strict as Map
-import Data.Acid     (Query, Update, makeAcidic)
+import Distribution.Server.Framework.EventSourcing (Query, Update, makeAcidic)
+import Distribution.Server.Framework.BeamInstances ()
 import Data.SafeCopy (base, deriveSafeCopy)
 import Data.Set (Set)
 import qualified Data.Set as Set
@@ -34,7 +35,8 @@ newtype AnalyticsPixelsState = AnalyticsPixelsState
     {
         analyticsPixels :: Map PackageName (Set AnalyticsPixel)
     }
-  deriving (Show, Eq, NFData, MemSize)
+  deriving stock (Show, Eq)
+  deriving newtype (NFData, MemSize)
 
 -- SafeCopy instances
 $(deriveSafeCopy 0 'base ''AnalyticsPixel)

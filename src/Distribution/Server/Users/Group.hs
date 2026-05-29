@@ -1,3 +1,6 @@
+{-# LANGUAGE FlexibleInstances #-}
+{-# LANGUAGE MultiParamTypeClasses #-}
+{-# LANGUAGE OverloadedStrings #-}
 module Distribution.Server.Users.Group (
     module UserIdSet,
     UserGroup(..),
@@ -7,6 +10,9 @@ module Distribution.Server.Users.Group (
     queryUserGroups,
   ) where
 
+import Database.Beam.Backend.SQL (HasSqlValueSyntax(..))
+import Database.Beam.Postgres.Syntax (PgValueSyntax)
+import qualified Data.Text as T
 import Distribution.Server.Users.Types
 import Distribution.Server.Users.UserIdSet as UserIdSet
 import Distribution.Server.Framework.MemSize
@@ -86,3 +92,5 @@ instance NFData GroupDescription where
 
 instance MemSize GroupDescription where
     memSize (GroupDescription a b c) = memSize3 a b c
+
+instance HasSqlValueSyntax PgValueSyntax UserIdSet where sqlValueSyntax = sqlValueSyntax . T.pack . show

@@ -12,11 +12,10 @@
 {-# LANGUAGE OverloadedStrings #-}
 module Main (main) where
 
-import Control.Monad
-import Data.Aeson (object, (.=), toJSON)
-import qualified Data.ByteString.Lazy.Char8 as LBS
+import Control.Monad (void)
+import Data.Aeson (object, (.=), Value, toJSON)
 import Data.List (isInfixOf)
-import System.Directory (createDirectoryIfMissing, getCurrentDirectory, removeDirectoryRecursive)
+import System.Directory (createDirectoryIfMissing, getCurrentDirectory)
 import System.FilePath
 import System.IO
 import System.IO.Temp (withSystemTempDirectory)
@@ -47,34 +46,24 @@ main = do
         localTest ts root workDir
 
 localTest :: TestServer -> FilePath -> FilePath -> IO ()
-localTest ts root workDir = do
-    createDirectoryIfMissing True (workDir </> "tmp")
+localTest ts root workDir =
+    withTempPostgres $ \cluster ->
+      withFreshDb cluster "hackage_feature_test" $ \connStr -> do
+        createDirectoryIfMissing True (workDir </> "tmp")
 
-    -- Init and start server, set up data
-    runServerChecked root ["init", "--state-dir", workDir </> "state"]
-    withServerRunning ts workDir $ do
-      setupBaseData ts
-      setupFeatures ts
+        -- Init and start server
+        runServerChecked root ["init", "--state-dir", workDir </> "state"
+                              , "--db-conn-str", connStr]
+        withServerRunning ts workDir connStr $ do
+          setupBaseData ts
+          setupFeatures ts
 
-    -- Backup/restore round-trip (imperative — needs server lifecycle control)
-    info "Making backup"
-    tarGz1 <- createBackup root workDir "1"
-    info "Removing state"
-    removeDirectoryRecursive (workDir </> "state")
-    info $ "Restoring from " ++ tarGz1
-    runServerChecked root ["restore", "--state-dir", workDir </> "state", tarGz1]
-    info "Making second backup"
-    tarGz2 <- createBackup root workDir "2"
-    db1 <- LBS.readFile tarGz1
-    db2 <- LBS.readFile tarGz2
-
-    -- Verify everything after restore — tasty accumulates failures
-    info "Verifying after restore"
-    withServerRunning ts workDir $
-      defaultMain $ testGroup "FeatureTest"
-        [ testCase "backups match" $ assertBool "Backup tarballs differ" (db1 == db2)
-        , verifyFeatures ts
-        ]
+        -- Verify after server restart
+        info "Verifying after server restart"
+        withServerRunning ts workDir connStr $
+          defaultMain $ testGroup "FeatureTest"
+            [ verifyFeatures ts
+            ]
 
 
 -- | Run against a pre-existing server (e.g. NixOS module).

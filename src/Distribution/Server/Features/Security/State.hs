@@ -1,4 +1,4 @@
-{-# LANGUAGE DeriveDataTypeable   #-}
+{-# LANGUAGE OverloadedStrings, MultiParamTypeClasses, FlexibleInstances, DeriveAnyClass, DeriveGeneric, DerivingStrategies, DeriveDataTypeable   #-}
 {-# LANGUAGE FlexibleContexts     #-}
 {-# LANGUAGE RecordWildCards      #-}
 {-# LANGUAGE TemplateHaskell      #-}
@@ -9,7 +9,8 @@ module Distribution.Server.Features.Security.State where
 -- stdlib
 import Control.Monad
 import Control.Monad.Reader (ask, asks)
-import Data.Acid
+import Distribution.Server.Framework.EventSourcing (Query, Update, makeAcidic)
+import Distribution.Server.Framework.BeamInstances ()
 import Data.Maybe
 import Data.SafeCopy
 import Data.Time

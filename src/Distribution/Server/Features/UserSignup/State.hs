@@ -1,4 +1,4 @@
-{-# LANGUAGE GeneralizedNewtypeDeriving, TemplateHaskell #-}
+{-# LANGUAGE DerivingStrategies, GeneralizedNewtypeDeriving, TemplateHaskell #-}
 
 module Distribution.Server.Features.UserSignup.State where
 
@@ -15,7 +15,8 @@ import Data.SafeCopy
 --
 
 newtype SignupResetTable = SignupResetTable (Map Nonce SignupResetInfo)
-  deriving (Eq, Show, MemSize)
+  deriving stock (Eq, Show)
+  deriving newtype (MemSize)
 
 emptySignupResetTable :: SignupResetTable
 emptySignupResetTable = SignupResetTable Map.empty

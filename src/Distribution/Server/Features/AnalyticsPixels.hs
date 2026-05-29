@@ -54,8 +54,8 @@ initAnalyticsPixelsFeature :: ServerEnv
                             -> UserFeature
                             -> UploadFeature
                             -> IO AnalyticsPixelsFeature)
-initAnalyticsPixelsFeature env@ServerEnv{serverStateDir} = do
-  dbAnalyticsPixelsState <- acidStore serverStateDir
+initAnalyticsPixelsFeature env@ServerEnv{serverPgConn} = do
+  dbAnalyticsPixelsState <- acidStore serverPgConn
   analyticsPixelAdded    <- newHook
   analyticsPixelRemoved  <- newHook
 

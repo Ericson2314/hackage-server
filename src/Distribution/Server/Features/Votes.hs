@@ -56,8 +56,8 @@ initVotesFeature :: ServerEnv
                    -> IO ( CoreFeature
                       -> UserFeature
                       -> IO VotesFeature)
-initVotesFeature env@ServerEnv{serverStateDir} = do
-  initVotesFeatureWith (acidStore serverStateDir) env
+initVotesFeature env@ServerEnv{serverPgConn} = do
+  initVotesFeatureWith (acidStore serverPgConn) env
 
 initVotesFeatureWith :: IO Backend
                      -> ServerEnv

@@ -1,4 +1,4 @@
-{-# LANGUAGE DeriveDataTypeable, TemplateHaskell #-}
+{-# LANGUAGE DeriveDataTypeable, MultiParamTypeClasses, OverloadedStrings, TemplateHaskell #-}
 -----------------------------------------------------------------------------
 -- |
 -- Module      :  Distribution.Server.Features.Check.Types
@@ -9,6 +9,9 @@
 -----------------------------------------------------------------------------
 module Distribution.Server.Features.PackageCandidates.Types where
 
+import qualified Data.Text as T
+import Database.Beam.Backend.SQL (HasSqlValueSyntax(..))
+import Database.Beam.Postgres.Syntax (PgValueSyntax)
 import Distribution.Server.Packages.Types (PkgInfo(..))
 import Distribution.Server.Framework.Instances ()
 import Distribution.Server.Framework.MemSize
@@ -44,3 +47,5 @@ instance Package CandPkgInfo where packageId = candInfoId
 
 instance MemSize CandPkgInfo where
     memSize (CandPkgInfo a b c) = memSize3 a b c
+
+instance HasSqlValueSyntax PgValueSyntax CandPkgInfo where sqlValueSyntax = sqlValueSyntax . T.pack . show

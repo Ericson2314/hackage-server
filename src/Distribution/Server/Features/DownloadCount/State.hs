@@ -1,10 +1,9 @@
-{-# LANGUAGE TemplateHaskell, StandaloneDeriving, GeneralizedNewtypeDeriving,
+{-# LANGUAGE OverloadedStrings, DeriveAnyClass, DeriveGeneric, DerivingStrategies, TemplateHaskell, StandaloneDeriving, GeneralizedNewtypeDeriving,
              DeriveDataTypeable, TypeFamilies, FlexibleInstances,
              MultiParamTypeClasses, BangPatterns #-}
 module Distribution.Server.Features.DownloadCount.State where
 
 import Data.Time.Calendar (Day(..))
-import Data.Foldable (forM_)
 import Control.Arrow (first)
 import Control.Monad (liftM, unless)
 import Data.List (foldl', groupBy)
@@ -12,22 +11,10 @@ import Data.Function (on)
 import Control.Monad.Reader (ask, asks)
 import Control.Monad.State (get, put)
 import qualified Data.Map.Lazy as Map
-import System.FilePath ((</>))
-import System.Directory (
-    getDirectoryContents
-  , createDirectoryIfMissing
-  )
-import qualified Data.ByteString.Lazy as BSL
-import System.IO (withFile, IOMode (..))
-import System.IO.Unsafe (unsafeInterleaveIO)
-import qualified Data.Csv as Csv
-import qualified Data.ByteString.Lazy.Char8 as LBS8
-import Control.Exception (evaluate)
 
-import Data.Acid (Update, Query, makeAcidic)
-import Data.SafeCopy (base, deriveSafeCopy, safeGet, safePut)
-import Data.Serialize.Get (runGetLazy)
-import Data.Serialize.Put (runPutLazy)
+import Distribution.Server.Framework.EventSourcing (Query, Update, makeAcidic)
+import Distribution.Server.Framework.BeamInstances ()
+import Data.SafeCopy (base, deriveSafeCopy)
 
 import Distribution.Version (Version)
 import Distribution.Package (
@@ -36,8 +23,7 @@ import Distribution.Package (
   , packageName
   , packageVersion
   )
-import Distribution.Text (simpleParse, display)
-import Distribution.Simple.Utils (writeFileAtomic)
+import Distribution.Text (display)
 
 import Distribution.Server.Framework.Instances ()
 import Distribution.Server.Framework.MemSize
@@ -56,7 +42,8 @@ data InMemStats = InMemStats {
 newtype OnDiskStats = OnDiskStats {
     onDiskStats :: NestedCountingMap PackageName OnDiskPerPkg
   }
-  deriving (Show, Eq, MemSize)
+  deriving stock (Show, Eq)
+  deriving newtype (MemSize)
 
 instance CountingMap (PackageName, (Day, Version)) OnDiskStats where
   cmEmpty                            = OnDiskStats cmEmpty
@@ -66,13 +53,12 @@ instance CountingMap (PackageName, (Day, Version)) OnDiskStats where
   cmUnion    (OnDiskStats a)
              (OnDiskStats b)         = OnDiskStats (cmUnion a b)
   cmToList   (OnDiskStats ncm)       = cmToList ncm
-  cmToCSV    (OnDiskStats ncm)       = cmToCSV ncm
-  cmInsertRecord r (OnDiskStats ncm) = first OnDiskStats `liftM` cmInsertRecord r ncm
 
 newtype OnDiskPerPkg = OnDiskPerPkg {
     onDiskPerPkgCounts :: NestedCountingMap Day (SimpleCountingMap Version)
   }
-  deriving (Show, Eq, Ord, MemSize)
+  deriving stock (Show, Eq, Ord)
+  deriving newtype (MemSize)
 
 instance CountingMap (Day, Version) OnDiskPerPkg where
   cmEmpty  = OnDiskPerPkg cmEmpty
@@ -81,13 +67,12 @@ instance CountingMap (Day, Version) OnDiskPerPkg where
   cmFind   k (OnDiskPerPkg ncm) = cmFind k ncm
   cmUnion  (OnDiskPerPkg a) (OnDiskPerPkg b) = OnDiskPerPkg (cmUnion a b)
   cmToList (OnDiskPerPkg ncm) = cmToList ncm
-  cmToCSV  (OnDiskPerPkg ncm) = cmToCSV ncm
-  cmInsertRecord r (OnDiskPerPkg ncm) = first OnDiskPerPkg `liftM` cmInsertRecord r ncm
 
 newtype RecentDownloads = RecentDownloads {
     recentDownloads :: SimpleCountingMap PackageName
   }
-  deriving (Show, Eq, MemSize)
+  deriving stock (Show, Eq)
+  deriving newtype (MemSize)
 
 instance CountingMap PackageName RecentDownloads where
   cmEmpty  = RecentDownloads cmEmpty
@@ -96,13 +81,12 @@ instance CountingMap PackageName RecentDownloads where
   cmFind   k (RecentDownloads ncm) = cmFind k ncm
   cmUnion  (RecentDownloads a) (RecentDownloads b) = RecentDownloads (cmUnion a b)
   cmToList (RecentDownloads ncm) = cmToList ncm
-  cmToCSV  (RecentDownloads ncm) = cmToCSV ncm
-  cmInsertRecord r (RecentDownloads ncm) = first RecentDownloads `liftM` cmInsertRecord r ncm
 
 newtype TotalDownloads = TotalDownloads {
     totalDownloads :: SimpleCountingMap PackageName
   }
-  deriving (Show, Eq, MemSize)
+  deriving stock (Show, Eq)
+  deriving newtype (MemSize)
 
 instance CountingMap PackageName TotalDownloads where
   cmEmpty  = TotalDownloads cmEmpty
@@ -111,8 +95,6 @@ instance CountingMap PackageName TotalDownloads where
   cmFind   k (TotalDownloads ncm) = cmFind k ncm
   cmUnion  (TotalDownloads a) (TotalDownloads b) = TotalDownloads (cmUnion a b)
   cmToList (TotalDownloads ncm) = cmToList ncm
-  cmToCSV  (TotalDownloads ncm) = cmToCSV ncm
-  cmInsertRecord r (TotalDownloads ncm) = first TotalDownloads `liftM` cmInsertRecord r ncm
 
 {------------------------------------------------------------------------------
   Initial instances
@@ -206,49 +188,6 @@ instance MemSize InMemStats where
 
 deriveSafeCopy 0 'base ''InMemStats
 deriveSafeCopy 0 'base ''OnDiskPerPkg
-
-readOnDiskStats :: FilePath -> IO OnDiskStats
-readOnDiskStats stateDir = do
-    createDirectoryIfMissing True stateDir
-    pkgStrs <- getDirectoryContents stateDir
-    OnDiskStats . NCM 0 . Map.fromList <$> sequence
-      [ do onDiskPerPkg <- unsafeInterleaveIO $
-                             either (const cmEmpty) id
-                               <$> readOnDiskPerPkg pkgFile
-           return (pkgName, onDiskPerPkg)
-      | Just pkgName <- map simpleParse pkgStrs
-      , let pkgFile = stateDir </> display pkgName ]
-
-readOnDiskPerPkg :: FilePath -> IO (Either String OnDiskPerPkg)
-readOnDiskPerPkg pkgFile =
-    withFile pkgFile ReadMode $ \h ->
-      -- By evaluating the Either result from the parser we force
-      -- all contents to be read
-      evaluate =<< (runGetLazy safeGet <$> BSL.hGetContents h)
-
-writeOnDiskStats :: FilePath -> OnDiskStats -> IO ()
-writeOnDiskStats stateDir stats@(OnDiskStats (NCM _ onDisk)) =
-    writeOnDiskStatsFor stateDir (Map.keys onDisk) stats
-
--- | Write out the statistics for the given packages only.
-writeOnDiskStatsFor :: FilePath -> [PackageName] -> OnDiskStats -> IO ()
-writeOnDiskStatsFor stateDir pkgNames (OnDiskStats (NCM _ onDisk)) = do
-   createDirectoryIfMissing True stateDir
-   forM_ pkgNames $ \pkgName ->
-     forM_ (Map.lookup pkgName onDisk) $ \perPkg ->
-       writeFileAtomic (stateDir </> display pkgName) $ runPutLazy (safePut perPkg)
-
-{------------------------------------------------------------------------------
-  The append-only all-time log
-------------------------------------------------------------------------------}
-
-appendToLog :: FilePath -> InMemStats -> IO ()
-appendToLog stateDir (InMemStats _ inMemStats) =
-  LBS8.appendFile (stateDir </> "log") $ Csv.encode (cmToCSV inMemStats)
-
-reconstructLog :: FilePath -> OnDiskStats -> IO ()
-reconstructLog stateDir onDisk =
-  LBS8.writeFile (stateDir </> "log") $ Csv.encode (cmToCSV onDisk)
 
 {------------------------------------------------------------------------------
   ACID stuff

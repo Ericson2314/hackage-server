@@ -7,6 +7,7 @@ module Distribution.Server.Framework.MemSize (
   memSize12, memSize13, memSizeUArray, memSizeUVector
   ) where
 
+import Data.Int (Int32)
 import Data.Word
 import qualified Data.Map as Map
 import Data.Map (Map)
@@ -120,6 +121,9 @@ instance MemSize (a -> b) where
 
 instance MemSize Int where
   memSize _ = 2
+
+instance MemSize Int32 where
+  memSize _ = 1
 
 instance MemSize Word where
   memSize _ = 2

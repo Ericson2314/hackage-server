@@ -46,13 +46,13 @@ pkgLatestRevision = fromOldMetadataRev . Vec.last . pkgMetadataRevisions
 pkgSpecificRevision :: PkgInfo -> MetadataRevIx -> Maybe MetadataRevision
 pkgSpecificRevision pkg (MetadataRevIx revno)
   = fmap fromOldMetadataRev
-  $ pkgMetadataRevisions pkg Vec.!? revno
+  $ pkgMetadataRevisions pkg Vec.!? fromIntegral revno
 
 pkgAllRevisionsCabalFiles :: PkgInfo -> [CabalFileText]
 pkgAllRevisionsCabalFiles = fmap fst . Vec.toList . pkgMetadataRevisions
 
 pkgSpecificTarball :: PkgInfo -> TarballRevIx -> Maybe (PkgTarball, UploadInfo)
-pkgSpecificTarball pkg (TarballRevIx revno) = fmap (fmap fromOldUploadInfo) $ pkgTarballRevisions pkg Vec.!? revno
+pkgSpecificTarball pkg (TarballRevIx revno) = fmap (fmap fromOldUploadInfo) $ pkgTarballRevisions pkg Vec.!? fromIntegral revno
 
 pkgAllTarballs :: PkgInfo -> [(PkgTarball, OldUploadInfo)]
 pkgAllTarballs = Vec.toList . pkgTarballRevisions
@@ -76,7 +76,7 @@ pkgNumRevisions :: PkgInfo -> Int
 pkgNumRevisions = Vec.length . pkgMetadataRevisions
 
 pkgMaxRevision :: PkgInfo -> MetadataRevIx
-pkgMaxRevision = MetadataRevIx . subtract 1 . pkgNumRevisions
+pkgMaxRevision = MetadataRevIx . fromIntegral . subtract 1 . pkgNumRevisions
 
 -- | The latest tarball for a package (if any)
 --

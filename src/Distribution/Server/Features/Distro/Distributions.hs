@@ -1,4 +1,4 @@
-{-# LANGUAGE
+{-# LANGUAGE OverloadedStrings, MultiParamTypeClasses,
     RecordWildCards
   #-}
 
@@ -24,6 +24,9 @@ module Distribution.Server.Features.Distro.Distributions
     , modifyDistroMaintainers
     ) where
 
+import Database.Beam.Backend.SQL (HasSqlValueSyntax(..))
+import Database.Beam.Postgres.Syntax (PgValueSyntax)
+import qualified Data.Text as T
 import qualified Data.Map as Map
 import qualified Data.Map.Strict as Map.Strict
 import qualified Data.Set as Set
@@ -144,3 +147,6 @@ getDistroMaintainers name = Map.lookup name . nameMap
 modifyDistroMaintainers :: DistroName -> (UserIdSet -> UserIdSet) -> Distributions -> Distributions
 modifyDistroMaintainers name func dists = dists {nameMap = Map.alter (Just . func . fromMaybe Group.empty) name (nameMap dists) }
 
+
+instance HasSqlValueSyntax PgValueSyntax DistroName where sqlValueSyntax = sqlValueSyntax . T.pack . show
+instance HasSqlValueSyntax PgValueSyntax DistroPackageInfo where sqlValueSyntax = sqlValueSyntax . T.pack . show

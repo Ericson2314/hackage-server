@@ -1,7 +1,11 @@
+{-# LANGUAGE DeriveDataTypeable #-}
 {-# LANGUAGE DerivingStrategies #-}
-{-# LANGUAGE GeneralizedNewtypeDeriving, DeriveDataTypeable,
-             StandaloneDeriving, TemplateHaskell, TypeFamilies,
-             RecordWildCards #-}
+{-# LANGUAGE GeneralizedNewtypeDeriving #-}
+{-# LANGUAGE MultiParamTypeClasses #-}
+{-# LANGUAGE RecordWildCards #-}
+{-# LANGUAGE StandaloneDeriving #-}
+{-# LANGUAGE TemplateHaskell #-}
+{-# LANGUAGE TypeFamilies #-}
 
 -----------------------------------------------------------------------------
 -- |
@@ -19,6 +23,12 @@ module Distribution.Server.Packages.Types where
 
 import Distribution.Server.Prelude
 
+import Data.Int (Int32)
+import Database.Beam.Backend (FromBackendRow(..))
+import Database.Beam.Backend.SQL (HasSqlValueSyntax(..))
+import Database.Beam.Postgres (Postgres)
+import Database.Beam.Postgres.Syntax (PgValueSyntax)
+import qualified Data.Text as T
 import Distribution.Server.Framework (FromReqURI(..))
 import Distribution.Server.Users.Types (UserId(..))
 import Distribution.Server.Framework.BlobStorage (BlobId, BlobId_v0, BlobStorage)
@@ -161,16 +171,22 @@ instance Package PkgInfo where
   Utility
 -------------------------------------------------------------------------------}
 
-newtype MetadataRevIx = MetadataRevIx { getMetadataRevIx :: Int }
-  deriving newtype (Eq, Ord, Show, MemSize, Read, FromReqURI, ToJSON, Serialize)
+newtype MetadataRevIx = MetadataRevIx { getMetadataRevIx :: Int32 }
+  deriving newtype (Eq, Ord, Show, Read, ToJSON, Serialize, Num, Enum, HasSqlValueSyntax PgValueSyntax, FromBackendRow Postgres)
+
+instance MemSize MetadataRevIx where memSize _ = 1
+instance FromReqURI MetadataRevIx where fromReqURI = fmap (MetadataRevIx . fromIntegral) . (fromReqURI :: String -> Maybe Int)
 
 instance SafeCopy MetadataRevIx where
     getCopy = contain Serialize.get
     putCopy = contain . Serialize.put
     errorTypeName _ = "MetadataRevIx"
 
-newtype TarballRevIx = TarballRevIx { getTarballRevIx :: Int }
-  deriving newtype (Eq, Ord, Show, MemSize, Read, FromReqURI, ToJSON, Serialize)
+newtype TarballRevIx = TarballRevIx { getTarballRevIx :: Int32 }
+  deriving newtype (Eq, Ord, Show, Read, ToJSON, Serialize, Num, Enum, HasSqlValueSyntax PgValueSyntax, FromBackendRow Postgres)
+
+instance MemSize TarballRevIx where memSize _ = 1
+instance FromReqURI TarballRevIx where fromReqURI = fmap (TarballRevIx . fromIntegral) . (fromReqURI :: String -> Maybe Int)
 
 instance SafeCopy TarballRevIx where
     getCopy = contain Serialize.get
@@ -259,7 +275,7 @@ instance Migrate PkgInfo_v1 where
                  [ (cf, migrateUploadInfo ui) | (cf, ui) <- d ]
                  (migrateUploadInfo e)
       where
-        migrateUploadInfo (UTCTime_v0 ts, UserId_v0 uid) = (ts, UserId uid)
+        migrateUploadInfo (UTCTime_v0 ts, UserId_v0 uid) = (ts, UserId (fromIntegral uid))
 
 deriveSafeCopy 2 'extension ''PkgInfo_v1
 
@@ -293,3 +309,7 @@ instance Migrate PkgInfo where
 
 deriveSafeCopy 4 'extension ''PkgInfo
 
+
+instance HasSqlValueSyntax PgValueSyntax PkgInfo where sqlValueSyntax = sqlValueSyntax . T.pack . show
+instance HasSqlValueSyntax PgValueSyntax PkgTarball where sqlValueSyntax = sqlValueSyntax . T.pack . show
+instance HasSqlValueSyntax PgValueSyntax CabalFileText where sqlValueSyntax = sqlValueSyntax . T.pack . show

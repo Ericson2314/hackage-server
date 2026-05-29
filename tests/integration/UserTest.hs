@@ -1,6 +1,6 @@
 {-
   Integration test for user management: CRUD operations, authentication,
-  password changes, and backup/restore round-trip for user data.
+  password changes, and server restart persistence.
 
   Runs its own server instance on a random port, independent of other
   integration tests, so all can run in parallel.
@@ -9,10 +9,9 @@
 module Main (main) where
 
 import Control.Monad
-import qualified Data.ByteString.Lazy.Char8 as LBS
 import Data.List (isInfixOf)
 import Data.String ()
-import System.Directory (createDirectoryIfMissing, getCurrentDirectory, removeDirectoryRecursive)
+import System.Directory (createDirectoryIfMissing, getCurrentDirectory)
 import System.Exit (die)
 import System.FilePath
 import System.IO
@@ -32,39 +31,42 @@ main = do
   info "UserTest: Initialising"
   ts <- initTestServer
   info $ "Using port " ++ show (testServerPort ts)
+  case ts of
+    ExternalServer _ _ -> externalTest ts
+    LocalServer _ _    -> localTest ts
+
+externalTest :: TestServer -> IO ()
+externalTest ts = do
+    waitForServer ts
+    runUserCreateTests ts
+    runUserAuthTests ts
+    runPasswordChangeTests ts
+    runUserDeleteTests ts
+    verifyUsers ts
+    info "UserTest: PASSED"
+
+localTest :: TestServer -> IO ()
+localTest ts = do
   root <- getCurrentDirectory
-  withSystemTempDirectory "hackage-user-test" $ \workDir -> do
-    info $ "Using test directory " ++ workDir
-    createDirectoryIfMissing True (workDir </> "tmp")
+  withSystemTempDirectory "hackage-user-test" $ \workDir ->
+    withTempPostgres $ \cluster ->
+      withFreshDb cluster "hackage_user_test" $ \connStr -> do
+        info $ "Using test directory " ++ workDir
+        createDirectoryIfMissing True (workDir </> "tmp")
 
-    -- Init and start server
-    runServerChecked root ["init", "--state-dir", workDir </> "state"]
-    withServerRunning ts workDir $ do
-      runUserCreateTests ts
-      runUserAuthTests ts
-      runPasswordChangeTests ts
-      runUserDeleteTests ts
-      verifyUsers ts
+        -- Init and start server
+        runServerChecked root ["init", "--state-dir", workDir </> "state"
+                              , "--db-conn-str", connStr]
+        withServerRunning ts workDir connStr $ do
+          runUserCreateTests ts
+          runUserAuthTests ts
+          runPasswordChangeTests ts
+          runUserDeleteTests ts
+          verifyUsers ts
 
-    -- Verify users survive server restart
-    info "Verifying users after server restart"
-    withServerRunning ts workDir $ verifyUsers ts
-
-    -- Backup/restore round-trip
-    info "Making backup"
-    tarGz1 <- createBackup root workDir "1"
-    info "Removing state"
-    removeDirectoryRecursive (workDir </> "state")
-    info $ "Restoring from " ++ tarGz1
-    runServerChecked root ["restore", "--state-dir", workDir </> "state", tarGz1]
-    info "Making second backup"
-    tarGz2 <- createBackup root workDir "2"
-    info "Checking backups match"
-    db1 <- LBS.readFile tarGz1
-    db2 <- LBS.readFile tarGz2
-    unless (db1 == db2) $ die "Backups don't match"
-    info "Verifying users after restore"
-    withServerRunning ts workDir $ verifyUsers ts
+        -- Verify users survive server restart
+        info "Verifying users after server restart"
+        withServerRunning ts workDir connStr $ verifyUsers ts
 
   info "UserTest: PASSED"
 

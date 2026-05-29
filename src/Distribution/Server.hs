@@ -30,7 +30,6 @@ module Distribution.Server (
 
 import Happstack.Server.SimpleHTTP
 import Distribution.Server.Framework
-import qualified Distribution.Server.Framework.BackupRestore as Import
 import qualified Distribution.Server.Framework.BlobStorage as BlobStorage
 import qualified Distribution.Server.Framework.Auth as Auth
 import Distribution.Server.Framework.Templating (TemplatesMode(..))
@@ -47,6 +46,9 @@ import qualified Distribution.Server.Users.Group as Group
 
 import Distribution.Text
 import Distribution.Verbosity as Verbosity
+import qualified Data.ByteString as BS
+import qualified Data.ByteString.Char8 as BS8
+import System.Environment (lookupEnv)
 
 import System.Directory (createDirectoryIfMissing, doesDirectoryExist)
 import Control.Concurrent
@@ -103,7 +105,8 @@ data ServerConfig = ServerConfig {
   confCacheDelay:: Int,
   -- | Period before which downloads are flushed to disk
   confDownloadFlush :: Int,
-  confLiveTemplates :: Bool
+  confLiveTemplates :: Bool,
+  confDbConnStr :: BS.ByteString
 } deriving (Show)
 
 confDbStateDir, confBlobStoreDir :: ServerConfig -> FilePath
@@ -139,7 +142,8 @@ defaultServerConfig = do
     confTmpDir    = "state" </> "tmp",
     confCacheDelay= 0,
     confDownloadFlush = 60,
-    confLiveTemplates = False
+    confLiveTemplates = False,
+    confDbConnStr = BS8.pack "dbname=hackage"
   }
 
 data Server = Server {
@@ -159,7 +163,7 @@ hasSavedState = doesDirectoryExist . confDbStateDir
 mkServerEnv :: ServerConfig -> IO ServerEnv
 mkServerEnv config@(ServerConfig verbosity hostURI userContentURI requiredBaseHostHeader _
                                     stateDir _ tmpDir
-                                    cacheDelay flushDownloadPeriod liveTemplates) = do
+                                    cacheDelay flushDownloadPeriod liveTemplates dbConnStr) = do
     createDirectoryIfMissing False stateDir
     let blobStoreDir  = confBlobStoreDir   config
         staticDir     = confStaticFilesDir config
@@ -169,6 +173,12 @@ mkServerEnv config@(ServerConfig verbosity hostURI userContentURI requiredBaseHo
     store   <- BlobStorage.open blobStoreDir
     cron    <- newCron verbosity
     tufDir  <- Sec.makeAbsolute $ Sec.fromFilePath tufDir'
+    pgConn  <- connectPg dbConnStr
+
+    -- Execute schema DDL to ensure all tables exist
+    let schemaPath = confStaticDir config </> "schema.sql"
+    schemaFile <- readFile schemaPath
+    executeSchema pgConn schemaFile
 
     let env = ServerEnv {
             serverStaticDir     = staticDir,
@@ -185,7 +195,8 @@ mkServerEnv config@(ServerConfig verbosity hostURI userContentURI requiredBaseHo
             serverBaseURI       = hostURI,
             serverUserContentBaseURI = userContentURI,
             serverRequiredBaseHostHeader = requiredBaseHostHeader,
-            serverVerbosity     = verbosity
+            serverVerbosity     = verbosity,
+            serverPgConn        = pgConn
          }
     return env
 
@@ -306,19 +317,11 @@ serverState server = [ (featureName feature, mconcat (featureState feature))
                      | feature <- serverFeatures server
                      ]
 
--- An alternative to an import: starts the server off to a sane initial state.
--- To accomplish this, we import a 'null' tarball, finalizing immediately after initializing import
+-- | Initialize a fresh server with a default admin account.
+-- The PostgreSQL schema is already created; this just adds the admin user.
 initState ::  Server -> (String, String) -> IO ()
 initState server (admin, pass) = do
-    -- We take the opportunity to checkpoint all the acid-state components
-    -- upon first initialisation as this helps with migration problems later.
-    -- https://github.com/acid-state/acid-state/issues/20
     checkpoint server
-
-    let store  = serverBlobStore (serverEnv server)
-        stores = BlobStorage.BlobStores store []
-    void . Import.importBlank stores $ map (second abstractStateRestore) (serverState server)
-    -- create default admin user
     let UserFeature{updateAddUser, adminGroup} = serverUserFeature server
     muid <- case simpleParse admin of
         Just uname -> do

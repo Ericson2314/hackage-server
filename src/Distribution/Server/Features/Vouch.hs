@@ -6,9 +6,7 @@ module Distribution.Server.Features.Vouch (VouchFeature(..), initVouchFeature, j
 import Distribution.Server.Features.Vouch.Acid (acidStore)
 import qualified Distribution.Server.Features.Vouch.Store as Store
 import Distribution.Server.Features.Vouch.Types
-import Distribution.Server.Features.Vouch.Backup (vouchBackup, vouchRestore)
 import Control.Monad (when, join, forM_)
-import qualified Data.Map as Map
 import Control.Monad.Except (runExceptT, throwError)
 import Control.Monad.IO.Class (MonadIO)
 import qualified Data.ByteString.Lazy.Char8 as LBS
@@ -93,8 +91,8 @@ renderVouchers lookupUserInfo (uid, timestamp) = do
   pure . toUTF8LBS . prettyHtmlFragment . li . stringToHtml $ name <> " vouched on " <> formatShow iso8601Format newUTCTime
 
 initVouchFeature :: ServerEnv -> IO (UserFeature -> UploadFeature -> IO VouchFeature)
-initVouchFeature ServerEnv{serverStateDir, serverTemplatesDir, serverTemplatesMode} = do
-  vouchBackend <- acidStore serverStateDir
+initVouchFeature ServerEnv{serverPgConn, serverTemplatesDir, serverTemplatesMode} = do
+  vouchBackend <- acidStore serverPgConn
   templates <- loadTemplates serverTemplatesMode [ serverTemplatesDir, serverTemplatesDir </> "Html"]
                                                  ["vouch.html"]
   vouchTemplate <- getTemplate templates "vouch.html"

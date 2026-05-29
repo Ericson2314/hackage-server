@@ -96,8 +96,8 @@ initTagsFeature :: ServerEnv
                     -> UploadFeature
                     -> UserFeature
                     -> IO TagsFeature)
-initTagsFeature ServerEnv{serverStateDir} = do
-    tagsBackend <- Acid.acidStore serverStateDir
+initTagsFeature ServerEnv{serverPgConn} = do
+    tagsBackend <- Acid.acidStore serverPgConn
     let tagsStore = Store.backendStore tagsBackend
     specials  <- newMemStateWHNF State.emptyPackageTags
     updateTag <- newHook

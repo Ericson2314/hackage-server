@@ -1,4 +1,5 @@
 {-# LANGUAGE DeriveDataTypeable, GeneralizedNewtypeDeriving, TemplateHaskell #-}
+{-# LANGUAGE MultiParamTypeClasses #-}
 {-# LANGUAGE TypeFamilies #-}
 {-# LANGUAGE DerivingStrategies #-}
 module Distribution.Server.Users.Types (
@@ -7,8 +8,13 @@ module Distribution.Server.Users.Types (
     module Distribution.Server.Framework.AuthTypes
   ) where
 
+import Data.Int (Int32)
 import Distribution.Server.Framework.AuthTypes
 import Distribution.Server.Framework.MemSize
+import Database.Beam.Backend (FromBackendRow(..))
+import Database.Beam.Backend.SQL (HasSqlValueSyntax(..))
+import Database.Beam.Postgres (Postgres)
+import Database.Beam.Postgres.Syntax (PgValueSyntax)
 import Distribution.Server.Users.AuthToken
 
 import Distribution.Pretty (Pretty(..))
@@ -29,11 +35,17 @@ import Data.Hashable
 import Data.Serialize (Serialize)
 
 
-newtype UserId = UserId Int
-  deriving newtype (Eq, Ord, Read, Show, MemSize, ToJSON, FromJSON, Pretty)
+newtype UserId = UserId Int32
+  deriving newtype (Eq, Ord, Read, Show, ToJSON, FromJSON, HasSqlValueSyntax PgValueSyntax, FromBackendRow Postgres)
+
+instance MemSize UserId where memSize _ = 1
+instance Pretty UserId where pretty (UserId n) = Disp.text (show n)
 
 newtype UserName  = UserName String
   deriving newtype (Eq, Ord, Read, Show, MemSize, ToJSON, FromJSON, Hashable, Serialize)
+
+instance HasSqlValueSyntax PgValueSyntax UserName where sqlValueSyntax (UserName s) = sqlValueSyntax (T.pack s)
+instance FromBackendRow Postgres UserName where fromBackendRow = do { t <- fromBackendRow; pure $ UserName (T.unpack (t :: T.Text)) }
 
 data UserInfo = UserInfo {
                   userName   :: !UserName,
@@ -48,6 +60,8 @@ data UserStatus = AccountEnabled  UserAuth
 
 newtype UserAuth = UserAuth PasswdHash
     deriving (Show, Eq)
+
+instance HasSqlValueSyntax PgValueSyntax UserAuth where sqlValueSyntax = sqlValueSyntax . T.pack . show
 
 isActiveAccount :: UserStatus -> Bool
 isActiveAccount (AccountEnabled  _) = True
@@ -68,7 +82,7 @@ instance MemSize UserAuth where
 instance Parsec UserId where
   -- parse a non-negative integer. No redundant leading zeros allowed.
   -- (this is effectively a relabeled versionDigitParser)
-  parsec = (P.some d >>= (fmap UserId . toNumber)) P.<?> "UserId (natural number without redunant leading zeroes)"
+  parsec = (P.some d >>= (fmap (UserId . fromIntegral) . toNumber)) P.<?> "UserId (natural number without redunant leading zeroes)"
     where
       toNumber :: P.CabalParsing m => [Int] -> m Int
       toNumber [0]   = return 0

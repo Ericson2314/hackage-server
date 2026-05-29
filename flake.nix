@@ -5,6 +5,8 @@
     haskell-flake.url = "github:srid/haskell-flake";
     flake-root.url = "github:srid/flake-root";
     flake-parts.inputs.nixpkgs-lib.follows = "nixpkgs";
+    all-cabal-hashes.url = "github:commercialhaskell/all-cabal-hashes/hackage";
+    all-cabal-hashes.flake = false;
   };
 
   outputs = inputs@{ self, nixpkgs, flake-parts, ... }:

@@ -3,7 +3,7 @@ module Distribution.Server.Features.Core.Acid
   , packagesStateComponent
   ) where
 
-import Distribution.Server.Features.Core.Backup
+import Distribution.Server.Features.Core.Db
 import Distribution.Server.Features.Core.Store
 import qualified Distribution.Server.Features.Core.State as Acid
 import Distribution.Server.Features.Security.Migration
@@ -17,9 +17,11 @@ import Distribution.Package (packageId)
 import qualified Data.List.NonEmpty as NE
 import qualified Data.Map as Map
 
-acidStore :: ServerEnv -> Verbosity -> Bool -> FilePath -> IO Backend
-acidStore env verbosity freshDB stateDir = do
-  packagesState <- packagesStateComponent verbosity freshDB stateDir
+import Control.Concurrent.MVar (swapMVar)
+
+acidStore :: ServerEnv -> Verbosity -> PgConnection -> IO Backend
+acidStore env verbosity conn = do
+  packagesState <- packagesStateComponent verbosity conn
   let withIndex :: MonadIO m => (PackageIndex.PackageIndex PkgInfo -> a) -> m a
       withIndex f = f . Acid.packageIndex <$> queryState packagesState Acid.GetPackagesState
   pure Backend {
@@ -63,17 +65,19 @@ acidStore env verbosity freshDB stateDir = do
     , backendState = [abstractAcidStateComponent packagesState]
     }
 
-packagesStateComponent :: Verbosity -> Bool -> FilePath -> IO (StateComponent AcidState Acid.PackagesState)
-packagesStateComponent verbosity freshDB stateDir = do
-  let stateFile = stateDir </> "db" </> "PackagesState"
+packagesStateComponent :: Verbosity -> PgConnection -> IO (StateComponent AcidState Acid.PackagesState)
+packagesStateComponent verbosity conn = do
+  -- Load state
   st <- logTiming verbosity "Loaded PackagesState" $
-          openLocalStateFrom stateFile (Acid.initialPackagesState freshDB)
+          runPgTx conn loadPackagesState
+
+  pgSt <- mkAcidState conn st savePackagesState
   return StateComponent {
        stateDesc    = "Main package database"
-     , stateHandle  = st
-     , getState     = query st Acid.GetPackagesState
-     , putState     = update st . Acid.ReplacePackagesState
-     , backupState  = \_ -> indexToAllVersions
-     , restoreState = packagesBackup
-     , resetState   = packagesStateComponent verbosity True
+     , stateHandle  = pgSt
+     , getState     = queryPg pgSt (runQueryEvent Acid.GetPackagesState)
+     , putState     = \s -> do
+         runPgTx conn (savePackagesState s)
+         _ <- swapMVar (pgMVar pgSt) s
+         return ()
      }

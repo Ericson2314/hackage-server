@@ -35,13 +35,13 @@ empty :: UserIdSet
 empty = UserIdSet IntSet.empty
 
 insert :: UserId -> UserIdSet -> UserIdSet
-insert (UserId uid) (UserIdSet uidset) = UserIdSet (IntSet.insert uid uidset)
+insert (UserId uid) (UserIdSet uidset) = UserIdSet (IntSet.insert (fromIntegral uid) uidset)
 
 delete :: UserId -> UserIdSet -> UserIdSet
-delete (UserId uid) (UserIdSet uidset) = UserIdSet (IntSet.delete uid uidset)
+delete (UserId uid) (UserIdSet uidset) = UserIdSet (IntSet.delete (fromIntegral uid) uidset)
 
 member :: UserId -> UserIdSet -> Bool
-member (UserId uid) (UserIdSet uidset) = IntSet.member uid uidset
+member (UserId uid) (UserIdSet uidset) = IntSet.member (fromIntegral uid) uidset
 
 size :: UserIdSet -> Int
 size (UserIdSet uidset) = IntSet.size uidset
@@ -50,10 +50,10 @@ null :: UserIdSet -> Bool
 null (UserIdSet uidset) = IntSet.null uidset
 
 toList :: UserIdSet -> [UserId]
-toList (UserIdSet uidset) = map UserId (IntSet.toList uidset)
+toList (UserIdSet uidset) = map (UserId . fromIntegral) (IntSet.toList uidset)
 
 fromList :: [UserId] -> UserIdSet
-fromList ids = UserIdSet $ IntSet.fromList (map (\(UserId uid) -> uid) ids)
+fromList ids = UserIdSet $ IntSet.fromList (map (\(UserId uid) -> fromIntegral uid) ids)
 
 unions :: [UserIdSet] -> UserIdSet
 unions uidsets = UserIdSet (IntSet.unions [ uidset | UserIdSet uidset <- uidsets ])

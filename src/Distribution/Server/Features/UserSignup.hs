@@ -98,10 +98,10 @@ initUserSignupFeature :: ServerEnv
                           -> UserDetailsFeature
                           -> UploadFeature
                           -> IO UserSignupFeature)
-initUserSignupFeature env@ServerEnv{ serverStateDir, serverTemplatesDir,
+initUserSignupFeature env@ServerEnv{ serverPgConn, serverTemplatesDir,
                                      serverTemplatesMode } = do
     -- Canonical state
-    signupResetBackend <- Acid.acidStore serverStateDir
+    signupResetBackend <- Acid.acidStore serverPgConn
 
     -- Page templates
     templates <- loadTemplates serverTemplatesMode

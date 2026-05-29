@@ -7,7 +7,7 @@ import Control.Concurrent
 import Control.Exception
 import Control.Monad
 import Control.Applicative
-import Data.List (isInfixOf, isSuffixOf)
+import Data.List (isInfixOf)
 import Data.Maybe
 import Data.String ()
 import Data.Aeson (FromJSON(..), Result(..), Value(..), (.:), fromJSON)
@@ -41,15 +41,15 @@ import qualified Paths_hackage_server as Paths
 
 -- | Run an action with the test server. For 'LocalServer', forks and
 -- kills the server process. For 'ExternalServer', just runs the action.
-withServerRunning :: TestServer -> FilePath -> IO () -> IO ()
-withServerRunning ts@(ExternalServer _ _) _workDir f = do
+withServerRunning :: TestServer -> FilePath -> String -> IO () -> IO ()
+withServerRunning ts@(ExternalServer _ _) _workDir _connStr f = do
     info "Using external server"
     waitForServer ts
     info "Server running"
     f
     info "Finished with server"
-withServerRunning ts@(LocalServer sock _) workDir f = do
-    args <- serverRunningArgs ts workDir
+withServerRunning ts@(LocalServer sock _) workDir connStr f = do
+    args <- serverRunningArgs ts workDir connStr
     root <- getCurrentDirectory
     info "Forking server thread"
     mv <- newEmptyMVar
@@ -64,8 +64,79 @@ withServerRunning ts@(LocalServer sock _) workDir f = do
                       f
                       info "Finished with server")
 
-serverRunningArgs :: TestServer -> FilePath -> IO [String]
-serverRunningArgs ts workDir = do
+-- | Start a temporary PostgreSQL cluster for testing.
+-- The cluster runs for the duration of the action.
+-- Use 'withFreshDb' inside to create/reset databases.
+withTempPostgres :: (PgCluster -> IO a) -> IO a
+withTempPostgres action = do
+    cwd <- getCurrentDirectory
+    let pgdata = cwd </> "pgdata"
+        socketDir = cwd
+    -- Find PostgreSQL executables
+    initdbPath    <- findExe "initdb"
+    pgctlPath     <- findExe "pg_ctl"
+    pgisreadyPath <- findExe "pg_isready"
+    createdbPath  <- findExe "createdb"
+    dropdbPath    <- findExe "dropdb"
+    -- Initialize the cluster
+    info "Initialising temporary PostgreSQL cluster"
+    initEc <- run initdbPath ["-D", pgdata, "--no-locale", "-E", "UTF8"]
+    case initEc of
+      Just ExitSuccess -> return ()
+      _ -> die "initdb failed"
+    -- Enable query logging
+    appendFile (pgdata </> "postgresql.conf") "\nlog_statement = 'all'\n"
+    -- Start PostgreSQL
+    info "Starting temporary PostgreSQL"
+    startEc <- run pgctlPath ["-D", pgdata, "-l", pgdata </> "log",
+                               "-o", "-k " ++ socketDir ++ " -h ''",
+                               "start"]
+    case startEc of
+      Just ExitSuccess -> return ()
+      _ -> die "pg_ctl start failed"
+    -- Wait for PostgreSQL to be ready
+    let waitPg n = do
+          ec <- run pgisreadyPath ["-h", socketDir]
+          case ec of
+            Just ExitSuccess -> info "PostgreSQL is ready"
+            _ | n <= (0 :: Int) -> die "PostgreSQL didn't start"
+              | otherwise -> do
+                  info "Waiting for PostgreSQL..."
+                  threadDelay 500000
+                  waitPg (n - 1)
+    waitPg 20
+    let cluster = PgCluster socketDir createdbPath dropdbPath
+    -- Run the action, then stop PostgreSQL
+    action cluster
+      `onException` do
+        info "PostgreSQL log on failure:"
+        readFile (pgdata </> "log") >>= putStr
+      `finally` do
+        info "Stopping temporary PostgreSQL"
+        void $ run pgctlPath ["-D", pgdata, "stop", "-m", "immediate"]
+  where
+    findExe name = findExecutable name >>= maybe (die (name ++ " not found in PATH")) return
+
+-- | Handle for a running PostgreSQL cluster.
+data PgCluster = PgCluster
+  { pgSocketDir   :: FilePath
+  , pgCreatedbExe :: FilePath
+  , pgDropdbExe   :: FilePath
+  }
+
+-- | Create a fresh database, run the action, then drop it.
+-- Returns the connection string for use with @--db-conn-str@.
+withFreshDb :: PgCluster -> String -> (String -> IO a) -> IO a
+withFreshDb cluster dbName action = do
+    info $ "Creating database " ++ dbName
+    void $ run (pgCreatedbExe cluster) ["-h", pgSocketDir cluster, dbName]
+    let connStr = "host=" ++ pgSocketDir cluster ++ " dbname=" ++ dbName
+    action connStr `finally` do
+      info $ "Dropping database " ++ dbName
+      void $ run (pgDropdbExe cluster) ["-h", pgSocketDir cluster, "--force", dbName]
+
+serverRunningArgs :: TestServer -> FilePath -> String -> IO [String]
+serverRunningArgs ts workDir connStr = do
   let p = testServerPort ts
   return ["run"
     , "--socket-activation-only"
@@ -75,6 +146,7 @@ serverRunningArgs ts workDir = do
     , "--required-base-host-header", "127.0.0.1:" <> show p
     , "--state-dir", workDir </> "state"
     , "--tmp-dir", workDir </> "tmp"
+    , "--db-conn-str", connStr
     ]
 
 waitForServer :: TestServer -> IO ()
@@ -93,20 +165,6 @@ waitForServer ts = f 10
                               threadDelay 5000000
                               f (n - 1)
 
-createBackup :: FilePath -> FilePath -> FilePath -> IO FilePath
-createBackup root workDir suffix = do
-    let outDir = workDir </> suffix
-    createDirectoryIfMissing False outDir
-    runServerChecked root ["backup", "-o", outDir, "--state-dir", workDir </> "state"]
-    findTarGz outDir
-  where
-    findTarGz :: FilePath -> IO FilePath
-    findTarGz dir = do
-      [tarGz] <- find dir (".tar.gz" `isSuffixOf`)
-      return tarGz
-
-find :: FilePath -> (FilePath -> Bool) -> IO [FilePath]
-find dir p = (map (dir </>) . filter p) `liftM` getDirectoryContents dir
 
 runServerChecked :: FilePath -> [String] -> IO ()
 runServerChecked root args = do

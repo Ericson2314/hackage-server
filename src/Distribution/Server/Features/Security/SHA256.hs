@@ -7,6 +7,7 @@ module Distribution.Server.Features.Security.SHA256 (
   , sha256
 
   , sha256DigestBytes
+  , sha256digestFromBS
   ) where
 
 -- stdlibs

@@ -1,7 +1,14 @@
-{-# LANGUAGE NamedFieldPuns  #-}
-{-# LANGUAGE RankNTypes      #-}
-{-# LANGUAGE RecordWildCards #-}
-{-# LANGUAGE RecursiveDo     #-}
+{-# LANGUAGE DeriveAnyClass      #-}
+{-# LANGUAGE DeriveGeneric       #-}
+{-# LANGUAGE FlexibleContexts, FlexibleInstances   #-}
+{-# LANGUAGE MultiParamTypeClasses #-}
+{-# LANGUAGE NamedFieldPuns      #-}
+{-# LANGUAGE OverloadedStrings   #-}
+{-# LANGUAGE RankNTypes          #-}
+{-# LANGUAGE RecordWildCards     #-}
+{-# LANGUAGE RecursiveDo         #-}
+{-# LANGUAGE StandaloneDeriving  #-}
+{-# LANGUAGE TypeFamilies        #-}
 module Distribution.Server.Features.Core (
     CoreFeature(..),
     CoreResource(..),
@@ -44,6 +51,7 @@ import           Distribution.Server.Features.Security.SHA256       (sha256)
 import           Distribution.Server.Features.Users
 import           Distribution.Server.Framework
 import qualified Distribution.Server.Framework.BlobStorage          as BlobStorage
+import           Distribution.Server.Framework.BlobStorage (BlobId)
 import qualified Distribution.Server.Framework.ResponseContentTypes as Resource
 import           Distribution.Server.Packages.Index                 (TarIndexEntry (..))
 import qualified Distribution.Server.Packages.Index                 as Packages.Index
@@ -51,13 +59,15 @@ import           Distribution.Server.Packages.PackageIndex          (PackageInde
 import qualified Distribution.Server.Packages.PackageIndex          as PackageIndex
 import           Distribution.Server.Packages.Types
 import           Distribution.Server.Packages.Utils
-import           Distribution.Server.Users.Types                    (UserId,
+import           Distribution.Server.Users.Types                    (UserId(..),
+                                                                     UserName(..),
                                                                      userName)
 
 -- Cabal
 import           Distribution.Package
 import           Distribution.Text                                  (display)
-import           Distribution.Version                               (nullVersion)
+import           Distribution.Version                               (Version, nullVersion)
+
 
 -- | The core feature, responsible for the main package index and all access
 -- and modifications of it.
@@ -291,9 +301,9 @@ data CoreResource = CoreResource {
 }
 
 initCoreFeature :: ServerEnv -> IO (UserFeature -> IO CoreFeature)
-initCoreFeature env@ServerEnv{serverStateDir, serverCacheDelay,
+initCoreFeature env@ServerEnv{serverPgConn, serverCacheDelay,
                               serverVerbosity = verbosity} = do
-    packagesBackend <- acidStore env verbosity False serverStateDir
+    packagesBackend <- acidStore env verbosity serverPgConn
     let packagesStore = Store.backendStore packagesBackend
 
     -- Hooks
@@ -349,7 +359,7 @@ initCoreFeature env@ServerEnv{serverStateDir, serverCacheDelay,
         -- reconstruct the package log rather than use the package log as it was
         -- constructed in the first place, and we might potentially lose
         -- information.
-        Store.createStoreCheckpoint packagesStore
+        return () -- each update is already durable
 
       rec let (feature, getIndexTarball)
                 = coreFeature env users
@@ -606,6 +616,7 @@ coreFeature ServerEnv{serverBlobStore = store} UserFeature{..}
           runHook_ packageChangeHook  (PackageChangeInfo PackageUpdatedTarball oldpkginfo newpkginfo)
           return True
 
+    updateSetPackageUploader :: MonadIO m => PackageId -> UserId -> m Bool
     updateSetPackageUploader pkgid userid = do
       mpkginfo <- Store.setPackageUploader packagesStore pkgid userid
       case mpkginfo of
@@ -614,6 +625,7 @@ coreFeature ServerEnv{serverBlobStore = store} UserFeature{..}
           runHook_ packageChangeHook  (PackageChangeInfo PackageUpdatedUploader oldpkginfo newpkginfo)
           return True
 
+    updateSetPackageUploadTime :: MonadIO m => PackageId -> UTCTime -> m Bool
     updateSetPackageUploadTime pkgid time = do
       mpkginfo <- Store.setPackageUploadTime packagesStore pkgid time
       case mpkginfo of

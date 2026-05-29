@@ -1,4 +1,4 @@
-{-# LANGUAGE DeriveDataTypeable, GeneralizedNewtypeDeriving,
+{-# LANGUAGE OverloadedStrings, MultiParamTypeClasses, FlexibleInstances, DeriveAnyClass, DeriveGeneric, DerivingStrategies, DeriveDataTypeable, GeneralizedNewtypeDeriving,
              TypeFamilies, TemplateHaskell #-}
 
 module Distribution.Server.Features.Votes.State where
@@ -17,7 +17,8 @@ import Distribution.Server.Users.State ()
 import Data.Map (Map)
 import qualified Data.Map as Map
 import Data.Maybe (fromMaybe)
-import Data.Acid     (Query, Update, makeAcidic)
+import Distribution.Server.Framework.EventSourcing (Query, Update, makeAcidic)
+import Distribution.Server.Framework.BeamInstances ()
 import Data.SafeCopy (base, extension, deriveSafeCopy, Migrate(..))
 
 import qualified Control.Monad.State as State
@@ -26,7 +27,8 @@ import Control.Monad.Reader.Class (ask)
 newtype VotesState_v0 = VotesState_v0 { votesMap :: Map PackageName UserIdSet }
 
 newtype VotesState = VotesState (Map PackageName (Map UserId Score))
-  deriving (Show, Eq, MemSize)
+  deriving stock (Show, Eq)
+  deriving newtype (MemSize)
 
 -- SafeCopy instances
 deriveSafeCopy 0 'base      ''VotesState_v0

@@ -1,4 +1,6 @@
 {-# LANGUAGE DeriveDataTypeable, GeneralizedNewtypeDeriving #-}
+{-# LANGUAGE MultiParamTypeClasses #-}
+{-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE TypeFamilies #-}
 module Distribution.Server.Users.AuthToken
     ( AuthToken
@@ -9,6 +11,8 @@ module Distribution.Server.Users.AuthToken
     )
 where
 
+import Database.Beam.Backend.SQL (HasSqlValueSyntax(..))
+import Database.Beam.Postgres.Syntax (PgValueSyntax)
 import Distribution.Server.Framework.MemSize
 import Distribution.Server.Util.Nonce
 
@@ -35,6 +39,8 @@ newtype OriginalToken = OriginalToken Nonce
 -- | Contains a hash of the original token
 newtype AuthToken = AuthToken BSS.ShortByteString
     deriving (Eq, Ord, Read, Show, MemSize)
+
+instance HasSqlValueSyntax PgValueSyntax AuthToken where sqlValueSyntax = sqlValueSyntax . renderAuthToken
 
 convertToken :: OriginalToken -> AuthToken
 convertToken (OriginalToken bs) =

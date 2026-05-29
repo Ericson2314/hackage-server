@@ -7,6 +7,7 @@ module Distribution.Server.Features.Security.MD5 (
   , md5
 
   , md5DigestBytes
+  , md5digestFromBS
 
   , lazyMD5
   , ByteStringWithMd5(..)

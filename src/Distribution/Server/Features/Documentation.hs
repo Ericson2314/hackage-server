@@ -96,9 +96,9 @@ initDocumentationFeature :: String
                              -> VersionsFeature
                              -> IO DocumentationFeature)
 initDocumentationFeature name
-                         env@ServerEnv{serverStateDir} = do
+                         env@ServerEnv{serverPgConn} = do
     -- Canonical state
-    documentationBackend <- acidStore name serverStateDir
+    documentationBackend <- acidStore name serverPgConn
 
     -- Hooks
     documentationChangeHook <- newHook

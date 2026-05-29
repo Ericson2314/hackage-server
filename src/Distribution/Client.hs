@@ -199,7 +199,7 @@ readNewIndex cacheDir = do
           pkgid
           (Just time)
           (if null username then Nothing else Just (UserName username))
-          (if userid == 0   then Nothing else Just (UserId userid))
+          (if userid == 0   then Nothing else Just (UserId (fromIntegral userid)))
       where
         time     = epochTimeToUTC (Tar.entryTime entry)
         username = Tar.ownerName (Tar.entryOwnership entry)

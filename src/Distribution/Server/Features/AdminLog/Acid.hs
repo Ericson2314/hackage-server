@@ -1,16 +1,34 @@
+{-# LANGUAGE DeriveAnyClass        #-}
+{-# LANGUAGE DeriveGeneric         #-}
+{-# LANGUAGE FlexibleInstances     #-}
+{-# LANGUAGE MultiParamTypeClasses #-}
+{-# LANGUAGE OverloadedStrings     #-}
+{-# LANGUAGE StandaloneDeriving    #-}
+{-# LANGUAGE TypeFamilies          #-}
+
 module Distribution.Server.Features.AdminLog.Acid
   ( acidStore
   ) where
 
-import Distribution.Server.Features.AdminLog.Backup
+import Distribution.Server.Util.Parse (packUTF8, unpackUTF8)
 import qualified Distribution.Server.Features.AdminLog.State as State
 import Distribution.Server.Features.AdminLog.Store
+import Distribution.Server.Features.AdminLog.Types
+import Distribution.Server.Users.Types (UserId(..))
 import Distribution.Server.Framework
-import Distribution.Server.Framework.BackupRestore
 
-acidStore :: FilePath -> IO Backend
-acidStore stateDir = do
-  adminLogState <- adminLogStateComponent stateDir
+import Data.Time.Clock (UTCTime)
+import GHC.Generics (Generic)
+import Data.Int (Int32)
+import Database.Beam
+import Database.Beam.Postgres
+import Control.Concurrent.MVar (swapMVar)
+import qualified Data.Text as T
+import qualified Data.ByteString.Lazy.Char8 as BS
+
+acidStore :: PgConnection -> IO Backend
+acidStore serverPgConn = do
+  adminLogState <- adminLogStateComponent serverPgConn
   pure Backend {
       backendStore = Store {
           getAdminLog = State.adminLog <$> queryState adminLogState State.GetAdminLog
@@ -19,16 +37,120 @@ acidStore stateDir = do
     , backendState = [abstractAcidStateComponent adminLogState]
     }
 
-adminLogStateComponent :: FilePath -> IO (StateComponent AcidState State.AdminLog)
-adminLogStateComponent stateDir = do
-  st <- openLocalStateFrom (stateDir </> "db" </> "AdminLog") State.initialAdminLog
+------------------------------------------------------------------------
+-- Beam table for AdminLog
+
+data AdminLogEntryT f = AdminLogEntryRow
+  { _aleId                :: C f Int32
+  , _aleTimestamp         :: C f UTCTime
+  , _aleUserId            :: C f Int32
+  , _aleActionType        :: C f T.Text
+  , _aleActionTargetUserId :: C f Int32
+  , _aleGroupType         :: C f T.Text
+  , _aleGroupData         :: C f T.Text
+  } deriving (Generic, Beamable)
+
+instance Table AdminLogEntryT where
+  data PrimaryKey AdminLogEntryT f =
+    AdminLogEntryId (C f Int32)
+    deriving (Generic, Beamable)
+  primaryKey r = AdminLogEntryId (_aleId r)
+
+deriving instance Show (AdminLogEntryT Identity)
+
+data AdminLogDb f = AdminLogDb
+  { _adminLogEntries :: f (TableEntity AdminLogEntryT)
+  } deriving (Generic, Database Postgres)
+
+adminLogDb :: DatabaseSettings Postgres AdminLogDb
+adminLogDb = defaultDbSettings `withDbModification`
+  AdminLogDb (setEntityName "admin_log" <>
+              modifyTableFields tableModification
+                { _aleId                 = "id"
+                , _aleTimestamp          = "timestamp"
+                , _aleUserId             = "actor_user_id"
+                , _aleActionType         = "action_type"
+                , _aleActionTargetUserId = "target_user_id"
+                , _aleGroupType          = "group_description"
+                , _aleGroupData          = "reason"
+                })
+
+adminLogEntriesTable :: DatabaseEntity Postgres AdminLogDb (TableEntity AdminLogEntryT)
+adminLogEntriesTable = _adminLogEntries adminLogDb
+
+-- Convert AdminAction to DB fields
+actionToFields :: AdminAction -> (T.Text, Int32, T.Text, T.Text)
+actionToFields (Admin_GroupAddUser (UserId targetUid) gd) =
+  ("add", fromIntegral targetUid, groupDescToText gd, groupReasonToText gd)
+actionToFields (Admin_GroupDelUser (UserId targetUid) gd) =
+  ("delete", fromIntegral targetUid, groupDescToText gd, groupReasonToText gd)
+
+groupDescToText :: GroupDesc -> T.Text
+groupDescToText (MaintainerGroup bs') = T.pack $ "maintainer:" ++ unpackUTF8 bs'
+groupDescToText AdminGroup            = "admin"
+groupDescToText TrusteeGroup          = "trustee"
+groupDescToText (OtherGroup bs')      = T.pack $ "other:" ++ unpackUTF8 bs'
+
+groupReasonToText :: GroupDesc -> T.Text
+groupReasonToText (MaintainerGroup bs') = T.pack $ unpackUTF8 bs'
+groupReasonToText AdminGroup            = ""
+groupReasonToText TrusteeGroup          = ""
+groupReasonToText (OtherGroup bs')      = T.pack $ unpackUTF8 bs'
+
+-- Convert DB fields back to AdminAction
+fieldsToAction :: T.Text -> Int32 -> T.Text -> T.Text -> AdminAction
+fieldsToAction actionType targetUid groupDesc _reason =
+  let uid = UserId (fromIntegral targetUid)
+      gd = case T.breakOn ":" groupDesc of
+             ("maintainer", rest) -> MaintainerGroup (packUTF8 . T.unpack $ T.drop 1 rest)
+             ("admin", _)        -> AdminGroup
+             ("trustee", _)      -> TrusteeGroup
+             _                   -> OtherGroup (packUTF8 . T.unpack $ T.drop 1 $ snd $ T.breakOn ":" groupDesc)
+      mkAction = case T.unpack actionType of
+                   "add" -> Admin_GroupAddUser
+                   _     -> Admin_GroupDelUser
+  in mkAction uid gd
+
+loadAdminLog :: PgTx State.AdminLog
+loadAdminLog = do
+  rows <- beamTx $
+    runSelectReturningList $ select $
+      orderBy_ (\r -> desc_ (_aleId r)) $
+        all_ adminLogEntriesTable
+  let entries = [ (ts, UserId (fromIntegral uid), fieldsToAction at mtu gt gd, packUTF8 "")
+                | AdminLogEntryRow _id ts uid at mtu gt gd <- rows ]
+  return $ State.AdminLog entries
+
+saveAdminLog :: State.AdminLog -> PgTx ()
+saveAdminLog (State.AdminLog entries) = do
+    beamTx $ runDelete $ delete adminLogEntriesTable (\_ -> val_ True)
+    let rows = zipWith mkRow [(1::Int32)..] (reverse entries)
+    mapM_ (\chunk -> beamTx $
+      runInsert $ insert adminLogEntriesTable $ insertValues chunk) (chunksOf 1000 rows)
+  where
+    mkRow :: Int32 -> (UTCTime, UserId, AdminAction, BS.ByteString) -> AdminLogEntryT Identity
+    mkRow idx (ts, UserId uid, action, _reason) =
+      let (at, mtu, gt, gd) = actionToFields action
+      in AdminLogEntryRow idx ts (fromIntegral uid) at mtu gt gd
+
+chunksOf :: Int -> [a] -> [[a]]
+chunksOf _ [] = []
+chunksOf n xs = let (h, t) = splitAt n xs in h : chunksOf n t
+
+------------------------------------------------------------------------
+
+adminLogStateComponent :: PgConnection -> IO (StateComponent AcidState State.AdminLog)
+adminLogStateComponent serverPgConn = do
+  st <- runPgTx serverPgConn loadAdminLog
+
+  pgSt <- mkAcidState serverPgConn st saveAdminLog
   return StateComponent {
       stateDesc    = "AdminLog"
-    , stateHandle  = st
-    , getState     = query st State.GetAdminLog
-    , putState     = update st . State.ReplaceAdminLog
-    , backupState  = \_ (State.AdminLog xs) ->
-                      [BackupByteString ["adminLog.txt"] . backupLogEntries $ xs]
-    , restoreState = restoreAdminLogBackup
-    , resetState   = adminLogStateComponent
+    , stateHandle  = pgSt
+    , getState     = queryPg pgSt (runQueryEvent State.GetAdminLog)
+    , putState     = \s -> do
+        runPgTx serverPgConn (saveAdminLog s)
+        _ <- swapMVar (pgMVar pgSt) s
+        return ()
     }
+

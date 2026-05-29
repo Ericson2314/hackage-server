@@ -4,15 +4,17 @@ module Distribution.Server.Features.PackageCandidates.Acid
   ) where
 
 import qualified Distribution.Server.Features.PackageCandidates.State as State
-import Distribution.Server.Features.PackageCandidates.Backup
+import Distribution.Server.Features.PackageCandidates.Db (loadCandidatePackages, saveCandidatePackages)
 import qualified Distribution.Server.Features.PackageCandidates.Store as Store
 import Distribution.Server.Framework
 import Distribution.Server.Features.PackageCandidates.Types (CandPkgInfo)
 import qualified Distribution.Server.Packages.PackageIndex as PackageIndex
 
-acidStore :: FilePath -> IO Store.Backend
-acidStore stateDir = do
-  candidatesState <- candidatesStateComponent False stateDir
+import Control.Concurrent.MVar (swapMVar)
+
+acidStore :: PgConnection -> IO Store.Backend
+acidStore conn = do
+  candidatesState <- candidatesStateComponent False conn
   let withCandidates :: MonadIO m => (PackageIndex.PackageIndex CandPkgInfo -> a) -> m a
       withCandidates f = f . State.candidateList <$> queryState candidatesState State.GetCandidatePackages
   pure Store.Backend {
@@ -30,16 +32,18 @@ acidStore stateDir = do
     , Store.backendState = [abstractAcidStateComponent candidatesState]
     }
 
-candidatesStateComponent :: Bool -> FilePath -> IO (StateComponent AcidState State.CandidatePackages)
-candidatesStateComponent freshDB stateDir = do
-  st <- openLocalStateFrom (stateDir </> "db" </> "CandidatePackages")
-                           (State.initialCandidatePackages freshDB)
+candidatesStateComponent :: Bool -> PgConnection -> IO (StateComponent AcidState State.CandidatePackages)
+candidatesStateComponent _freshDB serverPgConn = do
+  -- Load state
+  st <- runPgTx serverPgConn loadCandidatePackages
+
+  pgSt <- mkAcidState serverPgConn st saveCandidatePackages
   return StateComponent {
       stateDesc    = "Candidate packages"
-    , stateHandle  = st
-    , getState     = query st State.GetCandidatePackages
-    , putState     = update st . State.ReplaceCandidatePackages
-    , resetState   = candidatesStateComponent True
-    , backupState  = \_ -> backupCandidates
-    , restoreState = restoreCandidates
+    , stateHandle  = pgSt
+    , getState     = queryPg pgSt (runQueryEvent State.GetCandidatePackages)
+    , putState     = \s -> do
+        runPgTx serverPgConn (saveCandidatePackages s)
+        _ <- swapMVar (pgMVar pgSt) s
+        return ()
   }

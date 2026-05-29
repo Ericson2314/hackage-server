@@ -16,7 +16,6 @@ import Data.Maybe (listToMaybe)
 import Distribution.Server.Framework
 import Distribution.Server.Framework.BlobStorage
 import qualified Distribution.Server.Framework.BlobStorage as BlobStorage
-import Distribution.Server.Framework.BackupRestore
 import Distribution.Server.Features.TarIndexCache.Acid (acidStore)
 import qualified Distribution.Server.Features.TarIndexCache.Store as Store
 import qualified Distribution.Server.Features.TarIndexCache.State as Acid
@@ -47,8 +46,8 @@ instance IsHackageFeature TarIndexCacheFeature where
 initTarIndexCacheFeature :: ServerEnv
                          -> IO (UserFeature
                              -> IO TarIndexCacheFeature)
-initTarIndexCacheFeature env@ServerEnv{serverStateDir} = do
-    tarIndexCacheBackend <- acidStore serverStateDir
+initTarIndexCacheFeature env@ServerEnv{serverPgConn} = do
+    tarIndexCacheBackend <- acidStore serverPgConn
 
     return $ \users -> do
       let feature = tarIndexCacheFeature env users tarIndexCacheBackend

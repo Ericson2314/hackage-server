@@ -6,6 +6,7 @@ import Distribution.Server.Framework.Logging (Verbosity)
 import Distribution.Server.Framework.Cron (Cron)
 import Distribution.Server.Framework.Templating (TemplatesMode)
 import Distribution.Server.Framework.Error (ServerPartE)
+import Distribution.Server.Framework.PostgreSQL (PgConnection)
 
 import qualified Data.ByteString as BS
 import qualified Data.Text as T
@@ -78,7 +79,10 @@ data ServerEnv = ServerEnv {
     -- microseconds.
     serverFlushDownloadsPeriod :: Int,
 
-    serverVerbosity  :: Verbosity
+    serverVerbosity  :: Verbosity,
+
+    -- | PostgreSQL connection for state persistence
+    serverPgConn     :: PgConnection
 }
 
 getHost :: ServerMonad m => m (Maybe BS.ByteString)

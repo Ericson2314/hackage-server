@@ -1,4 +1,6 @@
-{-# LANGUAGE GeneralizedNewtypeDeriving #-}
+{-# LANGUAGE OverloadedStrings, MultiParamTypeClasses, FlexibleInstances, DeriveAnyClass, DeriveGeneric, DerivingStrategies, GeneralizedNewtypeDeriving #-}
+{-# LANGUAGE FlexibleContexts           #-}
+{-# LANGUAGE StandaloneDeriving         #-}
 {-# LANGUAGE TemplateHaskell            #-}
 {-# LANGUAGE TypeFamilies               #-}
 {-# OPTIONS_GHC -Wno-orphans #-}
@@ -7,51 +9,27 @@ module Distribution.Server.Features.UserSignup.Acid where
 
 import Distribution.Server.Features.UserSignup.Types
 import Distribution.Server.Features.UserSignup.State
-import Distribution.Server.Features.UserSignup.Backup
 import qualified Distribution.Server.Features.UserSignup.Store as Store
 
-import Distribution.Server.Framework hiding (Method)
-import Distribution.Server.Framework.BackupDump
+import Distribution.Server.Framework
 
+import Distribution.Server.Framework.EventSourcing (Query, Update, makeAcidic)
+import Distribution.Server.Framework.BeamInstances ()
+import Distribution.Server.Users.Types (UserId(..))
 import Distribution.Server.Util.Nonce
 
 import qualified Data.Map as Map
 import Control.Monad.Reader (ask)
 import Control.Monad.State (get, put, modify)
-import Data.Acid.Compat
 
 import Data.Time
 
-acidStore :: FilePath -> IO Store.Backend
-acidStore stateDir = do
-  signupResetState <- signupResetStateComponent stateDir
-  pure Store.Backend {
-      Store.backendStore = Store.Store {
-          Store.getSignupResetInfos =
-                queryState signupResetState GetSignupResetTable
-            >>= \(SignupResetTable tbl) -> return (Map.elems tbl)
-        , Store.lookupSignupResetInfo = \nonce -> queryState signupResetState (LookupSignupResetInfo nonce)
-        , Store.addSignupResetInfo = \nonce info -> updateState signupResetState (AddSignupResetInfo nonce info)
-        , Store.deleteSignupResetInfo = \nonce -> updateState signupResetState (DeleteSignupResetInfo nonce)
-        , Store.deleteExpiredResetInfos = \expiry -> updateState signupResetState (DeleteAllExpired expiry)
-        }
-    , Store.backendState = [abstractAcidStateComponent signupResetState]
-    }
-
-signupResetStateComponent :: FilePath -> IO (StateComponent AcidState SignupResetTable)
-signupResetStateComponent stateDir = do
-  st <- openLocalStateFrom (stateDir </> "db" </> "UserSignupReset") emptySignupResetTable
-  return StateComponent {
-      stateDesc    = "State to keep track of outstanding requests for user signup and password resets"
-    , stateHandle  = st
-    , getState     = query st GetSignupResetTable
-    , putState     = update st . ReplaceSignupResetTable
-    , backupState  = \backuptype tbl ->
-        [csvToBackup ["signups.csv"] (signupInfoToCSV backuptype tbl)
-        ,csvToBackup ["resets.csv"]  (resetInfoToCSV backuptype tbl)]
-    , restoreState = signupResetBackup
-    , resetState   = signupResetStateComponent
-    }
+import qualified Data.Text as T
+import GHC.Generics (Generic)
+import Data.Int (Int32)
+import Database.Beam
+import Database.Beam.Postgres
+import Control.Concurrent.MVar (swapMVar)
 
 ------------------------------
 -- State queries and updates
@@ -87,128 +65,158 @@ deleteAllExpired expireTime =
       SignupResetTable $
         Map.filter (\entry -> nonceTimestamp entry > expireTime) tbl
 
-------------------------------
--- IsAcidic machinery
+$(makeAcidic ''SignupResetTable
+  [ -- queries
+    'getSignupResetTable
+  , 'lookupSignupResetInfo
+    -- updates
+  , 'replaceSignupResetTable
+  , 'addSignupResetInfo
+  , 'deleteSignupResetInfo
+  , 'deleteAllExpired
+  ])
+
+acidStore :: PgConnection -> IO Store.Backend
+acidStore pgConn = do
+  signupResetState <- signupResetStateComponent pgConn
+  pure Store.Backend {
+      Store.backendStore = Store.Store {
+          Store.getSignupResetInfos =
+                queryState signupResetState GetSignupResetTable
+            >>= \(SignupResetTable tbl) -> return (Map.elems tbl)
+        , Store.lookupSignupResetInfo = \nonce -> queryState signupResetState (LookupSignupResetInfo nonce)
+        , Store.addSignupResetInfo = \nonce info -> updateState signupResetState (AddSignupResetInfo nonce info)
+        , Store.deleteSignupResetInfo = \nonce -> updateState signupResetState (DeleteSignupResetInfo nonce)
+        , Store.deleteExpiredResetInfos = \expiry -> updateState signupResetState (DeleteAllExpired expiry)
+        }
+    , Store.backendState = [abstractAcidStateComponent signupResetState]
+    }
+
+---------------------
+-- State components
 --
--- See Note [Acid Migration] in "Data.Acid.Compat"
--- original module name was Distribution.Server.Features.UserSignup"
 
--- makeAcidic ''SignupResetTable [
---    --queries
---    'getSignupResetTable,
---    'lookupSignupResetInfo,
---    --updates
---    'replaceSignupResetTable,
---    'addSignupResetInfo,
---    'deleteSignupResetInfo,
---    'deleteAllExpired
---  ]
+------------------------------------------------------------------------
+-- Beam table definition
+--
 
-instance IsAcidic SignupResetTable where
-  acidEvents
-    = [QueryEvent
-         (\ GetSignupResetTable -> getSignupResetTable)
-         safeCopyMethodSerialiser,
-       QueryEvent
-         (\ (LookupSignupResetInfo arg_a30zB)
-            -> lookupSignupResetInfo arg_a30zB)
-         safeCopyMethodSerialiser,
-       UpdateEvent
-         (\ (ReplaceSignupResetTable arg_a30zC)
-            -> replaceSignupResetTable arg_a30zC)
-         safeCopyMethodSerialiser,
-       UpdateEvent
-         (\ (AddSignupResetInfo arg_a30zD arg_a30zE)
-            -> addSignupResetInfo arg_a30zD arg_a30zE)
-         safeCopyMethodSerialiser,
-       UpdateEvent
-         (\ (DeleteSignupResetInfo arg_a30zF)
-            -> deleteSignupResetInfo arg_a30zF)
-         safeCopyMethodSerialiser,
-       UpdateEvent
-         (\ (DeleteAllExpired arg_a30zG) -> deleteAllExpired arg_a30zG)
-         safeCopyMethodSerialiser]
-data GetSignupResetTable = GetSignupResetTable
-instance SafeCopy GetSignupResetTable where
-  putCopy GetSignupResetTable = contain (do return ())
-  getCopy = contain (return GetSignupResetTable)
-  errorTypeName _
-    = "Data.SafeCopy.SafeCopy.SafeCopy GetSignupResetTable"
-instance Method GetSignupResetTable where
-  type MethodResult GetSignupResetTable = SignupResetTable
-  type MethodState GetSignupResetTable = SignupResetTable
-  methodTag = movedMethodTag "Distribution.Server.Features.UserSignup"
-instance QueryEvent GetSignupResetTable
-newtype LookupSignupResetInfo = LookupSignupResetInfo Nonce
-instance SafeCopy LookupSignupResetInfo where
-  putCopy (LookupSignupResetInfo arg_a30yN)
-    = contain
-        (do safePut arg_a30yN
-            return ())
-  getCopy = contain (return LookupSignupResetInfo <*> safeGet)
-  errorTypeName _
-    = "Data.SafeCopy.SafeCopy.SafeCopy LookupSignupResetInfo"
-instance Method LookupSignupResetInfo where
-  type MethodResult LookupSignupResetInfo = Maybe SignupResetInfo
-  type MethodState LookupSignupResetInfo = SignupResetTable
-  methodTag = movedMethodTag "Distribution.Server.Features.UserSignup"
-instance QueryEvent LookupSignupResetInfo
-newtype ReplaceSignupResetTable
-  = ReplaceSignupResetTable SignupResetTable
-instance SafeCopy ReplaceSignupResetTable where
-  putCopy (ReplaceSignupResetTable arg_a30yS)
-    = contain
-        (do safePut arg_a30yS
-            return ())
-  getCopy = contain (return ReplaceSignupResetTable <*> safeGet)
-  errorTypeName _
-    = "Data.SafeCopy.SafeCopy.SafeCopy ReplaceSignupResetTable"
-instance Method ReplaceSignupResetTable where
-  type MethodResult ReplaceSignupResetTable = ()
-  type MethodState ReplaceSignupResetTable = SignupResetTable
-  methodTag = movedMethodTag "Distribution.Server.Features.UserSignup"
-instance UpdateEvent ReplaceSignupResetTable
-data AddSignupResetInfo = AddSignupResetInfo Nonce SignupResetInfo
-instance SafeCopy AddSignupResetInfo where
-  putCopy (AddSignupResetInfo arg_a30yX arg_a30yY)
-    = contain
-        (do safePut arg_a30yX
-            safePut arg_a30yY
-            return ())
-  getCopy
-    = contain ((return AddSignupResetInfo <*> safeGet) <*> safeGet)
-  errorTypeName _
-    = "Data.SafeCopy.SafeCopy.SafeCopy AddSignupResetInfo"
-instance Method AddSignupResetInfo where
-  type MethodResult AddSignupResetInfo = Bool
-  type MethodState AddSignupResetInfo = SignupResetTable
-  methodTag = movedMethodTag "Distribution.Server.Features.UserSignup"
-instance UpdateEvent AddSignupResetInfo
-newtype DeleteSignupResetInfo = DeleteSignupResetInfo Nonce
-instance SafeCopy DeleteSignupResetInfo where
-  putCopy (DeleteSignupResetInfo arg_a30z3)
-    = contain
-        (do safePut arg_a30z3
-            return ())
-  getCopy = contain (return DeleteSignupResetInfo <*> safeGet)
-  errorTypeName _
-    = "Data.SafeCopy.SafeCopy.SafeCopy DeleteSignupResetInfo"
-instance Method DeleteSignupResetInfo where
-  type MethodResult DeleteSignupResetInfo = ()
-  type MethodState DeleteSignupResetInfo = SignupResetTable
-  methodTag = movedMethodTag "Distribution.Server.Features.UserSignup"
-instance UpdateEvent DeleteSignupResetInfo
-newtype DeleteAllExpired = DeleteAllExpired UTCTime
-instance SafeCopy DeleteAllExpired where
-  putCopy (DeleteAllExpired arg_a30z8)
-    = contain
-        (do safePut arg_a30z8
-            return ())
-  getCopy = contain (return DeleteAllExpired <*> safeGet)
-  errorTypeName _
-    = "Data.SafeCopy.SafeCopy.SafeCopy DeleteAllExpired"
-instance Method DeleteAllExpired where
-  type MethodResult DeleteAllExpired = ()
-  type MethodState DeleteAllExpired = SignupResetTable
-  methodTag = movedMethodTag "Distribution.Server.Features.UserSignup"
-instance UpdateEvent DeleteAllExpired
+data SignupResetEntryT f = SignupResetEntryRow
+  { _sreNonce          :: C f T.Text
+  , _sreEntryType      :: C f T.Text
+  , _sreSignupUserName :: C f (Maybe T.Text)
+  , _sreSignupRealName :: C f (Maybe T.Text)
+  , _sreSignupContactEmail :: C f (Maybe T.Text)
+  , _sreResetUserId    :: C f (Maybe Int32)
+  , _sreTimestamp      :: C f UTCTime
+  } deriving (Generic, Beamable)
+
+instance Table SignupResetEntryT where
+  data PrimaryKey SignupResetEntryT f =
+    SignupResetEntryId (C f T.Text)
+    deriving (Generic, Beamable)
+  primaryKey r = SignupResetEntryId (_sreNonce r)
+
+deriving instance Show (SignupResetEntryT Identity)
+
+data SignupResetDb f = SignupResetDb
+  { _signupResetEntries :: f (TableEntity SignupResetEntryT)
+  } deriving (Generic, Database Postgres)
+
+signupResetDb :: DatabaseSettings Postgres SignupResetDb
+signupResetDb = defaultDbSettings `withDbModification`
+  SignupResetDb (setEntityName "signup_entries" <>
+                 modifyTableFields tableModification
+                   { _sreNonce              = "nonce"
+                   , _sreEntryType          = "entry_type"
+                   , _sreSignupUserName     = "signup_user_name"
+                   , _sreSignupRealName     = "signup_real_name"
+                   , _sreSignupContactEmail = "signup_contact_email"
+                   , _sreResetUserId        = "reset_user_id"
+                   , _sreTimestamp           = "timestamp"
+                   })
+
+signupResetEntriesTable :: DatabaseEntity Postgres SignupResetDb (TableEntity SignupResetEntryT)
+signupResetEntriesTable = _signupResetEntries signupResetDb
+
+rowToSignupResetEntry :: SignupResetEntryT Identity -> Maybe (Nonce, SignupResetInfo)
+rowToSignupResetEntry (SignupResetEntryRow nonceText entryType mUserName mRealName mEmail mUserId ts) =
+  case parseNonceM (T.unpack nonceText) of
+    Nothing -> Nothing
+    Just nonce -> case entryType of
+      "signup" | Just uname <- mUserName
+               , Just rname <- mRealName
+               , Just email <- mEmail ->
+        Just (nonce, SignupInfo { signupUserName = uname
+                                , signupRealName = rname
+                                , signupContactEmail = email
+                                , nonceTimestamp = ts })
+      "reset" | Just uid <- mUserId ->
+        Just (nonce, ResetInfo { resetUserId = UserId (fromIntegral uid)
+                               , nonceTimestamp = ts })
+      _ -> Nothing
+
+signupResetToRow :: Nonce -> SignupResetInfo -> SignupResetEntryT Identity
+signupResetToRow nonce (SignupInfo uname rname email ts) =
+  SignupResetEntryRow
+    { _sreNonce              = T.pack (renderNonce nonce)
+    , _sreEntryType          = "signup"
+    , _sreSignupUserName     = Just uname
+    , _sreSignupRealName     = Just rname
+    , _sreSignupContactEmail = Just email
+    , _sreResetUserId        = Nothing
+    , _sreTimestamp           = ts
+    }
+signupResetToRow nonce (ResetInfo (UserId uid) ts) =
+  SignupResetEntryRow
+    { _sreNonce              = T.pack (renderNonce nonce)
+    , _sreEntryType          = "reset"
+    , _sreSignupUserName     = Nothing
+    , _sreSignupRealName     = Nothing
+    , _sreSignupContactEmail = Nothing
+    , _sreResetUserId        = Just (fromIntegral uid)
+    , _sreTimestamp           = ts
+    }
+
+loadSignupResetTable :: PgTx SignupResetTable
+loadSignupResetTable = do
+  rows <- beamTx $
+    runSelectReturningList $ select $ all_ signupResetEntriesTable
+  let entries = concatMap (maybe [] (:[]) . rowToSignupResetEntry) rows
+  return $ SignupResetTable (Map.fromList entries)
+
+saveSignupResetTable :: SignupResetTable -> PgTx ()
+saveSignupResetTable (SignupResetTable tbl) =
+  do
+    beamTx $
+      runDelete $ delete signupResetEntriesTable (\_ -> val_ True)
+    let rows = [ signupResetToRow nonce info | (nonce, info) <- Map.toList tbl ]
+    mapM_ insertSignupResetChunk (chunksOf 1000 rows)
+
+insertSignupResetChunk :: [SignupResetEntryT Identity] -> PgTx ()
+insertSignupResetChunk chunk =
+  beamTx $
+    runInsert $ insert signupResetEntriesTable $ insertValues chunk
+
+chunksOf :: Int -> [a] -> [[a]]
+chunksOf _ [] = []
+chunksOf n xs = let (h, t) = splitAt n xs in h : chunksOf n t
+
+------------------------------------------------------------------------
+
+signupResetStateComponent :: PgConnection -> IO (StateComponent AcidState SignupResetTable)
+signupResetStateComponent serverPgConn = do
+  -- Load state
+  st <- runPgTx serverPgConn loadSignupResetTable
+
+  pgSt <- mkAcidState serverPgConn st saveSignupResetTable
+  return StateComponent {
+      stateDesc    = "State to keep track of outstanding requests for user signup and password resets"
+    , stateHandle  = pgSt
+    , getState     = queryPg pgSt (runQueryEvent GetSignupResetTable)
+    , putState     = \s -> do
+        runPgTx serverPgConn (saveSignupResetTable s)
+        _ <- swapMVar (pgMVar pgSt) s
+        return ()
+    }
+
+

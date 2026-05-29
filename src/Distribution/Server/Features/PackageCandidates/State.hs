@@ -1,4 +1,4 @@
-{-# LANGUAGE DeriveDataTypeable, TypeFamilies, TemplateHaskell, NamedFieldPuns #-}
+{-# LANGUAGE OverloadedStrings, MultiParamTypeClasses, FlexibleInstances, DeriveAnyClass, DeriveGeneric, DerivingStrategies, DeriveDataTypeable, TypeFamilies, TemplateHaskell, NamedFieldPuns #-}
 
 module Distribution.Server.Features.PackageCandidates.State where
 
@@ -9,7 +9,8 @@ import Distribution.Server.Packages.Types
 import qualified Distribution.Server.Packages.PackageIndex as PackageIndex
 import Distribution.Package
 
-import Data.Acid     (Query, Update, makeAcidic)
+import Distribution.Server.Framework.EventSourcing (Query, Update, makeAcidic)
+import Distribution.Server.Framework.BeamInstances ()
 import Data.SafeCopy (Migrate(..), deriveSafeCopy, base, extension)
 import Control.Monad.Reader
 import qualified Control.Monad.State as State

@@ -1,6 +1,9 @@
-{-# LANGUAGE DeriveDataTypeable, TypeFamilies, TemplateHaskell #-}
+{-# LANGUAGE OverloadedStrings, MultiParamTypeClasses, DeriveDataTypeable, TypeFamilies, TemplateHaskell #-}
 module Distribution.Server.Features.UserDetails.Types where
 
+import Database.Beam.Backend.SQL (HasSqlValueSyntax(..))
+import Database.Beam.Postgres.Syntax (PgValueSyntax)
+import qualified Data.Text as T
 import Distribution.Server.Framework
 
 import Data.SafeCopy (base, deriveSafeCopy)
@@ -42,3 +45,6 @@ deriveJSON (compatAesonOptionsDropPrefix "ui_") ''AdminInfo
 
 $(deriveSafeCopy 0 'base ''AccountKind)
 $(deriveSafeCopy 0 'base ''AccountDetails)
+
+instance HasSqlValueSyntax PgValueSyntax AccountDetails where sqlValueSyntax = sqlValueSyntax . T.pack . show
+instance HasSqlValueSyntax PgValueSyntax AccountKind where sqlValueSyntax = sqlValueSyntax . T.pack . show
