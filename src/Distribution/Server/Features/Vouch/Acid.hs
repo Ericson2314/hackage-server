@@ -25,24 +25,17 @@ import GHC.Generics (Generic)
 import Data.Int (Int32)
 import Database.Beam
 import Database.Beam.Postgres
-import Control.Concurrent.MVar (swapMVar)
 
 acidStore :: PgConnection -> IO Store.Backend
-acidStore pgConn = do
-  vouchState <- vouchStateComponent pgConn
+acidStore pool =
   pure Store.Backend {
       Store.backendStore = Store.Store {
-          Store.getVouchesFor = \uid -> queryState vouchState (Acid.GetVouchesFor uid)
-        , Store.addVouch = \uid entry -> updateState vouchState (Acid.PutVouch uid entry)
-        , Store.queueVouchCompleteNotification = \uid -> do
-            Acid.VouchData vouches notNotified <- queryState vouchState Acid.GetVouchesData
-            updateState vouchState (Acid.ReplaceVouchesData (Acid.VouchData vouches (Set.insert uid notNotified)))
-        , Store.drainQueuedNotifications = do
-            Acid.VouchData vouches notNotified <- queryState vouchState Acid.GetVouchesData
-            updateState vouchState (Acid.ReplaceVouchesData (Acid.VouchData vouches mempty))
-            pure (Set.toList notNotified)
+          Store.getVouchesFor = liftIO . dbGetVouchesFor pool
+        , Store.addVouch = \uid entry -> liftIO $ dbPutVouch pool uid entry
+        , Store.queueVouchCompleteNotification = liftIO . dbAddNotNotified pool
+        , Store.drainQueuedNotifications = liftIO $ dbDrainNotNotified pool
         }
-    , Store.backendState = [abstractAcidStateComponent vouchState]
+    , Store.backendState = []  -- no AcidState; data lives in PostgreSQL
     }
 
 ------------------------------------------------------------------------
@@ -132,20 +125,56 @@ chunksOf :: Int -> [a] -> [[a]]
 chunksOf _ [] = []
 chunksOf n xs = let (h, t) = splitAt n xs in h : chunksOf n t
 
+
 ------------------------------------------------------------------------
+-- Direct database operations (no MVar, no event sourcing)
+--
 
-vouchStateComponent :: PgConnection -> IO (StateComponent AcidState Acid.VouchData)
-vouchStateComponent serverPgConn = do
-  st <- runPgTx serverPgConn loadVouchData
+-- | Get vouches for a specific user
+dbGetVouchesFor :: PgConnection -> UserId -> IO [(UserId, UTCTime)]
+dbGetVouchesFor pool (UserId uid) = do
+  rows <- runBeamPg pool $
+    runSelectReturningList $ select $
+      filter_ (\r -> _veVoucheeId r ==. val_ (fromIntegral uid)) $
+      all_ vouchesTable
+  return [ (UserId (fromIntegral vid), ts) | VouchEntryRow _ vid ts <- rows ]
 
-  pgSt <- mkAcidState serverPgConn st saveVouchData
-  pure StateComponent
-    { stateDesc = "Keeps track of vouches"
-    , stateHandle = pgSt
-    , getState = queryPg pgSt (runQueryEvent Acid.GetVouchesData)
-    , putState = \s -> do
-        runPgTx serverPgConn (saveVouchData s)
-        _ <- swapMVar (pgMVar pgSt) s
-        return ()
-    }
+-- | Add a vouch
+dbPutVouch :: PgConnection -> UserId -> (UserId, UTCTime) -> IO ()
+dbPutVouch pool (UserId voucheeId) (UserId voucherId, now) =
+  runBeamPg pool $
+    runInsert $ insert vouchesTable $ insertValues
+      [VouchEntryRow (fromIntegral voucheeId) (fromIntegral voucherId) now]
+
+-- | Add a user to the not-notified set
+dbAddNotNotified :: PgConnection -> UserId -> IO ()
+dbAddNotNotified pool (UserId uid) =
+  runBeamPg pool $
+    runInsert $ insert notNotifiedTable $ insertValues
+      [VouchNotNotifiedRow (fromIntegral uid)]
+
+-- | Drain queued notifications: return users and clear the set
+dbDrainNotNotified :: PgConnection -> IO [UserId]
+dbDrainNotNotified pool =
+  runPgTx pool $ do
+    rows <- beamTx $
+      runSelectReturningList $ select $ all_ notNotifiedTable
+    beamTx $
+      runDelete $ delete notNotifiedTable (\_ -> val_ True)
+    return [ UserId (fromIntegral uid) | VouchNotNotifiedRow uid <- rows ]
+
+-- | Write full state to DB (for backup restore)
+dbPutAllVouchData :: PgConnection -> Acid.VouchData -> IO ()
+dbPutAllVouchData pool (Acid.VouchData vouches nn) =
+  runPgTx pool $ do
+    beamTx $ runDelete $ delete vouchesTable (\_ -> val_ True)
+    beamTx $ runDelete $ delete notNotifiedTable (\_ -> val_ True)
+    let vouchRows = [ VouchEntryRow (fromIntegral voucheeId) (fromIntegral voucherId) vouchedAt
+                    | (UserId voucheeId, vs) <- Map.toList vouches
+                    , (UserId voucherId, vouchedAt) <- vs ]
+    mapM_ (\chunk -> beamTx $
+      runInsert $ insert vouchesTable $ insertValues chunk) (chunksOf 1000 vouchRows)
+    let nnRows = [ VouchNotNotifiedRow (fromIntegral uid) | UserId uid <- Set.toList nn ]
+    mapM_ (\chunk -> beamTx $
+      runInsert $ insert notNotifiedTable $ insertValues chunk) (chunksOf 1000 nnRows)
 
