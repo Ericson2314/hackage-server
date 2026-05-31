@@ -14,6 +14,7 @@ import qualified Distribution.Server.Features.Distro.State as State
 import qualified Distribution.Server.Features.Distro.Store as Store
 import Distribution.Server.Features.Distro.Types
 import Distribution.Server.Features.Distro.Distributions (Distributions(..), DistroVersions(..), DistroPackageInfo(..))
+import qualified Distribution.Server.Features.Distro.Distributions as Dist
 import qualified Distribution.Server.Users.Types as Users.Types
 import qualified Distribution.Server.Users.Group as Group
 import Distribution.Server.Framework
@@ -28,28 +29,37 @@ import GHC.Generics (Generic)
 import Data.Int (Int32)
 import Database.Beam
 import Database.Beam.Postgres
-import Control.Concurrent.MVar (swapMVar)
 
 acidStore :: PgConnection -> IO Store.Backend
-acidStore serverPgConn = do
-  distrosState <- distrosStateComponent serverPgConn
+acidStore pool =
   pure Store.Backend {
       Store.backendStore = Store.Store {
-          Store.queryDistroMaintainers = \name -> queryState distrosState (State.GetDistroMaintainers name)
-        , Store.addDistroMaintainer = \name uid -> updateState distrosState (State.AddDistroMaintainer name uid)
-        , Store.removeDistroMaintainer = \name uid -> updateState distrosState (State.RemoveDistroMaintainer name uid)
-        , Store.enumerateDistros = queryState distrosState State.EnumerateDistros
-        , Store.queryPackageStatus = \pkgname -> queryState distrosState (State.PackageStatus pkgname)
-        , Store.queryDistroStatus = \name -> queryState distrosState (State.DistroStatus name)
-        , Store.isDistribution = \name -> queryState distrosState (State.IsDistribution name)
-        , Store.queryDistroPackageStatus = \name pkgname -> queryState distrosState (State.DistroPackageStatus name pkgname)
-        , Store.removeDistro = \name -> updateState distrosState (State.RemoveDistro name)
-        , Store.dropDistroPackage = \name pkgname -> updateState distrosState (State.DropPackage name pkgname)
-        , Store.addDistroPackage = \name pkgname info -> updateState distrosState (State.AddPackage name pkgname info)
-        , Store.addDistro = \name -> updateState distrosState (State.AddDistro name)
-        , Store.putDistroPackageList = \name pkgs -> updateState distrosState (State.PutDistroPackageList name pkgs)
+          Store.queryDistroMaintainers = liftIO . dbGetDistroMaintainers pool
+        , Store.addDistroMaintainer = \name uid -> liftIO $ dbAddDistroMaintainer pool name uid
+        , Store.removeDistroMaintainer = \name uid -> liftIO $ dbRemoveDistroMaintainer pool name uid
+        , Store.enumerateDistros = liftIO $ dbEnumerateDistros pool
+        , Store.queryPackageStatus = \pkgname -> liftIO $
+            Dist.packageStatus pkgname . State.distVersions <$> dbGetDistros pool
+        , Store.queryDistroStatus = \name -> liftIO $
+            Dist.distroStatus name . State.distVersions <$> dbGetDistros pool
+        , Store.isDistribution = liftIO . dbIsDistribution pool
+        , Store.queryDistroPackageStatus = \name pkgname -> liftIO $
+            Dist.distroPackageStatus name pkgname . State.distVersions <$> dbGetDistros pool
+        , Store.removeDistro = \name -> liftIO $ dbModifyDistros pool $ \st ->
+            st { State.distDistros  = Dist.removeDistro name (State.distDistros st)
+               , State.distVersions = Dist.removeDistroVersions name (State.distVersions st) }
+        , Store.dropDistroPackage = \name pkgname -> liftIO $ dbModifyDistros pool $ \st ->
+            st { State.distVersions = Dist.dropPackage name pkgname (State.distVersions st) }
+        , Store.addDistroPackage = \name pkgname info -> liftIO $ dbModifyDistros pool $ \st ->
+            st { State.distVersions = Dist.addPackage name pkgname info (State.distVersions st) }
+        , Store.addDistro = \name -> liftIO $ dbModifyDistros' pool $ \st ->
+            case Dist.addDistro name (State.distDistros st) of
+              Nothing       -> (False, st)
+              Just distros' -> (True, st { State.distDistros = distros' })
+        , Store.putDistroPackageList = \name pkgs -> liftIO $ dbModifyDistros pool $ \st ->
+            st { State.distVersions = Dist.updatePackageList name pkgs (State.distVersions st) }
         }
-    , Store.backendState = [abstractAcidStateComponent distrosState]
+    , Store.backendState = []  -- no AcidState; data lives in PostgreSQL
     }
 
 ------------------------------------------------------------------------
@@ -198,21 +208,67 @@ distroChunksOf :: Int -> [a] -> [[a]]
 distroChunksOf _ [] = []
 distroChunksOf n xs = let (h, t) = splitAt n xs in h : distroChunksOf n t
 
+
 ------------------------------------------------------------------------
+-- Direct database operations (no MVar, no event sourcing)
+--
 
-distrosStateComponent :: PgConnection -> IO (StateComponent AcidState State.Distros)
-distrosStateComponent serverPgConn = do
-  -- Load state
-  st <- runPgTx serverPgConn loadDistros
+-- | Get full distros state
+dbGetDistros :: PgConnection -> IO State.Distros
+dbGetDistros pool = runPgTx pool loadDistros
 
-  pgSt <- mkAcidState serverPgConn st saveDistros
-  return StateComponent {
-      stateDesc    = ""
-    , stateHandle  = pgSt
-    , getState     = queryPg pgSt (runQueryEvent State.GetDistributions)
-    , putState     = \s -> do
-        runPgTx serverPgConn (saveDistros s)
-        _ <- swapMVar (pgMVar pgSt) s
-        return ()
-    }
+-- | Write full distros state
+dbPutDistros :: PgConnection -> State.Distros -> IO ()
+dbPutDistros pool = runPgTx pool . saveDistros
+
+-- | Read-modify-write helper for distro updates
+dbModifyDistros :: PgConnection -> (State.Distros -> State.Distros) -> IO ()
+dbModifyDistros pool f = do
+  st <- dbGetDistros pool
+  dbPutDistros pool (f st)
+
+-- | Read-modify-write helper for distro updates that return a value
+dbModifyDistros' :: PgConnection -> (State.Distros -> (a, State.Distros)) -> IO a
+dbModifyDistros' pool f = do
+  st <- dbGetDistros pool
+  let (result, st') = f st
+  dbPutDistros pool st'
+  return result
+
+-- | Enumerate distro names
+dbEnumerateDistros :: PgConnection -> IO [DistroName]
+dbEnumerateDistros pool = do
+  rows <- runBeamPg pool $ runSelectReturningList $ select $ all_ distroDistrosTable
+  return [ DistroName (T.unpack name) | DistroDistroRow name <- rows ]
+
+-- | Check if a distribution exists
+dbIsDistribution :: PgConnection -> DistroName -> IO Bool
+dbIsDistribution pool dname = do
+  rows <- runBeamPg pool $
+    runSelectReturningList $ select $
+      filter_ (\r -> _ddName r ==. val_ (T.pack (display dname))) $
+      all_ distroDistrosTable
+  return (not (null rows))
+
+-- | Get distro maintainers
+dbGetDistroMaintainers :: PgConnection -> DistroName -> IO Group.UserIdSet
+dbGetDistroMaintainers pool dname = do
+  rows <- runBeamPg pool $
+    runSelectReturningList $ select $
+      filter_ (\r -> _dmDistroName r ==. val_ (T.pack (display dname))) $
+      all_ distroMaintainersTable
+  return $ Group.fromList [ Users.Types.UserId (fromIntegral uid) | DistroMaintainerRow _ uid <- rows ]
+
+-- | Add a distro maintainer
+dbAddDistroMaintainer :: PgConnection -> DistroName -> Users.Types.UserId -> IO ()
+dbAddDistroMaintainer pool dname (Users.Types.UserId uid) =
+  runBeamPg pool $ runInsert $ insert distroMaintainersTable $ insertValues
+    [DistroMaintainerRow (T.pack (display dname)) (fromIntegral uid)]
+
+-- | Remove a distro maintainer
+dbRemoveDistroMaintainer :: PgConnection -> DistroName -> Users.Types.UserId -> IO ()
+dbRemoveDistroMaintainer pool dname (Users.Types.UserId uid) =
+  runBeamPg pool $ runDelete $ delete distroMaintainersTable
+    (\r -> _dmDistroName r ==. val_ (T.pack (display dname))
+       &&. _dmUserId r ==. val_ (fromIntegral uid))
 
