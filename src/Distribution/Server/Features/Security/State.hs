@@ -7,15 +7,10 @@
 module Distribution.Server.Features.Security.State where
 
 -- stdlib
-import Control.Monad
-import Control.Monad.Reader (ask, asks)
-import Distribution.Server.Framework.EventSourcing (Query, Update, makeAcidic)
-import Distribution.Server.Framework.BeamInstances ()
 import Data.Maybe
 import Data.SafeCopy
 import Data.Time
 import Data.Time.Clock.POSIX (posixSecondsToUTCTime)
-import qualified Control.Monad.State  as State
 import qualified Data.ByteString.Lazy as BS.Lazy
 
 import qualified Codec.Archive.Tar      as Tar
@@ -93,27 +88,17 @@ initialSecurityState =
     epoch1970     = posixSecondsToUTCTime 0
 
 {-------------------------------------------------------------------------------
-  Transactions
+  Pure state operations (used by db layer)
 -------------------------------------------------------------------------------}
-
-getSecurityState :: Query SecurityState SecurityState
-getSecurityState = ask
-
-replaceSecurityState :: SecurityState -> Update SecurityState ()
-replaceSecurityState = State.put
-
-getSecurityFiles :: Query SecurityState (Maybe SecurityStateFiles)
-getSecurityFiles = asks securityStateFiles
-
 
 -- | This is used whenever any of the external files change
 setRootMirrorsAndKeys :: Root -> Mirrors
                       -> Some Sec.Key -> Some Sec.Key
                       -> UTCTime
-                      -> Update SecurityState ()
-setRootMirrorsAndKeys root mirrors snapshotKey timestampKey now = do
-    st <- State.get
-    State.put st {
+                      -> SecurityState -> SecurityState
+setRootMirrorsAndKeys root mirrors snapshotKey timestampKey now st =
+    updateSnapshotAndTimestamp now $
+      st {
         securityStateFiles =
           Just SecurityStateFiles {
             securityRoot            = root,
@@ -125,45 +110,39 @@ setRootMirrorsAndKeys root mirrors snapshotKey timestampKey now = do
             securityTimestamp       = error "timestamp cache not set"
           }
       }
-    updateSnapshotAndTimestamp now
 
 
 -- | This is used whenever the main index is updated
 setTarGzFileInfo :: FileInfo -> FileInfo -> UTCTime
-                 -> Update SecurityState ()
-setTarGzFileInfo tarGzFileInfo tarFileInfo now = do
-    st@SecurityState{..} <- State.get
-    unless (securityTarGzFileInfo == tarGzFileInfo
-         && securityTarFileInfo   == tarFileInfo) $ do
-      State.put st {
-        securityTarGzFileInfo = tarGzFileInfo,
-        securityTarFileInfo   = tarFileInfo
-      }
-      updateSnapshotAndTimestamp now
+                 -> SecurityState -> SecurityState
+setTarGzFileInfo tarGzFileInfo tarFileInfo now st@SecurityState{..}
+    | securityTarGzFileInfo == tarGzFileInfo
+   && securityTarFileInfo   == tarFileInfo = st
+    | otherwise =
+        updateSnapshotAndTimestamp now $
+          st { securityTarGzFileInfo = tarGzFileInfo
+             , securityTarFileInfo   = tarFileInfo
+             }
 
 
 -- | This is used by a cron job to resign the snapshot and timestamp if they
 -- are too old.
-resignSnapshotAndTimestamp :: Int -> UTCTime -> Update SecurityState ()
-resignSnapshotAndTimestamp maxAge now = do
-    st <- State.get
-    let -- Is the existing update too told?
-        tooOld = (now `diffUTCTime` securityTimestampTime st)
-              >= fromIntegral maxAge
-    when tooOld $
-      -- note: if we care, it would be possible in this case, to resign just
-      -- the timestamp and leave the snapshot as is. If so, think about the
-      -- snapshot expiry.
-      updateSnapshotAndTimestamp now
+resignSnapshotAndTimestamp :: Int -> UTCTime -> SecurityState -> SecurityState
+resignSnapshotAndTimestamp maxAge now st
+    | tooOld    = updateSnapshotAndTimestamp now st
+    | otherwise = st
+  where
+    -- Is the existing update too old?
+    tooOld = (now `diffUTCTime` securityTimestampTime st)
+          >= fromIntegral maxAge
 
 
 -- | Increment the snapshot and timestamp versions and resign them both.
-updateSnapshotAndTimestamp :: UTCTime -> Update SecurityState ()
-updateSnapshotAndTimestamp now = do
-    st@SecurityState{..} <- State.get
+updateSnapshotAndTimestamp :: UTCTime -> SecurityState -> SecurityState
+updateSnapshotAndTimestamp now st@SecurityState{..} =
     case securityStateFiles of
-      Nothing -> return ()
-      Just files@SecurityStateFiles{..} -> do
+      Nothing -> st
+      Just files@SecurityStateFiles{..} ->
         let !snapshotVersion  = Sec.versionIncrement securitySnapshotVersion
             !timestampVersion = Sec.versionIncrement securityTimestampVersion
             (snapshot, timestamp) =
@@ -173,7 +152,7 @@ updateSnapshotAndTimestamp now = do
                 securitySnapshotKey   snapshotVersion
                 securityTimestampKey  timestampVersion
                 now
-        State.put st {
+        in st {
           securityStateFiles       = Just files {
             securitySnapshot       = snapshot,
             securityTimestamp      = timestamp
@@ -254,86 +233,6 @@ data TUFUpdate = TUFUpdate {
   deriving (Show, Eq)
 
 deriveSafeCopy 0 'base ''TUFUpdate
-
--- | Legacy transaction for compatibility with old transaction logs.
---
--- NOTE: We pass in the maximum age as an argument so that if we change the
--- policy then we can still accurately replay the old log.
-updateSecurityState :: Int        -- ^ Maximum age of previous update in secs
-                    -> TUFUpdate
-                    -> Update SecurityState (Timestamp, Snapshot)
-updateSecurityState maxAge newUpdate = do
-    oldUpdate <- getTufUpdate
-    when (needUpdate oldUpdate newUpdate) $ do
-      setTufUpdate newUpdate
-      updateSnapshotAndTimestamp (tufUpdateTime newUpdate)
-    st <- State.get
-    case st of
-      SecurityState {
-        securityStateFiles  = Just SecurityStateFiles {
-                                securitySnapshot  = snapshot,
-                                securityTimestamp = timestamp
-                              }
-      } -> return (timestamp, snapshot)
-      _ -> error "updateSecurityState: unexpected state"
-  where
-    needUpdate :: Maybe TUFUpdate -> TUFUpdate -> Bool
-    needUpdate Nothing    _   = True
-    needUpdate (Just old) new = changed old new || tooOld old new
-
-    -- Did the files change (ignoring time)?
-    changed :: TUFUpdate -> TUFUpdate -> Bool
-    changed old new = old /= new{tufUpdateTime = tufUpdateTime old}
-
-    -- Is the existing update too told?
-    tooOld :: TUFUpdate -> TUFUpdate -> Bool
-    tooOld old new = (tufUpdateTime new `diffUTCTime` tufUpdateTime old)
-                  >= (fromIntegral maxAge)
-
-    -- These helpers mediate the changes in the SecurityState representation
-    -- Both require that the securityStateFiles is Just, which is set up by
-    -- the migration.
-    getTufUpdate = do
-      st <- State.get
-      case st of
-        SecurityState {
-          securityTimestampTime = timestampTime,
-          securityStateFiles    = Just SecurityStateFiles {
-            securityRoot        = root,
-            securityMirrors     = mirrors
-          },
-          securityTarGzFileInfo = tarGzFileInfo,
-          securityTarFileInfo   = tarFileInfo
-        } -> return $ Just TUFUpdate {
-               tufUpdateInfoRoot    = fauxFileInfo root,
-               tufUpdateInfoMirrors = fauxFileInfo mirrors,
-               tufUpdateInfoTarGz   = tarGzFileInfo,
-               tufUpdateInfoTar     = tarFileInfo,
-               tufUpdateTime        = timestampTime
-             }
-        _ -> error "getTufUpdate: unexpected state"
-
-    setTufUpdate TUFUpdate {
-                   tufUpdateInfoRoot    = rootFileInfo,
-                   tufUpdateInfoMirrors = mirrorsFileInfo,
-                   tufUpdateInfoTarGz   = tarGzFileInfo,
-                   tufUpdateInfoTar     = tarFileInfo,
-                   tufUpdateTime        = timestampTime
-                 } = do
-      st <- State.get
-      let files = case st of
-                    SecurityState{ securityStateFiles = Just files' } -> files'
-                    _                                                 -> error "setTufUpdate: unexpected state"
-      State.put st {
-        securityStateFiles =
-          Just files {
-            securityRoot      = Root    (fauxTUFFile rootFileInfo),
-            securityMirrors   = Mirrors (fauxTUFFile mirrorsFileInfo)
-          },
-        securityTarGzFileInfo = tarGzFileInfo,
-        securityTarFileInfo   = tarFileInfo,
-        securityTimestampTime = timestampTime
-      }
 
 -- | This is just to support the old 'updateSecurityState' transaction when
 -- using the new 'SecurityState' representation. The 'updateSecurityState'
@@ -453,12 +352,3 @@ deriveSafeCopy 2 'extension ''SecurityState
   The acid-state transactions
 -------------------------------------------------------------------------------}
 
-makeAcidic ''SecurityState
-  [ 'getSecurityState
-  , 'replaceSecurityState
-  , 'getSecurityFiles
-  , 'updateSecurityState
-  , 'setRootMirrorsAndKeys
-  , 'setTarGzFileInfo
-  , 'resignSnapshotAndTimestamp
-  ]

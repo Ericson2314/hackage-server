@@ -7,8 +7,7 @@
 {-# LANGUAGE StandaloneDeriving    #-}
 {-# LANGUAGE TypeFamilies          #-}
 module Distribution.Server.Features.Security.Acid
-  ( securityStateComponent
-  , acidStore
+  ( acidStore
   ) where
 
 import Distribution.Server.Features.Security.FileInfo
@@ -21,7 +20,6 @@ import Distribution.Server.Framework
 
 import qualified Hackage.Security.Server as Sec
 
-import Control.Concurrent.MVar (swapMVar)
 import qualified Data.ByteString as BS
 import qualified Data.ByteString.Lazy as BSL
 import Data.Int (Int32, Int64)
@@ -35,20 +33,19 @@ import Database.Beam.Postgres
 import GHC.Generics (Generic)
 
 acidStore :: ServerEnv -> PgConnection -> IO Store.Backend
-acidStore env serverPgConn = do
-  securityState <- securityStateComponent env serverPgConn
+acidStore _env pool =
   pure Store.Backend {
       Store.backendStore = Store.Store {
-          Store.getSecurityState = queryState securityState State.GetSecurityState
-        , Store.getSecurityFiles = queryState securityState State.GetSecurityFiles
-        , Store.setRootMirrorsAndKeys = \root mirrors snapshotKey timestampKey now ->
-            updateState securityState (State.SetRootMirrorsAndKeys root mirrors snapshotKey timestampKey now)
-        , Store.setTarGzFileInfo = \tarGzInfo tarInfo now ->
-            updateState securityState (State.SetTarGzFileInfo tarGzInfo tarInfo now)
-        , Store.resignSnapshotAndTimestamp = \maxAge now ->
-            updateState securityState (State.ResignSnapshotAndTimestamp maxAge now)
+          Store.getSecurityState = liftIO $ dbGetSecurityState pool
+        , Store.getSecurityFiles = liftIO $ State.securityStateFiles <$> dbGetSecurityState pool
+        , Store.setRootMirrorsAndKeys = \root mirrors snapshotKey timestampKey now -> liftIO $
+            dbModifySecurityState pool (State.setRootMirrorsAndKeys root mirrors snapshotKey timestampKey now)
+        , Store.setTarGzFileInfo = \tarGzInfo tarInfo now -> liftIO $
+            dbModifySecurityState pool (State.setTarGzFileInfo tarGzInfo tarInfo now)
+        , Store.resignSnapshotAndTimestamp = \maxAge now -> liftIO $
+            dbModifySecurityState pool (State.resignSnapshotAndTimestamp maxAge now)
         }
-    , Store.backendState = [abstractAcidStateComponent securityState]
+    , Store.backendState = []  -- no AcidState; data lives in PostgreSQL
     }
 
 ------------------------------------------------------------------------
@@ -196,24 +193,22 @@ saveSecurityState SecurityState{..} =
             (conflictingFields primaryKey)
             onConflictUpdateAll
 
+
 ------------------------------------------------------------------------
+-- Direct database operations (no MVar, no event sourcing)
+--
 
-securityStateComponent :: ServerEnv
-                       -> PgConnection
-                       -> IO (StateComponent AcidState SecurityState)
-securityStateComponent env serverPgConn = do
-    -- Load state
-    st <- logTiming (serverVerbosity env) "Loaded SecurityState" $
-            runPgTx serverPgConn loadSecurityState
 
-    pgSt <- mkAcidState serverPgConn st saveSecurityState
-    return StateComponent {
-        stateDesc    = "TUF specific state"
-      , stateHandle  = pgSt
-      , getState     = queryPg pgSt (runQueryEvent GetSecurityState)
-      , putState     = \s -> do
-          runPgTx serverPgConn (saveSecurityState s)
-          _ <- swapMVar (pgMVar pgSt) s
-          return ()
-      }
+-- | Get security state from PostgreSQL
+dbGetSecurityState :: PgConnection -> IO SecurityState
+dbGetSecurityState pool' = runPgTx pool' loadSecurityState
 
+-- | Write full security state to PostgreSQL
+dbPutSecurityState :: PgConnection -> SecurityState -> IO ()
+dbPutSecurityState pool' st = runPgTx pool' (saveSecurityState st)
+
+-- | Read-modify-write, no return value
+dbModifySecurityState :: PgConnection -> (SecurityState -> SecurityState) -> IO ()
+dbModifySecurityState pool' f = do
+  st <- dbGetSecurityState pool'
+  dbPutSecurityState pool' (f st)
