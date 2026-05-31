@@ -379,6 +379,14 @@ CREATE TABLE IF NOT EXISTS download_count__meta (
   today DATE NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS download_count__history (
+  pkg_name TEXT NOT NULL,
+  pkg_version TEXT NOT NULL,
+  day DATE NOT NULL,
+  count INT4 NOT NULL,
+  PRIMARY KEY (pkg_name, day, pkg_version)
+);
+
 
 ------------------------------------------------------------------------
 -- Feature: Security

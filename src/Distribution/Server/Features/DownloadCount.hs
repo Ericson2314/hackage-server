@@ -1,6 +1,7 @@
 {-# LANGUAGE DeriveAnyClass #-}
 {-# LANGUAGE DeriveGeneric #-}
 {-# LANGUAGE DerivingStrategies #-}
+{-# LANGUAGE FlexibleContexts #-}
 {-# LANGUAGE FlexibleInstances #-}
 {-# LANGUAGE MultiParamTypeClasses #-}
 {-# LANGUAGE NamedFieldPuns #-}
@@ -37,10 +38,10 @@ module Distribution.Server.Features.DownloadCount (
 
 import Distribution.Server.Framework
 import Distribution.Server.Framework.PgTx (beamTx)
-import Distribution.Server.Framework.BackupRestore
+import Distribution.Server.Framework.BackupRestore (BackupEntry(..), importCSV)
 
 import Distribution.Server.Features.DownloadCount.State
-import Distribution.Server.Features.DownloadCount.Backup
+import Distribution.Server.Features.DownloadCount.Backup (onDiskBackup)
 import Distribution.Server.Features.Core
 import Distribution.Server.Features.Users
 
@@ -58,6 +59,7 @@ import Data.Aeson (ToJSON)
 import qualified Data.Aeson as Aeson
 import Data.List (foldl', sortBy)
 import Data.Function (on)
+import qualified Data.Map.Lazy as Map
 import qualified Data.Text as T
 
 import Database.Beam
@@ -88,7 +90,7 @@ data PackageDownloads = PackageDownloads {
 
 initDownloadFeature :: ServerEnv
                     -> IO (CoreFeature -> UserFeature -> IO DownloadFeature)
-initDownloadFeature serverEnv@ServerEnv{serverStateDir, serverPgConn} = do
+initDownloadFeature serverEnv@ServerEnv{serverPgConn} = do
     -- Seed meta if empty
     metaRows <- runBeamPg serverPgConn $
       runSelectReturningList $ select $ all_ dlMetaTable
@@ -99,16 +101,15 @@ initDownloadFeature serverEnv@ServerEnv{serverStateDir, serverPgConn} = do
           runInsert $ insert dlMetaTable $ insertValues [DlMetaRow (inMemToday initSt)]
       _ -> return ()
 
-    let onDiskState = onDiskStateComponent serverStateDir
     (recentDownloads,
-     totalDownloads) <- computeRecentAndTotalDownloads =<< getState onDiskState
+     totalDownloads) <- computeRecentAndTotalDownloads =<< dbGetOnDiskStats serverPgConn
     recentCache    <- newMemStateWHNF recentDownloads
     totalsCache    <- newMemStateWHNF totalDownloads
     downChan       <- newChan
 
     return $ \core users -> do
-      let feature = downloadFeature core users serverEnv serverPgConn
-                      onDiskState totalsCache recentCache downChan
+      let feature = downloadFeature core users serverPgConn
+                      totalsCache recentCache downChan
 
       registerHook (packageDownloadHook core) (writeChan downChan)
       return feature
@@ -167,6 +168,40 @@ dlCountsTable = _dlCounts dlDb
 
 dlMetaTable :: DatabaseEntity Postgres DlDb (TableEntity DlMetaT)
 dlMetaTable = _dlMeta dlDb
+
+-- | Historical download counts per package per version per day
+data DlHistoryT f = DlHistoryRow
+  { _dhPkgName    :: C f T.Text
+  , _dhPkgVersion :: C f T.Text
+  , _dhDay        :: C f Day
+  , _dhCount      :: C f Int32
+  } deriving (Generic, Beamable)
+
+instance Table DlHistoryT where
+  data PrimaryKey DlHistoryT f =
+    DlHistoryId (C f T.Text) (C f Day) (C f T.Text)
+    deriving (Generic, Beamable)
+  primaryKey r = DlHistoryId (_dhPkgName r) (_dhDay r) (_dhPkgVersion r)
+
+deriving instance Show (DlHistoryT Identity)
+
+data DlHistoryDb f = DlHistoryDb
+  { _dlHistory :: f (TableEntity DlHistoryT)
+  } deriving (Generic, Database Postgres)
+
+dlHistoryDb :: DatabaseSettings Postgres DlHistoryDb
+dlHistoryDb = defaultDbSettings `withDbModification`
+  DlHistoryDb
+    (setEntityName "download_count__history" <>
+     modifyTableFields tableModification
+       { _dhPkgName    = "pkg_name"
+       , _dhPkgVersion = "pkg_version"
+       , _dhDay        = "day"
+       , _dhCount      = "count"
+       })
+
+dlHistoryTable :: DatabaseEntity Postgres DlHistoryDb (TableEntity DlHistoryT)
+dlHistoryTable = _dlHistory dlHistoryDb
 
 ------------------------------------------------------------------------
 -- Direct database operations (no MVar, no event sourcing)
@@ -234,26 +269,46 @@ dlChunksOf :: Int -> [a] -> [[a]]
 dlChunksOf _ [] = []
 dlChunksOf n xs = let (h, t) = splitAt n xs in h : dlChunksOf n t
 
-onDiskStateComponent :: FilePath -> StateComponent OnDiskState OnDiskStats
-onDiskStateComponent stateDir = StateComponent {
-      stateDesc    = "All time download counts"
-    , stateHandle  = OnDiskState
-    , getState     = readOnDiskStats (dcPath stateDir </> "ondisk")
-    , putState     = \onDiskStats -> do
-                       --TODO: we should extend the backup system so we can
-                       -- write these files out incrementally
-                       writeOnDiskStats (dcPath stateDir </> "ondisk") onDiskStats
-                       reconstructLog (dcPath stateDir) onDiskStats
-    , backupState  = \_ -> onDiskBackup
-    , restoreState = onDiskRestore
-    , resetState   = return . onDiskStateComponent
-    }
+-- | Get all-time historical download stats from PostgreSQL
+dbGetOnDiskStats :: PgConnection -> IO OnDiskStats
+dbGetOnDiskStats pool' = do
+  rows <- runBeamPg pool' $
+    runSelectReturningList $ select $ all_ dlHistoryTable
+  let addRow m (DlHistoryRow pkgN verT day cnt) =
+        case (simpleParse (T.unpack pkgN), simpleParse (T.unpack verT)) of
+          (Just pkgName, Just ver) ->
+            cmInsert (pkgName, (day, ver)) (fromIntegral cnt) m
+          _ -> m
+  return $ foldl' addRow cmEmpty rows
+
+-- | Write historical stats to PostgreSQL (merge today's counts into history)
+dbUpdateHistory :: PgConnection -> InMemStats -> IO ()
+dbUpdateHistory pool' (InMemStats day perPkg) = do
+    let rows = [ DlHistoryRow (T.pack $ display pkgName) (T.pack $ display ver) day (fromIntegral cnt)
+               | (pkgId, cnt) <- cmToList perPkg
+               , let pkgName = Distribution.Package.packageName pkgId
+                     ver     = packageVersion pkgId ]
+    runPgTx pool' $
+      forM_ rows $ \row ->
+        beamTx $ runInsert $ insertOnConflict dlHistoryTable
+          (insertValues [row])
+          (conflictingFields primaryKey)
+          (onConflictUpdateSet (\fields oldValues ->
+            _dhCount fields <-. _dhCount oldValues + val_ (_dhCount row)))
+
+-- | Put full historical stats to PostgreSQL (for backup restore)
+dbPutOnDiskStats :: PgConnection -> OnDiskStats -> IO ()
+dbPutOnDiskStats pool' onDisk =
+  runPgTx pool' $ do
+    beamTx $ runDelete $ delete dlHistoryTable (\_ -> val_ True)
+    let rows = [ DlHistoryRow (T.pack $ display pkgName) (T.pack $ display ver) day (fromIntegral cnt)
+               | ((pkgName, (day, ver)), cnt) <- cmToList onDisk ]
+    mapM_ (\chunk -> beamTx $
+      runInsert $ insert dlHistoryTable $ insertValues chunk) (dlChunksOf 1000 rows)
 
 downloadFeature :: CoreFeature
                 -> UserFeature
-                -> ServerEnv
                 -> PgConnection
-                -> StateComponent OnDiskState OnDiskStats
                 -> MemState TotalDownloads
                 -> MemState RecentDownloads
                 -> Chan PackageId
@@ -261,9 +316,7 @@ downloadFeature :: CoreFeature
 
 downloadFeature CoreFeature{}
                 UserFeature{..}
-                ServerEnv{serverStateDir}
                 pool
-                onDiskState
                 totalDownloadsCache
                 recentDownloadsCache
                 downloadStream
@@ -274,8 +327,7 @@ downloadFeature CoreFeature{}
                            , downloadCSV
                            ]
       , featurePostInit  = void $ forkIO registerDownloads
-      , featureState     = [ abstractOnDiskStateComponent onDiskState
-                           ]  -- InMemStats lives in PostgreSQL, no AcidState
+      , featureState     = []  -- all data lives in PostgreSQL
       , featureCaches    = [
             CacheComponent {
               cacheDesc       = "recent package downloads cache",
@@ -305,16 +357,12 @@ downloadFeature CoreFeature{}
           inMemStats <- dbGetInMemStats pool
           dbPutInMemStats pool $ initInMemStats today
 
-          -- Write yesterday's downloads to the log
-          appendToLog (dcPath serverStateDir) inMemStats
+          -- Merge yesterday's counts into the historical table
+          dbUpdateHistory pool inMemStats
 
-          -- Update the on-disk statistics and recompute recent downloads
-          onDiskStats' <- updateHistory inMemStats <$> getState onDiskState
-          writeOnDiskStats (dcPath serverStateDir </> "ondisk") onDiskStats'
-          --TODO: this is still stupid, writing it out only to read it back
-          -- we should be able to update the in memory ones incrementally
+          -- Recompute recent and total download caches
           (recentDownloads,
-           totalDownloads) <- computeRecentAndTotalDownloads =<< getState onDiskState
+           totalDownloads) <- computeRecentAndTotalDownloads =<< dbGetOnDiskStats pool
           writeMemState recentDownloadsCache recentDownloads
           writeMemState totalDownloadsCache totalDownloads
 
@@ -348,7 +396,7 @@ downloadFeature CoreFeature{}
     getDownloadCounts :: DynamicPath -> ServerPartE Response
     getDownloadCounts _path = do
       guardAuthorised_ [InGroup adminGroup]
-      onDiskStats <- liftIO $ getState onDiskState
+      onDiskStats <- liftIO $ dbGetOnDiskStats pool
       let [BackupByteString _ bs] = onDiskBackup onDiskStats
       return $ toResponse bs
 
@@ -359,13 +407,11 @@ downloadFeature CoreFeature{}
       csv          <- importCSV "PUT input" fileContents
       onDiskStats  <- cmFromCSV csv
       liftIO $ do
-        --TODO: if the onDiskStats are large, can we stream it?
-        writeOnDiskStats (dcPath serverStateDir </> "ondisk") onDiskStats
+        dbPutOnDiskStats pool onDiskStats
         (recentDownloads,
          totalDownloads) <- computeRecentAndTotalDownloads onDiskStats
         writeMemState recentDownloadsCache recentDownloads
         writeMemState totalDownloadsCache totalDownloads
-        reconstructLog (dcPath serverStateDir) onDiskStats
 
       ok $ toResponse $ "Imported " ++ show (length csv) ++ " records\n"
 
@@ -386,6 +432,3 @@ computeRecentAndTotalDownloads :: OnDiskStats -> IO (RecentDownloads, TotalDownl
 computeRecentAndTotalDownloads onDiskStats = do
   recentRange <- getRecentDayRange 30
   return $ initRecentAndTotalDownloads recentRange onDiskStats
-
-dcPath :: FilePath -> FilePath
-dcPath stateDir = stateDir </> "db" </> "DownloadCount"

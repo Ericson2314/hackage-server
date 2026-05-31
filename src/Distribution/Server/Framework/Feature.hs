@@ -8,11 +8,9 @@ module Distribution.Server.Framework.Feature
   , emptyHackageFeature
     -- * State components
   , StateComponent(..)
-  , OnDiskState(..)
   , AbstractStateComponent(..)
   , abstractAcidStateComponent
   , abstractAcidStateComponent'
-  , abstractOnDiskStateComponent
   , queryState
   , updateState
   , compareState
@@ -100,8 +98,6 @@ data StateComponent f st = StateComponent {
   , resetState   :: FilePath -> IO (StateComponent f st)
   }
 
-data OnDiskState a = OnDiskState
-
 -- | 'AbstractStateComponent' abstracts away from a particular type of
 -- 'StateComponent'
 data AbstractStateComponent = AbstractStateComponent {
@@ -159,20 +155,6 @@ abstractAcidStateComponent' cmp st = AbstractStateComponent {
                                 let cmpSt = liftM2 cmp (getState st) (getState st')
                                 return (abstractAcidStateComponent' cmp st', cmpSt)
   , abstractStateSize       = liftM memSize (getState st)
-  }
-
-abstractOnDiskStateComponent :: (Eq st, Show st) => StateComponent OnDiskState st -> AbstractStateComponent
-abstractOnDiskStateComponent st = AbstractStateComponent {
-    abstractStateDesc       = stateDesc st
-  , abstractStateCheckpoint = return ()
-  , abstractStateClose      = return ()
-  , abstractStateBackup     = \t -> liftM (backupState st t) (getState st)
-  , abstractStateRestore    = abstractRestoreBackup (putState st) (restoreState st)
-  , abstractStateNewEmpty   = \stateDir -> do
-                                st' <- resetState st stateDir
-                                let cmpSt = liftM2 compareState (getState st) (getState st')
-                                return (abstractOnDiskStateComponent st', cmpSt)
-  , abstractStateSize       = return 0
   }
 
 instance Monoid AbstractStateComponent where
