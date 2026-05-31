@@ -461,14 +461,6 @@ CREATE TABLE IF NOT EXISTS users__revoke_auth_token (id BIGSERIAL PRIMARY KEY, a
 CREATE TABLE IF NOT EXISTS hackage_admins__add_hackage_admin (id BIGSERIAL PRIMARY KEY, arg0 TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS hackage_admins__remove_hackage_admin (id BIGSERIAL PRIMARY KEY, arg0 TEXT NOT NULL);
 
--- Upload events
-CREATE TABLE IF NOT EXISTS hackage_trustees__add_hackage_trustee (id BIGSERIAL PRIMARY KEY, arg0 TEXT NOT NULL);
-CREATE TABLE IF NOT EXISTS hackage_trustees__remove_hackage_trustee (id BIGSERIAL PRIMARY KEY, arg0 TEXT NOT NULL);
-CREATE TABLE IF NOT EXISTS hackage_uploaders__add_hackage_uploader (id BIGSERIAL PRIMARY KEY, arg0 TEXT NOT NULL);
-CREATE TABLE IF NOT EXISTS hackage_uploaders__remove_hackage_uploader (id BIGSERIAL PRIMARY KEY, arg0 TEXT NOT NULL);
-CREATE TABLE IF NOT EXISTS package_maintainers__add_package_maintainer (id BIGSERIAL PRIMARY KEY, arg0 TEXT NOT NULL, arg1 TEXT NOT NULL);
-CREATE TABLE IF NOT EXISTS package_maintainers__remove_package_maintainer (id BIGSERIAL PRIMARY KEY, arg0 TEXT NOT NULL, arg1 TEXT NOT NULL);
-CREATE TABLE IF NOT EXISTS package_maintainers__set_package_maintainers (id BIGSERIAL PRIMARY KEY, arg0 TEXT NOT NULL, arg1 TEXT NOT NULL);
 
 -- Tags events
 CREATE TABLE IF NOT EXISTS package_tags__add_package_tag (id BIGSERIAL PRIMARY KEY, arg0 TEXT NOT NULL, arg1 TEXT NOT NULL);
