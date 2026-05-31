@@ -1,26 +1,24 @@
-{-# LANGUAGE OverloadedStrings, MultiParamTypeClasses, FlexibleInstances, DeriveAnyClass, DeriveGeneric, DerivingStrategies, DeriveDataTypeable, TypeFamilies, TemplateHaskell, BangPatterns #-}
+{-# LANGUAGE BangPatterns #-}
+{-# LANGUAGE DeriveDataTypeable #-}
 {-# LANGUAGE FlexibleContexts #-}
+{-# LANGUAGE TemplateHaskell #-}
+{-# LANGUAGE TypeFamilies #-}
 
 module Distribution.Server.Features.Core.State (
     -- * DB state
     PackagesState(..)
   , initialPackagesState
   , mkPackageInfo
-    -- * DB transactions
-    --
-    -- NOTE: Explictly not exported: legacy transactions 'AddPackage'(2) and
-    -- 'AddPackageRevision' (see 'AddPackage3' and 'AddPackageRevision2').
-  , AddOtherIndexEntry(..)
-  , AddPackage3(..)
-  , AddPackageRevision2(..)
-  , AddPackageTarball(..)
-  , DeletePackage(..)
-  , GetPackagesState(..)
-  , MigrateAddUpdateLog(..)
-  , ReplacePackagesState(..)
-  , SetPackageUploadTime(..)
-  , SetPackageUploader(..)
-  , UpdatePackageInfo(..)
+    -- * Pure state operations (used by db layer)
+  , addPackage3
+  , deletePackage
+  , addPackageRevision2
+  , addPackageTarball
+  , setPackageUploader
+  , setPackageUploadTime
+  , updatePackageInfo
+  , addOtherIndexEntry
+  , migrateAddUpdateLog
   ) where
 
 import Distribution.Server.Prelude
@@ -36,11 +34,7 @@ import Distribution.Server.Users.Users (Users, lookupUserId)
 import Distribution.Server.Framework.MemSize
 
 import Data.Coerce (Coercible, coerce)
-import Distribution.Server.Framework.EventSourcing (Query, Update, makeAcidic)
-import Distribution.Server.Framework.BeamInstances ()
 import Data.SafeCopy (Migrate(..), base, extension, deriveSafeCopy)
-import Control.Monad.Reader
-import qualified Control.Monad.State as State
 import Data.Time (UTCTime)
 import qualified Data.Vector as Vec
 import qualified Data.Sequence as Seq
@@ -89,41 +83,16 @@ initialPackagesState freshDB = PackagesState {
     packageUpdateLog = if freshDB then Right mempty else Left mempty
   }
 
--- old v0 transaction
-addPackage :: PackageId -> CabalFileText -> OldUploadInfo
-           -> Maybe PkgTarball
-           -> Update PackagesState (Maybe PkgInfo)
-addPackage pkgid cabalfile uploadinfo mtarball =
-    addPackage2 pkgid cabalfile uploadinfo (UserName "") mtarball
-
--- v1  transaction (adds username)
-addPackage2 :: PackageId -> CabalFileText -> OldUploadInfo -> UserName
-            -> Maybe PkgTarball
-            -> Update PackagesState (Maybe PkgInfo)
-addPackage2 pkgid cabalfile uploadinfo@(timestamp, uid) username mtarball = do
-    PackagesState pkgindex updatelog <- State.get
-    case PackageIndex.lookupPackageId pkgindex pkgid of
-      Just _  -> return Nothing
-      Nothing -> do
-        let !pkginfo = mkPackageInfo pkgid cabalfile uploadinfo mtarball
-            pkgindex'   = PackageIndex.insert pkginfo pkgindex
-            !pkgentry   = CabalFileEntry pkgid (MetadataRevIx 0) timestamp uid username
-            updatelog'  = fmap (Seq.|> pkgentry) updatelog
-        State.put $! PackagesState pkgindex' updatelog'
-        return (Just pkginfo)
-
 -- current transaction (takes tar index entries as well)
-addPackage3 :: PkgInfo -> OldUploadInfo -> UserName -> [TarIndexEntry] -> Update PackagesState Bool
-addPackage3 !pkginfo (timestamp,uid) username entries = do
-    PackagesState pkgindex updatelog <- State.get
+addPackage3 :: PkgInfo -> OldUploadInfo -> UserName -> [TarIndexEntry] -> PackagesState -> (Bool, PackagesState)
+addPackage3 !pkginfo (timestamp,uid) username entries st@(PackagesState pkgindex updatelog) =
     case PackageIndex.lookupPackageId pkgindex (pkgInfoId pkginfo) of
-      Just _  -> return False
-      Nothing -> do
+      Just _  -> (False, st)
+      Nothing ->
         let pkgindex'   = PackageIndex.insert pkginfo pkgindex
             !pkgentry   = CabalFileEntry (pkgInfoId pkginfo) (MetadataRevIx 0) timestamp uid username
             updatelog'  = fmap (\ul -> foldr (\e s -> s Seq.|> e) ul (pkgentry:entries)) updatelog
-        State.put $! PackagesState pkgindex' updatelog'
-        return True
+        in (True, PackagesState pkgindex' updatelog')
 
 mkPackageInfo :: PackageIdentifier -> CabalFileText -> OldUploadInfo -> Maybe PkgTarball -> PkgInfo
 mkPackageInfo pkgid cabalfile uploadinfo mtarball =
@@ -136,29 +105,21 @@ mkPackageInfo pkgid cabalfile uploadinfo mtarball =
                                                          (tarball, uploadinfo)
             }
 
-deletePackage :: PackageId -> Update PackagesState (Maybe PkgInfo)
-deletePackage pkgid = do
-    PackagesState pkgindex updatelog <- State.get
+deletePackage :: PackageId -> PackagesState -> (Maybe PkgInfo, PackagesState)
+deletePackage pkgid st@(PackagesState pkgindex updatelog) =
     case PackageIndex.lookupPackageId pkgindex pkgid of
-      Nothing      -> return Nothing
-      Just pkginfo -> do
+      Nothing      -> (Nothing, st)
+      Just pkginfo ->
         let pkgindex' = PackageIndex.deletePackageId pkgid pkgindex
         --TODO: reset and rebuild the update log, or at least note that
         -- it has changed, since it'll need to be recompressed
-        State.put $! PackagesState pkgindex' updatelog
-        return (Just pkginfo)
-
-addPackageRevision :: PackageId -> CabalFileText -> OldUploadInfo
-                   -> Update PackagesState (Maybe PkgInfo, PkgInfo)
-addPackageRevision pkgid cabalfile uploadinfo =
-    addPackageRevision2 pkgid cabalfile uploadinfo (UserName "")
+        in (Just pkginfo, PackagesState pkgindex' updatelog)
 
 addPackageRevision2 :: PackageId -> CabalFileText -> OldUploadInfo -> UserName
-                    -> Update PackagesState (Maybe PkgInfo, PkgInfo)
-addPackageRevision2 pkgid cabalfile uploadinfo@(timestamp, uid) username = do
-    PackagesState pkgindex updatelog <- State.get
+                    -> PackagesState -> ((Maybe PkgInfo, PkgInfo), PackagesState)
+addPackageRevision2 pkgid cabalfile uploadinfo@(timestamp, uid) username (PackagesState pkgindex updatelog) =
     case PackageIndex.lookupPackageId pkgindex pkgid of
-      Just pkginfo -> do
+      Just pkginfo ->
         let !pkginfo' = pkginfo {
               pkgMetadataRevisions = pkgMetadataRevisions pkginfo
                                      `Vec.snoc` (cabalfile, uploadinfo)
@@ -167,9 +128,8 @@ addPackageRevision2 pkgid cabalfile uploadinfo@(timestamp, uid) username = do
             newrevision = MetadataRevIx $ fromIntegral $ Vec.length (pkgMetadataRevisions pkginfo)
             !pkgentry   = CabalFileEntry pkgid newrevision timestamp uid username
             updatelog'  = fmap (Seq.|> pkgentry) updatelog
-        State.put $! PackagesState pkgindex' updatelog'
-        return (Just pkginfo, pkginfo')
-      Nothing -> do
+        in ((Just pkginfo, pkginfo'), PackagesState pkgindex' updatelog')
+      Nothing ->
         let !pkginfo = PkgInfo {
               pkgInfoId            = pkgid,
               pkgMetadataRevisions = Vec.singleton (cabalfile, uploadinfo),
@@ -178,11 +138,10 @@ addPackageRevision2 pkgid cabalfile uploadinfo@(timestamp, uid) username = do
             pkgindex'   = PackageIndex.insert pkginfo pkgindex
             !pkgentry   = CabalFileEntry pkgid (MetadataRevIx 0) timestamp uid username
             updatelog'  = fmap (Seq.|> pkgentry) updatelog
-        State.put $! PackagesState pkgindex' updatelog'
-        return (Nothing, pkginfo)
+        in ((Nothing, pkginfo), PackagesState pkgindex' updatelog')
 
 addPackageTarball :: PackageId -> PkgTarball -> OldUploadInfo
-                  -> Update PackagesState (Maybe (PkgInfo, PkgInfo))
+                  -> PackagesState -> (Maybe (PkgInfo, PkgInfo), PackagesState)
 addPackageTarball pkgid tarball uploadinfo =
     alterPackage pkgid $ \pkginfo ->
       pkginfo {
@@ -191,7 +150,7 @@ addPackageTarball pkgid tarball uploadinfo =
       }
 
 setPackageUploader :: PackageId -> UserId
-                   -> Update PackagesState (Maybe (PkgInfo, PkgInfo))
+                   -> PackagesState -> (Maybe (PkgInfo, PkgInfo), PackagesState)
 setPackageUploader pkgid uid =
     alterPackage pkgid $ \pkginfo ->
       let (cabalfile, (time, _uid)) = pkgLatestRevision pkginfo in
@@ -201,7 +160,7 @@ setPackageUploader pkgid uid =
       }
 
 setPackageUploadTime :: PackageId -> UTCTime
-                     -> Update PackagesState (Maybe (PkgInfo, PkgInfo))
+                     -> PackagesState -> (Maybe (PkgInfo, PkgInfo), PackagesState)
 setPackageUploadTime pkgid time =
     alterPackage pkgid $ \pkginfo ->
       let (cabalfile, (_time, uid)) = pkgLatestRevision pkginfo in
@@ -210,40 +169,29 @@ setPackageUploadTime pkgid time =
                                `Vec.snoc` (cabalfile, (time, uid))
       }
 
-updatePackageInfo :: PackageId -> PkgInfo -> Update PackagesState ()
-updatePackageInfo pkgid pkginfo = void $ alterPackage pkgid (const pkginfo)
+updatePackageInfo :: PackageId -> PkgInfo -> PackagesState -> PackagesState
+updatePackageInfo pkgid pkginfo = snd . alterPackage pkgid (const pkginfo)
 
 alterPackage :: PackageId -> (PkgInfo -> PkgInfo)
-             -> Update PackagesState (Maybe (PkgInfo, PkgInfo))
-alterPackage pkgid alter = do
-    PackagesState pkgindex updatelog <- State.get
+             -> PackagesState -> (Maybe (PkgInfo, PkgInfo), PackagesState)
+alterPackage pkgid alter st@(PackagesState pkgindex updatelog) =
     case PackageIndex.lookupPackageId pkgindex pkgid of
-      Nothing      -> return Nothing
-      Just pkginfo -> do
+      Nothing      -> (Nothing, st)
+      Just pkginfo ->
         let !pkginfo' = alter pkginfo
             pkgindex' = PackageIndex.insert pkginfo' pkgindex
-        State.put $! PackagesState pkgindex' updatelog
-        return (Just (pkginfo, pkginfo'))
+        in (Just (pkginfo, pkginfo'), PackagesState pkgindex' updatelog)
 
 -- | Add entries into the index (other than cabal files)
-addOtherIndexEntry :: TarIndexEntry -> Update PackagesState ()
-addOtherIndexEntry !extraentry = do
-    PackagesState pkgindex updatelog <- State.get
+addOtherIndexEntry :: TarIndexEntry -> PackagesState -> PackagesState
+addOtherIndexEntry !extraentry (PackagesState pkgindex updatelog) =
     let updatelog' = fmap (Seq.|> extraentry) updatelog
-    State.put $! PackagesState pkgindex updatelog'
+    in PackagesState pkgindex updatelog'
 
--- |Replace all existing packages and reports
-replacePackagesState :: PackagesState -> Update PackagesState ()
-replacePackagesState = State.put
-
-getPackagesState :: Query PackagesState PackagesState
-getPackagesState = ask
-
-migrateAddUpdateLog :: Users -> Update PackagesState ()
-migrateAddUpdateLog users = do
-    PackagesState pkgindex oldlog <- State.get
+migrateAddUpdateLog :: Users -> PackagesState -> PackagesState
+migrateAddUpdateLog users (PackagesState pkgindex oldlog) =
     let !updatelog = initialUpdateLog (either id mempty oldlog) users pkgindex
-    State.put $! PackagesState pkgindex (Right updatelog)
+    in PackagesState pkgindex (Right updatelog)
 
 -- | Construct the initial update log (migration)
 --
@@ -349,19 +297,3 @@ instance Migrate PackagesState where
 
 deriveSafeCopy 2 'extension ''PackagesState
 
-makeAcidic ''PackagesState
-  [ 'getPackagesState
-  , 'replacePackagesState
-  , 'addPackage
-  , 'addPackage2
-  , 'addPackage3
-  , 'deletePackage
-  , 'addPackageRevision
-  , 'addPackageRevision2
-  , 'addPackageTarball
-  , 'setPackageUploader
-  , 'setPackageUploadTime
-  , 'updatePackageInfo
-  , 'addOtherIndexEntry
-  , 'migrateAddUpdateLog
-  ]
