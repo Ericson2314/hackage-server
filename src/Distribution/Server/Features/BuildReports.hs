@@ -25,6 +25,7 @@ import Distribution.Server.Features.BuildReports.Backup
 import qualified Distribution.Server.Features.BuildReports.State as Acid
 import qualified Distribution.Server.Features.BuildReports.BuildReport as BuildReport
 import Distribution.Server.Features.BuildReports.BuildReport (BuildReport(..))
+import qualified Distribution.Server.Features.BuildReports.BuildReports as BuildReports
 import Distribution.Server.Features.BuildReports.BuildReports (BuildReports(..), BuildReportId(..), PkgBuildReports(..), BuildCovg(..), BuildLog(..), TestLog(..))
 import qualified Distribution.Server.Framework.ResponseContentTypes as Resource
 
@@ -51,8 +52,6 @@ import GHC.Generics (Generic)
 import           Data.Int (Int32)
 import Database.Beam hiding (time)
 import Database.Beam.Postgres
-import qualified Database.PostgreSQL.Simple as PG
-import Control.Concurrent.MVar (swapMVar)
 
 
 -- TODO:
@@ -97,12 +96,9 @@ initBuildReportsFeature :: String
                             -> CoreResource
                             -> IO ReportsFeature)
 initBuildReportsFeature name env@ServerEnv{serverPgConn} = do
-    reportsState <- reportsStateComponent name serverPgConn
-
     return $ \user upload core -> do
-      let feature = buildReportsFeature name env
+      let feature = buildReportsFeature name env serverPgConn
                                         user upload core
-                                        reportsState
       return feature
 
 ------------------------------------------------------------------------
@@ -278,41 +274,44 @@ saveBuildReports (BuildReports idx) =
 
 ------------------------------------------------------------------------
 
-reportsStateComponent :: String -> PgConnection -> IO (StateComponent AcidState BuildReports)
-reportsStateComponent name serverPgConn = do
-  -- Load state
-  st <- runPgTx serverPgConn loadBuildReports
+-- | Get build reports from PostgreSQL
+dbGetBuildReports :: PgConnection -> IO BuildReports
+dbGetBuildReports pool = runPgTx pool loadBuildReports
 
-  pgSt <- mkAcidState serverPgConn st saveBuildReports
-  return StateComponent {
-      stateDesc    = "Build reports"
-    , stateHandle  = pgSt
-    , getState     = queryPg pgSt (runQueryEvent Acid.GetBuildReports)
-    , putState     = \s -> do
-        runPgTx serverPgConn (saveBuildReports s)
-        _ <- swapMVar (pgMVar pgSt) s
-        return ()
-    , backupState  = \_ -> dumpBackup
-    , restoreState = restoreBackup
-    , resetState   = \_ -> reportsStateComponent name serverPgConn
-    }
+-- | Write full build reports to PostgreSQL
+dbPutBuildReports :: PgConnection -> BuildReports -> IO ()
+dbPutBuildReports pool st = runPgTx pool (saveBuildReports st)
+
+-- | Read-modify-write helper
+dbModifyBuildReports :: PgConnection -> (BuildReports -> BuildReports) -> IO ()
+dbModifyBuildReports pool f = do
+  st <- dbGetBuildReports pool
+  dbPutBuildReports pool (f st)
+
+-- | Read-modify-write helper that returns a value
+dbModifyBuildReports' :: PgConnection -> (BuildReports -> (a, BuildReports)) -> IO a
+dbModifyBuildReports' pool f = do
+  st <- dbGetBuildReports pool
+  let (result, st') = f st
+  dbPutBuildReports pool st'
+  return result
 
 buildReportsFeature :: String
                     -> ServerEnv
+                    -> PgConnection
                     -> UserFeature
                     -> UploadFeature
                     -> CoreResource
-                    -> StateComponent AcidState BuildReports
                     -> ReportsFeature
 buildReportsFeature name
                     ServerEnv{serverBlobStore = store}
+                    pool
                     UserFeature{..} UploadFeature{..}
                     CoreResource{ packageInPath
                                 , guardValidPackageId
                                 , lookupPackageId
                                 , corePackagePage
                                 }
-                    reportsState
   = ReportsFeature{..}
   where
     reportsFeatureInterface = (emptyHackageFeature name) {
@@ -326,7 +325,7 @@ buildReportsFeature name
             , reportsReset
             , reportsTestsEnabled
             ]
-      , featureState = [abstractAcidStateComponent reportsState]
+      , featureState = []  -- no AcidState; data lives in PostgreSQL
       }
 
     reportsResource = ReportsResource
@@ -403,14 +402,14 @@ buildReportsFeature name
       pkgid <- packageInPath dpath
       guardValidPackageId pkgid
       reportId <- reportIdInPath dpath
-      mreport  <- queryState reportsState $ Acid.LookupReportCovg pkgid reportId
+      mreport  <- liftIO $ BuildReports.lookupReportCovg pkgid reportId <$> dbGetBuildReports pool
       case mreport of
         Nothing -> errNotFound "Report not found" [MText "Build report does not exist"]
         Just (report, mlog, mtest, covg) -> return (reportId, report, mlog, mtest, covg)
 
     queryPackageReports :: MonadIO m => PackageId -> m [(BuildReportId, BuildReport)]
     queryPackageReports pkgid = do
-        reports <- queryState reportsState $ Acid.LookupPackageReports pkgid
+        reports <- liftIO $ BuildReports.lookupPackageReports pkgid <$> dbGetBuildReports pool
         return $ map (second (\(a, _, _) -> a)) reports
 
     queryBuildLog :: MonadIO m => BuildLog -> m Resource.BuildLog
@@ -425,9 +424,9 @@ buildReportsFeature name
 
     pkgReportDetails :: MonadIO m => (PackageIdentifier, Bool) -> m BuildReport.PkgDetails--(PackageIdentifier, Bool, Maybe (BuildStatus, Maybe UTCTime, Maybe Version))
     pkgReportDetails (pkgid, docs) = do
-      failCnt   <- queryState reportsState $ Acid.LookupFailCount pkgid
-      latestRpt <- queryState reportsState $ Acid.LookupLatestReport pkgid
-      runTests  <- fmap Just . queryState reportsState $ Acid.LookupRunTests pkgid
+      failCnt   <- liftIO $ BuildReports.lookupFailCount pkgid <$> dbGetBuildReports pool
+      latestRpt <- liftIO $ BuildReports.lookupLatestReport pkgid <$> dbGetBuildReports pool
+      runTests  <- fmap Just . liftIO $ BuildReports.lookupRunTests pkgid <$> dbGetBuildReports pool
       (time, ghcId) <- case latestRpt of
         Nothing -> return (Nothing,Nothing)
         Just (_, brp, _, _, _) -> do
@@ -437,13 +436,13 @@ buildReportsFeature name
 
     queryLastReportStats :: MonadIO m => PackageIdentifier -> m (Maybe (BuildReportId, BuildReport, Maybe BuildCovg))
     queryLastReportStats pkgid = do
-      lookupRes <- queryState reportsState $ Acid.LookupLatestReport pkgid
+      lookupRes <- liftIO $ BuildReports.lookupLatestReport pkgid <$> dbGetBuildReports pool
       case lookupRes of
         Nothing -> return Nothing
         Just (rptId, rpt, _, _, covg) -> return (Just (rptId, rpt, covg))
 
     queryRunTests :: MonadIO m =>  PackageId -> m Bool
-    queryRunTests pkgid = queryState reportsState $ Acid.LookupRunTests pkgid
+    queryRunTests pkgid = liftIO $ BuildReports.lookupRunTests pkgid <$> dbGetBuildReports pool
 
     ---------------------------------------------------------------------------
 
@@ -488,7 +487,9 @@ buildReportsFeature name
                   -- Check that the submitter can actually upload docs
                   guardAuthorisedAsMaintainerOrTrustee (packageName pkgid)
               report' <- liftIO $ BuildReport.affixTimestamp report
-              reportId <- updateState reportsState $ Acid.AddReport pkgid (report', Nothing)
+              reportId <- liftIO $ dbModifyBuildReports' pool $ \br ->
+                let (br', rid) = BuildReports.addReport pkgid (report', Nothing, Nothing) br
+                in (rid, br')
               -- redirect to new reports page
               seeOther (reportsPageUri reportsResource "" pkgid reportId) $ toResponse ()
 
@@ -509,7 +510,10 @@ buildReportsFeature name
       guardValidPackageId pkgid
       reportId <- reportIdInPath dpath
       guardAuthorised_ [InGroup trusteesGroup]
-      success <- updateState reportsState $ Acid.DeleteReport pkgid reportId
+      success <- liftIO $ dbModifyBuildReports' pool $ \br ->
+        case BuildReports.deleteReport pkgid reportId br of
+          Nothing  -> (False, br)
+          Just br' -> (True, br')
       if success
           then seeOther (reportsListUri reportsResource "" pkgid) $ toResponse ()
           else errNotFound "Build report not found" [MText $ "Build report #" ++ display reportId ++ " not found"]
@@ -523,7 +527,10 @@ buildReportsFeature name
       guardAuthorised_ [AnyKnownUser]
       blogbody <- expectTextPlain
       buildLog <- liftIO $ BlobStorage.add store blogbody
-      void $ updateState reportsState $ Acid.SetBuildLog pkgid reportId (Just $ BuildLog buildLog)
+      liftIO $ dbModifyBuildReports pool $ \br ->
+        case BuildReports.setBuildLog pkgid reportId (Just $ BuildLog buildLog) br of
+          Nothing  -> br
+          Just br' -> br'
       noContent (toResponse ())
 
     putTestLog :: DynamicPath -> ServerPartE Response
@@ -535,7 +542,10 @@ buildReportsFeature name
       guardAuthorised_ [AnyKnownUser]
       blogbody <- expectTextPlain
       testLog <- liftIO $ BlobStorage.add store blogbody
-      void $ updateState reportsState $ Acid.SetTestLog pkgid reportId (Just $ TestLog testLog)
+      liftIO $ dbModifyBuildReports pool $ \br ->
+        case BuildReports.setTestLog pkgid reportId (Just $ TestLog testLog) br of
+          Nothing  -> br
+          Just br' -> br'
       noContent (toResponse ())
 
     {-
@@ -554,7 +564,10 @@ buildReportsFeature name
       guardValidPackageId pkgid
       reportId <- reportIdInPath dpath
       guardAuthorised_ [InGroup trusteesGroup]
-      void $ updateState reportsState $ Acid.SetBuildLog pkgid reportId Nothing
+      liftIO $ dbModifyBuildReports pool $ \br ->
+        case BuildReports.setBuildLog pkgid reportId Nothing br of
+          Nothing  -> br
+          Just br' -> br'
       noContent (toResponse ())
 
     deleteTestLog :: DynamicPath -> ServerPartE Response
@@ -563,7 +576,10 @@ buildReportsFeature name
       guardValidPackageId pkgid
       reportId <- reportIdInPath dpath
       guardAuthorised_ [InGroup trusteesGroup]
-      void $ updateState reportsState $ Acid.SetTestLog pkgid reportId Nothing
+      liftIO $ dbModifyBuildReports pool $ \br ->
+        case BuildReports.setTestLog pkgid reportId Nothing br of
+          Nothing  -> br
+          Just br' -> br'
       noContent (toResponse ())
 
     guardAuthorisedAsMaintainerOrTrustee pkgname =
@@ -574,7 +590,10 @@ buildReportsFeature name
       pkgid <- packageInPath dpath
       guardValidPackageId pkgid
       guardAuthorisedAsMaintainerOrTrustee (packageName pkgid)
-      success <- updateState reportsState $ Acid.ResetFailCount pkgid
+      success <- liftIO $ dbModifyBuildReports' pool $ \br ->
+        case BuildReports.resetFailCount pkgid br of
+          Nothing  -> (False, br)
+          Just br' -> (True, br')
       if success
           then seeOther (reportsListUri reportsResource "" pkgid) $ toResponse ()
           else errNotFound "Report not found" [MText "Build report does not exist"]
@@ -593,7 +612,10 @@ buildReportsFeature name
       runTests <- body $ looks "runTests"
       guardValidPackageId pkgid
       guardAuthorisedAsMaintainerOrTrustee (packageName pkgid)
-      success <- updateState reportsState $ Acid.SetRunTests pkgid ("on" `elem` runTests)
+      success <- liftIO $ dbModifyBuildReports' pool $ \br ->
+        case BuildReports.setRunTests pkgid ("on" `elem` runTests) br of
+          Nothing  -> (False, br)
+          Just br' -> (True, br')
       if success
           then seeOther (reportsListUri reportsResource "" pkgid) $ toResponse ()
           else errNotFound "Package not found" [MText "Package does not exist"]
@@ -611,7 +633,7 @@ buildReportsFeature name
           covgBody    = BuildReport.coverageContent buildFiles
           failStatus  = BuildReport.buildFail buildFiles
 
-      updateState reportsState $ Acid.SetFailStatus pkgid failStatus
+      liftIO $ dbModifyBuildReports pool $ BuildReports.setFailStatus pkgid failStatus
 
       -- Upload BuildReport
       case BuildReport.parse $ toStrict $ fromString $ fromMaybe "" reportBody of
@@ -623,8 +645,9 @@ buildReportsFeature name
               report'   <- liftIO $ BuildReport.affixTimestamp report
               logBlob   <- liftIO $ traverse (\x -> BlobStorage.add store $ fromString x) logBody
               testBlob  <- liftIO $ traverse (\x -> BlobStorage.add store $ fromString x) testBody
-              reportId  <- updateState reportsState $
-                                  Acid.AddRptLogTestCovg pkgid (report', (fmap BuildLog logBlob), (fmap TestLog testBlob),  (fmap BuildReport.parseCovg covgBody))
+              reportId  <- liftIO $ dbModifyBuildReports' pool $ \br ->
+                let (br', rid) = BuildReports.addRptLogTestCovg pkgid (report', (fmap BuildLog logBlob), (fmap TestLog testBlob),  (fmap BuildReport.parseCovg covgBody)) br
+                in (rid, br')
               -- redirect to new reports page
               seeOther (reportsPageUri reportsResource "" pkgid reportId) $ toResponse ()
 
