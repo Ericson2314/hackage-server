@@ -24,6 +24,7 @@ import qualified Data.Vector as Vec
 import Distribution.Package (PackageId)
 
 -- hackage
+import Distribution.Server.Features.Core.Db (dbGetPackagesState, dbModifyPackagesState_)
 import Distribution.Server.Features.Core.State
 import Distribution.Server.Features.PackageCandidates.Db (dbGetCandidatePackages, dbModifyCandidates')
 import Distribution.Server.Features.PackageCandidates.State
@@ -45,13 +46,13 @@ import qualified Distribution.Server.Packages.PackageIndex as PackageIndex
 -- This is part of the security feature because this computes the additional
 -- information (SHA hashes) that we need for the TUF target files.
 migratePkgTarball_v1_to_v2 :: ServerEnv
-                           -> StateComponent AcidState PackagesState
+                           -> PgConnection
                            -> IO ()
 migratePkgTarball_v1_to_v2 env@ServerEnv{ serverVerbosity = verbosity }
-                           packagesState
+                           pool
                            = do
     precomputedHashes <- readPrecomputedHashes env
-    PackagesState{packageIndex} <- queryState packagesState GetPackagesState
+    PackagesState{packageIndex} <- dbGetPackagesState pool
     let allPackages = PackageIndex.allPackages packageIndex
         partitionSz = PackageIndex.numPackageVersions packageIndex `div` 10
         partitioned = partition partitionSz allPackages
@@ -61,8 +62,8 @@ migratePkgTarball_v1_to_v2 env@ServerEnv{ serverVerbosity = verbosity }
     loginfo verbosity $ prettyMigrationStats (mconcat stats)
   where
     updatePackage :: PackageId -> PkgInfo -> IO ()
-    updatePackage pkgId pkgInfo = updateState packagesState
-                                $ UpdatePackageInfo pkgId pkgInfo
+    updatePackage pkgId pkgInfo =
+      dbModifyPackagesState_ pool (updatePackageInfo pkgId pkgInfo)
 
     partitionLogMsg :: Int -> Int -> String
     partitionLogMsg i n = "Computing blob info "

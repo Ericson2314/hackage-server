@@ -7,17 +7,23 @@
 {-# LANGUAGE StandaloneDeriving #-}
 {-# LANGUAGE TypeFamilies #-}
 
--- | Beam tables and PostgreSQL load\/save for Core\/PackagesState.
--- Separated from the feature module so that modules like
--- @Security.Migration@ can import it without creating circular
--- dependencies.
+-- | Beam tables and direct PostgreSQL operations for Core/PackagesState.
+-- Separated from the feature module to avoid circular imports with
+-- Security.Migration.
 module Distribution.Server.Features.Core.Db (
-    -- * Load\/Save
+    -- * Direct DB operations
+    dbGetPackagesState,
+    dbPutPackagesState,
+    dbModifyPackagesState,
+    dbModifyPackagesState_,
+
+    -- * Lower-level (used by feature module)
     loadPackagesState,
     savePackagesState,
   ) where
 
 import qualified Distribution.Server.Features.Core.State as Acid
+import Distribution.Server.Framework (PgConnection, runPgTx)
 import Distribution.Server.Framework.PgTx (PgTx, beamTx)
 import Distribution.Server.Framework.BlobStorage (BlobId, blobMd5, readBlobId)
 import Distribution.Server.Features.Security.SHA256 (SHA256Digest)
@@ -373,3 +379,29 @@ savePackagesState st = do
                       (Just (Text.pack fp))
                       (Just (toStrict fd))
                   ]
+
+------------------------------------------------------------------------
+-- Direct database operations
+--
+
+-- | Get packages state from PostgreSQL
+dbGetPackagesState :: PgConnection -> IO Acid.PackagesState
+dbGetPackagesState pool = runPgTx pool loadPackagesState
+
+-- | Write full packages state to PostgreSQL
+dbPutPackagesState :: PgConnection -> Acid.PackagesState -> IO ()
+dbPutPackagesState pool st = runPgTx pool (savePackagesState st)
+
+-- | Read-modify-write helper that returns a value
+dbModifyPackagesState :: PgConnection -> (Acid.PackagesState -> (a, Acid.PackagesState)) -> IO a
+dbModifyPackagesState pool f = do
+  st <- dbGetPackagesState pool
+  let (result, st') = f st
+  dbPutPackagesState pool st'
+  return result
+
+-- | Read-modify-write, no return value
+dbModifyPackagesState_ :: PgConnection -> (Acid.PackagesState -> Acid.PackagesState) -> IO ()
+dbModifyPackagesState_ pool f = do
+  st <- dbGetPackagesState pool
+  dbPutPackagesState pool (f st)

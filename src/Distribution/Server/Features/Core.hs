@@ -26,7 +26,6 @@ module Distribution.Server.Features.Core (
     packageExists,
     packageIdExists,
 
-    packagesStateComponent,
   ) where
 
 -- stdlib
@@ -34,7 +33,7 @@ import qualified Codec.Compression.GZip                             as GZip
 import           Data.Aeson                                         (Value (..), toJSON)
 import qualified Data.Aeson.Key                                     as Key
 import qualified Data.Aeson.KeyMap                                  as KeyMap
-import           Data.ByteString.Lazy                               (LazyByteString, fromStrict, toStrict)
+import           Data.ByteString.Lazy                               (LazyByteString, fromStrict)
 import qualified Data.Foldable                                      as Foldable
 import qualified Data.Text                                          as Text
 import           Data.Time.Clock                                    (UTCTime, getCurrentTime)
@@ -74,17 +73,11 @@ import           Distribution.Version                               (Version, nu
 import           GHC.Generics (Generic)
 import           Database.Beam
 import           Database.Beam.Postgres
-import qualified Database.PostgreSQL.Simple as PG
-import           Control.Concurrent.MVar (swapMVar)
 import qualified Data.ByteString as BS
 import qualified Data.ByteString.Lazy as BSL
 import           Data.Int (Int32, Int64)
 import qualified Data.Map.Strict as Map
 import qualified Data.Sequence as Seq
-
-import           Distribution.Server.Framework.BlobStorage (blobMd5, readBlobId)
-import           Distribution.Server.Util.ReadDigest (readDigest)
-import           Distribution.Parsec (simpleParsec)
 
 -- | The core feature, responsible for the main package index and all access
 -- and modifications of it.
@@ -295,9 +288,6 @@ data CoreResource = CoreResource {
 initCoreFeature :: ServerEnv -> IO (UserFeature -> IO CoreFeature)
 initCoreFeature env@ServerEnv{serverPgConn, serverCacheDelay,
                               serverVerbosity = verbosity} = do
-    -- Canonical state
-    packagesState <- packagesStateComponent verbosity serverPgConn
-
     -- Hooks
     packageChangeHook   <- newHook
     preIndexUpdateHook  <- newHook
@@ -326,16 +316,16 @@ initCoreFeature env@ServerEnv{serverPgConn, serverCacheDelay,
       -- need any other kind of migration.
 
       migrateUpdateLog <- (isLeft . Acid.packageUpdateLog) <$>
-                             queryState packagesState Acid.GetPackagesState
+                             dbGetPackagesState serverPgConn
       when migrateUpdateLog $ do
         -- Migrate Acid.PackagesState (introduce package update log)
         logTiming verbosity "migrating package update log" $ do
           userdb <- queryGetUserDb users
-          updateState packagesState (Acid.MigrateAddUpdateLog userdb)
+          dbModifyPackagesState_ serverPgConn (Acid.migrateAddUpdateLog userdb)
 
         -- Migrate PkgTarball
         logTiming verbosity "migrating PkgTarball" $
-          migratePkgTarball_v1_to_v2 env packagesState
+          migratePkgTarball_v1_to_v2 env serverPgConn
 
         -- Create a checkpoint
         --
@@ -355,7 +345,7 @@ initCoreFeature env@ServerEnv{serverPgConn, serverCacheDelay,
 
       rec let (feature, getIndexTarball)
                 = coreFeature env users
-                              packagesState indexTar
+                              serverPgConn indexTar
                               packageChangeHook
                               preIndexUpdateHook
                               packageDownloadHook
@@ -380,36 +370,15 @@ initCoreFeature env@ServerEnv{serverPgConn, serverCacheDelay,
              PackageChangeAdd _ -> return ()
              _ -> do
                      additionalEntries <- concat <$> runHook preIndexUpdateHook packageChange
-                     forM_ additionalEntries $ updateState packagesState . Acid.AddOtherIndexEntry
+                     forM_ additionalEntries $ \entry ->
+                       dbModifyPackagesState_ serverPgConn (Acid.addOtherIndexEntry entry)
         prodAsyncCache indexTar "package change"
 
       return feature
 
-------------------------------------------------------------------------
-
-packagesStateComponent :: Verbosity -> PgConnection -> IO (StateComponent AcidState Acid.PackagesState)
-packagesStateComponent verbosity conn = do
-  -- Load state
-  st <- logTiming verbosity "Loaded PackagesState" $
-          runPgTx conn loadPackagesState
-
-  pgSt <- mkAcidState conn st savePackagesState
-  return StateComponent {
-       stateDesc    = "Main package database"
-     , stateHandle  = pgSt
-     , getState     = queryPg pgSt (runQueryEvent Acid.GetPackagesState)
-     , putState     = \s -> do
-         runPgTx conn (savePackagesState s)
-         _ <- swapMVar (pgMVar pgSt) s
-         return ()
-     , backupState  = \_ -> indexToAllVersions
-     , restoreState = packagesBackup
-     , resetState   = \_ -> packagesStateComponent verbosity conn
-     }
-
 coreFeature :: ServerEnv
             -> UserFeature
-            -> StateComponent AcidState Acid.PackagesState
+            -> PgConnection
             -> AsyncCache IndexTarballInfo
             -> Hook PackageChange ()
             -> Hook PackageChange [TarIndexEntry]
@@ -418,7 +387,7 @@ coreFeature :: ServerEnv
                , IO IndexTarballInfo )
 
 coreFeature ServerEnv{serverBlobStore = store} UserFeature{..}
-            packagesState cacheIndexTarball
+            pool cacheIndexTarball
             packageChangeHook
             preIndexUpdateHook
             packageDownloadHook
@@ -441,7 +410,7 @@ coreFeature ServerEnv{serverBlobStore = store} UserFeature{..}
           , coreAdminDeauth
           , corePackUserDeauth
           ]
-      , featureState    = [abstractAcidStateComponent packagesState]
+      , featureState    = []  -- no AcidState; data lives in PostgreSQL
       , featureCaches   = [
             CacheComponent {
               cacheDesc       = "main package index tarball",
@@ -538,7 +507,7 @@ coreFeature ServerEnv{serverBlobStore = store} UserFeature{..}
     -- Queries
     --
     queryGetPackageIndex :: MonadIO m => m (PackageIndex PkgInfo)
-    queryGetPackageIndex = Acid.packageIndex <$> queryState packagesState Acid.GetPackagesState
+    queryGetPackageIndex = Acid.packageIndex <$> liftIO (dbGetPackagesState pool)
 
     queryGetIndexTarballInfo :: MonadIO m => m IndexTarballInfo
     queryGetIndexTarballInfo = readAsyncCache cacheIndexTarball
@@ -559,8 +528,8 @@ coreFeature ServerEnv{serverBlobStore = store} UserFeature{..}
       let pkginfo = Acid.mkPackageInfo pkgid cabalFile uploadinfo mtarball
       additionalEntries <- concat `liftM` runHook preIndexUpdateHook  (PackageChangeAdd pkginfo)
 
-      successFlag <- updateState packagesState $
-        Acid.AddPackage3
+      successFlag <- liftIO $ dbModifyPackagesState pool $
+        Acid.addPackage3
           pkginfo
           uploadinfo
           (userName userInfo)
@@ -574,7 +543,7 @@ coreFeature ServerEnv{serverBlobStore = store} UserFeature{..}
 
     updateDeletePackage :: MonadIO m => PackageId -> m Bool
     updateDeletePackage pkgid = logTiming maxBound ("updateDeletePackage " ++ display pkgid) $ do
-      mpkginfo <- updateState packagesState (Acid.DeletePackage pkgid)
+      mpkginfo <- liftIO $ dbModifyPackagesState pool (Acid.deletePackage pkgid)
       case mpkginfo of
         Nothing -> return False
         Just pkginfo -> do
@@ -585,8 +554,8 @@ coreFeature ServerEnv{serverBlobStore = store} UserFeature{..}
     updateAddPackageRevision pkgid cabalfile uploadinfo@(_, uid) = logTiming maxBound ("updateAddPackageRevision " ++ display pkgid) $ do
       usersdb <- queryGetUserDb
       let Just userInfo = lookupUserId uid usersdb
-      (moldpkginfo, newpkginfo) <- updateState packagesState $
-        Acid.AddPackageRevision2
+      (moldpkginfo, newpkginfo) <- liftIO $ dbModifyPackagesState pool $
+        Acid.addPackageRevision2
           pkgid
           cabalfile
           uploadinfo
@@ -600,7 +569,7 @@ coreFeature ServerEnv{serverBlobStore = store} UserFeature{..}
 
     updateAddPackageTarball :: MonadIO m => PackageId -> PkgTarball -> OldUploadInfo -> m Bool
     updateAddPackageTarball pkgid tarball uploadinfo = logTiming maxBound ("updateAddPackageTarball " ++ display pkgid) $ do
-      mpkginfo <- updateState packagesState (Acid.AddPackageTarball pkgid tarball uploadinfo)
+      mpkginfo <- liftIO $ dbModifyPackagesState pool (Acid.addPackageTarball pkgid tarball uploadinfo)
 
       case mpkginfo of
         Nothing -> return False
@@ -610,7 +579,7 @@ coreFeature ServerEnv{serverBlobStore = store} UserFeature{..}
 
     updateSetPackageUploader :: MonadIO m => PackageId -> UserId -> m Bool
     updateSetPackageUploader pkgid userid = do
-      mpkginfo <- updateState packagesState (Acid.SetPackageUploader pkgid userid)
+      mpkginfo <- liftIO $ dbModifyPackagesState pool (Acid.setPackageUploader pkgid userid)
       case mpkginfo of
         Nothing -> return False
         Just (oldpkginfo, newpkginfo) -> do
@@ -619,7 +588,7 @@ coreFeature ServerEnv{serverBlobStore = store} UserFeature{..}
 
     updateSetPackageUploadTime :: MonadIO m => PackageId -> UTCTime -> m Bool
     updateSetPackageUploadTime pkgid time = do
-      mpkginfo <- updateState packagesState (Acid.SetPackageUploadTime pkgid time)
+      mpkginfo <- liftIO $ dbModifyPackagesState pool (Acid.setPackageUploadTime pkgid time)
       case mpkginfo of
         Nothing -> return False
         Just (oldpkginfo, newpkginfo) -> do
@@ -628,8 +597,8 @@ coreFeature ServerEnv{serverBlobStore = store} UserFeature{..}
 
     updateArchiveIndexEntry :: MonadIO m => FilePath -> LazyByteString -> UTCTime -> m ()
     updateArchiveIndexEntry entryName entryData entryTime = logTiming maxBound ("updateArchiveIndexEntry " ++ show entryName) $ do
-      updateState packagesState $
-        Acid.AddOtherIndexEntry $ ExtraEntry entryName entryData entryTime
+      liftIO $ dbModifyPackagesState_ pool $
+        Acid.addOtherIndexEntry $ ExtraEntry entryName entryData entryTime
       runHook_ packageChangeHook (PackageChangeIndexExtra entryName entryData entryTime)
 
     -- Cache updates
@@ -638,7 +607,7 @@ coreFeature ServerEnv{serverBlobStore = store} UserFeature{..}
     getIndexTarball = do
       users <- queryGetUserDb  -- note, changes here don't automatically propagate
       time  <- getCurrentTime
-      Acid.PackagesState index (Right updateSeq) <- queryState packagesState Acid.GetPackagesState
+      Acid.PackagesState index (Right updateSeq) <- liftIO (dbGetPackagesState pool)
       let updateLog     = Foldable.toList updateSeq
           legacyTarball = Packages.Index.writeLegacy
                             users
