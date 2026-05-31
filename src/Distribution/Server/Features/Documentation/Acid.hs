@@ -13,30 +13,30 @@ module Distribution.Server.Features.Documentation.Acid
 import qualified Distribution.Server.Features.Documentation.State as State
 import qualified Distribution.Server.Features.Documentation.Store as Store
 import Distribution.Server.Framework
-import Distribution.Server.Framework.BlobStorage (blobMd5, readBlobId)
+import Distribution.Server.Framework.BlobStorage (BlobId, blobMd5, readBlobId)
 
-import Distribution.Package (PackageIdentifier(..))
+import Distribution.Package (PackageIdentifier(..), PackageId)
 import Distribution.Text (display, simpleParse)
 import Data.List (foldl')
+import Data.Maybe (isJust)
 import qualified Data.Map as Map
 import qualified Data.Text as T
 import GHC.Generics (Generic)
 import Database.Beam
+import Database.Beam.Backend.SQL.BeamExtensions (insertOnConflict, conflictingFields, onConflictUpdateAll)
 import Database.Beam.Postgres
-import Control.Concurrent.MVar (swapMVar)
 
 acidStore :: String -> PgConnection -> IO Store.Backend
-acidStore name serverPgConn = do
-  documentationState <- documentationStateComponent name serverPgConn
+acidStore _name pool =
   pure Store.Backend {
       Store.backendStore = Store.Store {
-          Store.hasDocumentation = \pkgid -> queryState documentationState (State.HasDocumentation pkgid)
-        , Store.lookupDocumentation = \pkgid -> queryState documentationState (State.LookupDocumentation pkgid)
-        , Store.getDocumentationIndex = State.documentation <$> queryState documentationState State.GetDocumentation
-        , Store.insertDocumentation = \pkgid blobid -> updateState documentationState (State.InsertDocumentation pkgid blobid)
-        , Store.removeDocumentation = \pkgid -> updateState documentationState (State.RemoveDocumentation pkgid)
+          Store.hasDocumentation = liftIO . dbHasDocumentation pool
+        , Store.lookupDocumentation = liftIO . dbLookupDocumentation pool
+        , Store.getDocumentationIndex = liftIO $ dbGetDocumentationIndex pool
+        , Store.insertDocumentation = \pkgid blobid -> liftIO $ dbInsertDocumentation pool pkgid blobid
+        , Store.removeDocumentation = liftIO . dbRemoveDocumentation pool
         }
-    , Store.backendState = [abstractAcidStateComponent documentationState]
+    , Store.backendState = []  -- no AcidState; data lives in PostgreSQL
     }
 
 ------------------------------------------------------------------------
@@ -104,21 +104,58 @@ chunksOf :: Int -> [a] -> [[a]]
 chunksOf _ [] = []
 chunksOf n xs = let (h, t) = splitAt n xs in h : chunksOf n t
 
+
 ------------------------------------------------------------------------
+-- Direct database operations (no MVar, no event sourcing)
+--
 
-documentationStateComponent :: String -> PgConnection -> IO (StateComponent AcidState State.Documentation)
-documentationStateComponent name serverPgConn = do
-  -- Load state
-  loaded <- runPgTx serverPgConn loadDocumentation
+-- | Lookup documentation blob for a package
+dbLookupDocumentation :: PgConnection -> PackageIdentifier -> IO (Maybe BlobId)
+dbLookupDocumentation pool pkgid = do
+  rows <- runBeamPg pool $
+    runSelectReturningList $ select $
+      filter_ (\r -> _drPkgName r ==. val_ (T.pack $ display (pkgName pkgid))
+                 &&. _drPkgVersion r ==. val_ (T.pack $ display (pkgVersion pkgid))) $
+      all_ docTable
+  return $ case rows of
+    (DocRow _ _ blobHex : _) ->
+      case readBlobId (T.unpack blobHex) of
+        Right blobId -> Just blobId
+        Left _       -> Nothing
+    [] -> Nothing
 
-  pgSt <- mkAcidState serverPgConn loaded saveDocumentation
-  return StateComponent {
-      stateDesc    = "Package documentation"
-    , stateHandle  = pgSt
-    , getState     = queryPg pgSt (runQueryEvent State.GetDocumentation)
-    , putState     = \s -> do
-        runPgTx serverPgConn (saveDocumentation s)
-        _ <- swapMVar (pgMVar pgSt) s
-        return ()
-    }
+-- | Check if documentation exists for a package
+dbHasDocumentation :: PgConnection -> PackageIdentifier -> IO Bool
+dbHasDocumentation pool pkgid = isJust <$> dbLookupDocumentation pool pkgid
 
+-- | Get all documentation as a map
+dbGetDocumentationIndex :: PgConnection -> IO (Map.Map PackageId BlobId)
+dbGetDocumentationIndex pool = do
+  rows <- runBeamPg pool $
+    runSelectReturningList $ select $ all_ docTable
+  let addRow m (DocRow name ver blobHex) =
+        case (simpleParse (T.unpack name), simpleParse (T.unpack ver), readBlobId (T.unpack blobHex)) of
+          (Just pkgName, Just pkgVer, Right blobId) ->
+            Map.insert (PackageIdentifier pkgName pkgVer) blobId m
+          _ -> m
+  return $ foldl' addRow Map.empty rows
+
+-- | Insert or replace documentation for a package
+dbInsertDocumentation :: PgConnection -> PackageIdentifier -> BlobId -> IO ()
+dbInsertDocumentation pool pkgid blobid =
+  runBeamPg pool $
+    runInsert $ insertOnConflict docTable
+      (insertValues
+        [DocRow (T.pack $ display (pkgName pkgid))
+                (T.pack $ display (pkgVersion pkgid))
+                (T.pack $ blobMd5 blobid)])
+      (conflictingFields primaryKey)
+      onConflictUpdateAll
+
+-- | Remove documentation for a package
+dbRemoveDocumentation :: PgConnection -> PackageIdentifier -> IO ()
+dbRemoveDocumentation pool pkgid =
+  runBeamPg pool $
+    runDelete $ delete docTable
+      (\r -> _drPkgName r ==. val_ (T.pack $ display (pkgName pkgid))
+         &&. _drPkgVersion r ==. val_ (T.pack $ display (pkgVersion pkgid)))
