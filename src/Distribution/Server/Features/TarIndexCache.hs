@@ -40,9 +40,8 @@ import Data.List (foldl')
 
 import GHC.Generics (Generic)
 import Database.Beam
+import Database.Beam.Backend.SQL.BeamExtensions (insertOnConflict, conflictingFields, onConflictUpdateAll)
 import Database.Beam.Postgres
-import Control.Concurrent.MVar (swapMVar)
-import qualified Database.PostgreSQL.Simple as PG
 
 data TarIndexCacheFeature = TarIndexCacheFeature {
     tarIndexCacheFeatureInterface :: HackageFeature
@@ -60,10 +59,8 @@ initTarIndexCacheFeature :: ServerEnv
                          -> IO (UserFeature
                              -> IO TarIndexCacheFeature)
 initTarIndexCacheFeature env@ServerEnv{serverPgConn} = do
-    tarIndexCache <- tarIndexCacheStateComponent serverPgConn
-
     return $ \users -> do
-      let feature = tarIndexCacheFeature env users tarIndexCache
+      let feature = tarIndexCacheFeature env serverPgConn users
       return feature
 
 ------------------------------------------------------------------------
@@ -98,9 +95,37 @@ tarIndexDb = defaultDbSettings `withDbModification`
 tarIndexTable :: DatabaseEntity Postgres TarIndexDb (TableEntity TarIndexRowT)
 tarIndexTable = _tarIndexRows tarIndexDb
 
-loadTarIndexCache :: PgTx Acid.TarIndexCache
-loadTarIndexCache = do
-  rows <- beamTx $
+------------------------------------------------------------------------
+-- Direct database operations (no MVar, no event sourcing)
+--
+
+-- | Find a cached tar index blob ID for a tarball blob ID
+dbFindTarIndex :: PgConnection -> BlobId -> IO (Maybe BlobId)
+dbFindTarIndex pool tarBlobId = do
+  rows <- runBeamPg pool $
+    runSelectReturningList $ select $
+      filter_ (\r -> _tiTarballBlobId r ==. val_ (T.pack $ blobMd5 tarBlobId)) $
+      all_ tarIndexTable
+  return $ case rows of
+    (TarIndexRow _ idxHex : _) ->
+      case readBlobId (T.unpack idxHex) of
+        Right idxId -> Just idxId
+        Left _      -> Nothing
+    [] -> Nothing
+
+-- | Set a cached tar index mapping
+dbSetTarIndex :: PgConnection -> BlobId -> BlobId -> IO ()
+dbSetTarIndex pool tarBlobId idxBlobId =
+  runBeamPg pool $
+    runInsert $ insertOnConflict tarIndexTable
+      (insertValues [TarIndexRow (T.pack $ blobMd5 tarBlobId) (T.pack $ blobMd5 idxBlobId)])
+      (conflictingFields primaryKey)
+      onConflictUpdateAll
+
+-- | Get all cached tar index mappings (for status display)
+dbGetTarIndexCache :: PgConnection -> IO Acid.TarIndexCache
+dbGetTarIndexCache pool = do
+  rows <- runBeamPg pool $
     runSelectReturningList $ select $ all_ tarIndexTable
   let addRow m (TarIndexRow tarHex idxHex) =
         case (readBlobId (T.unpack tarHex), readBlobId (T.unpack idxHex)) of
@@ -108,53 +133,27 @@ loadTarIndexCache = do
           _ -> m  -- skip unparseable rows
   return $ Acid.TarIndexCache $ foldl' addRow Map.empty rows
 
-saveTarIndexCache :: Acid.TarIndexCache -> PgTx ()
-saveTarIndexCache (Acid.TarIndexCache cache) = do
-    beamTx $ runDelete $ delete tarIndexTable (\_ -> val_ True)
-    let rows = [ TarIndexRow (T.pack $ blobMd5 tarId) (T.pack $ blobMd5 idxId)
-               | (tarId, idxId) <- Map.toList cache ]
-    mapM_ insertTarIndexChunk (chunksOf 1000 rows)
-
-insertTarIndexChunk :: [TarIndexRowT Identity] -> PgTx ()
-insertTarIndexChunk chunk =
-    beamTx $ runInsert $ insert tarIndexTable $ insertValues chunk
+-- | Clear all cached tar index mappings
+dbClearTarIndexCache :: PgConnection -> IO ()
+dbClearTarIndexCache pool =
+  runBeamPg pool $
+    runDelete $ delete tarIndexTable (\_ -> val_ True)
 
 chunksOf :: Int -> [a] -> [[a]]
 chunksOf _ [] = []
 chunksOf n xs = let (h, t) = splitAt n xs in h : chunksOf n t
 
 ------------------------------------------------------------------------
-
-tarIndexCacheStateComponent :: PgConnection -> IO (StateComponent AcidState Acid.TarIndexCache)
-tarIndexCacheStateComponent conn = do
-  -- Load state
-  loaded <- runPgTx conn loadTarIndexCache
-
-  pgSt <- mkAcidState conn loaded saveTarIndexCache
-  return StateComponent {
-      stateDesc    = "Mapping from tarball blob IDs to tarindex blob IDs"
-    , stateHandle  = pgSt
-    , getState     = queryPg pgSt (runQueryEvent Acid.GetTarIndexCache)
-    , putState     = \s -> do
-        runPgTx conn (saveTarIndexCache s)
-        _ <- swapMVar (pgMVar pgSt) s
-        return ()
-    , resetState   = \_ -> tarIndexCacheStateComponent conn
-    -- We don't backup the tar indices, but reconstruct them on demand
-    , backupState  = \_ _ -> []
-    , restoreState = RestoreBackup {
-                         restoreEntry    = error "The impossible happened"
-                       , restoreFinalize = return Acid.initialTarIndexCache
-                       }
-    }
+-- Feature
+--
 
 tarIndexCacheFeature :: ServerEnv
+                     -> PgConnection
                      -> UserFeature
-                     -> StateComponent AcidState Acid.TarIndexCache
                      -> TarIndexCacheFeature
 tarIndexCacheFeature ServerEnv{serverBlobStore = store}
-                     UserFeature{..}
-                     tarIndexCache =
+                     pool
+                     UserFeature{..} =
    TarIndexCacheFeature{..}
   where
     tarIndexCacheFeatureInterface :: HackageFeature
@@ -164,7 +163,7 @@ tarIndexCacheFeature ServerEnv{serverBlobStore = store}
         -- (TODO: We could potentially check that if a package occurs in both
         -- packages then both caches point to identical tar indices, but for
         -- that we would need to be in IO)
-      , featureState = [abstractAcidStateComponent' (\_ _ -> []) tarIndexCache]
+      , featureState = []  -- no AcidState; data lives in PostgreSQL
       , featureResources = [
             (resourceAt "/server-status/tarindices.:format") {
                 resourceDesc   = [ (GET,    "Which tar indices have been generated?")
@@ -179,7 +178,7 @@ tarIndexCacheFeature ServerEnv{serverBlobStore = store}
     -- This is the heart of this feature
     cachedTarIndex :: BlobId -> IO TarIndex
     cachedTarIndex tarBallBlobId = do
-      mTarIndexBlobId <- queryState tarIndexCache (Acid.FindTarIndex tarBallBlobId)
+      mTarIndexBlobId <- dbFindTarIndex pool tarBallBlobId
       case mTarIndexBlobId of
         Just tarIndexBlobId -> do
           serializedTarIndex <- fetch store tarIndexBlobId
@@ -192,7 +191,7 @@ tarIndexCacheFeature ServerEnv{serverBlobStore = store}
                               Left  err      -> throwIO (userError err)
                               Right tarIndex -> return tarIndex
           tarIndexBlobId <- add store (runPutLazy (safePut tarIndex))
-          updateState tarIndexCache (Acid.SetTarIndex tarBallBlobId tarIndexBlobId)
+          dbSetTarIndex pool tarBallBlobId tarIndexBlobId
           return tarIndex
 
     cachedPackageTarIndex :: PkgTarball -> IO TarIndex
@@ -200,7 +199,7 @@ tarIndexCacheFeature ServerEnv{serverBlobStore = store}
 
     serveTarIndicesStatus :: ServerPartE Response
     serveTarIndicesStatus = do
-      Acid.TarIndexCache state <- liftIO $ getState tarIndexCache
+      Acid.TarIndexCache state <- liftIO $ dbGetTarIndexCache pool
       return . toResponse . toJSON . Map.toList $ state
 
     -- | With curl:
@@ -211,7 +210,7 @@ tarIndexCacheFeature ServerEnv{serverBlobStore = store}
       guardAuthorised_ [InGroup adminGroup]
       -- TODO: This resets the tar indices _state_ only, we don't actually
       -- remove any blobs
-      liftIO $ putState tarIndexCache Acid.initialTarIndexCache
+      liftIO $ dbClearTarIndexCache pool
       ok $ toResponse "Ok!"
 
     -- Functions to access specific files in a tarball
