@@ -1,26 +1,26 @@
-{-# LANGUAGE MultiParamTypeClasses, FlexibleInstances, DeriveAnyClass, DeriveGeneric, DerivingStrategies, DeriveDataTypeable, GeneralizedNewtypeDeriving,
-             TypeFamilies, TemplateHaskell,
-             RankNTypes, NamedFieldPuns, RecordWildCards, BangPatterns,
-             DefaultSignatures, OverloadedStrings #-}
+{-# LANGUAGE DeriveDataTypeable #-}
+{-# LANGUAGE DerivingStrategies #-}
+{-# LANGUAGE FlexibleInstances #-}
+{-# LANGUAGE MultiParamTypeClasses #-}
+{-# LANGUAGE NamedFieldPuns #-}
+{-# LANGUAGE OverloadedStrings #-}
+{-# LANGUAGE RecordWildCards #-}
+{-# LANGUAGE TemplateHaskell #-}
+{-# LANGUAGE TypeFamilies #-}
 module Distribution.Server.Features.UserNotify.Acid where
 
 import Distribution.Server.Features.UserNotify.Types
-import Prelude hiding (lookup)
 
 import Distribution.Server.Users.Types (UserId)
 
-import Distribution.Server.Framework
+import Distribution.Server.Framework.MemSize
 
 import qualified Data.Map as Map
 
-import Control.Monad.Reader (ask)
-import Control.Monad.State (get, put)
-import Data.Time (UTCTime(..), getCurrentTime)
+import Data.Time (UTCTime, getCurrentTime)
 import qualified Data.Text as T
 import Database.Beam.Backend.SQL (HasSqlValueSyntax(..))
 import Database.Beam.Postgres.Syntax (PgValueSyntax)
-import Distribution.Server.Framework.EventSourcing (Query, Update, makeAcidic)
-import Distribution.Server.Framework.BeamInstances ()
 import Data.SafeCopy (Migrate(..), base, extension, deriveSafeCopy)
 
 
@@ -89,45 +89,5 @@ instance Migrate NotifyPref where
 
 $(deriveSafeCopy 1 'extension ''NotifyPref)
 $(deriveSafeCopy 0 'base ''NotifyData)
-
-------------------------------
--- State queries and updates
---
-
-getNotifyData :: Query NotifyData NotifyData
-getNotifyData = ask
-
-replaceNotifyData :: NotifyData -> Update NotifyData ()
-replaceNotifyData = put
-
-getNotifyTime :: Query NotifyData UTCTime
-getNotifyTime = fmap (snd . unNotifyData) ask
-
-setNotifyTime :: UTCTime -> Update NotifyData ()
-setNotifyTime t = do
-    NotifyData (m,_) <- get
-    put $! NotifyData (m,t)
-
-lookupNotifyPref :: UserId -> Query NotifyData (Maybe NotifyPref)
-lookupNotifyPref uid = do
-    NotifyData (m,_) <- ask
-    return $! Map.lookup uid m
-
-addNotifyPref :: UserId -> NotifyPref -> Update NotifyData ()
-addNotifyPref uid info = do
-    NotifyData (m,t) <- get
-    put $! NotifyData (Map.insert uid info m,t)
-
-$(makeAcidic ''NotifyData [
-    -- queries
-    'getNotifyData,
-    'lookupNotifyPref,
-    'getNotifyTime,
-    -- updates
-    'replaceNotifyData,
-    'addNotifyPref,
-    'setNotifyTime
-  ])
-
 
 instance HasSqlValueSyntax PgValueSyntax NotifyPref where sqlValueSyntax = sqlValueSyntax . T.pack . show

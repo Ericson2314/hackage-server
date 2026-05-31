@@ -8,8 +8,7 @@
 {-# LANGUAGE StandaloneDeriving #-}
 {-# LANGUAGE TypeFamilies #-}
 module Distribution.Server.Features.UserNotify.Acid.Component
-  ( notifyStateComponent
-  , acidStore
+  ( acidStore
   ) where
 
 import qualified Distribution.Server.Features.UserNotify.Acid as Acid
@@ -26,21 +25,20 @@ import Data.Time (UTCTime)
 import Data.Int (Int32)
 import GHC.Generics (Generic)
 import Database.Beam hiding (insert, delete, select)
+import Database.Beam.Backend.SQL.BeamExtensions (insertOnConflict, conflictingFields, onConflictUpdateAll)
 import qualified Database.Beam as Beam
 import Database.Beam.Postgres
-import Control.Concurrent.MVar (swapMVar)
 
 acidStore :: PgConnection -> IO Store.Backend
-acidStore pgConn = do
-  notifyState <- notifyStateComponent pgConn
+acidStore pool =
   pure Store.Backend {
       Store.backendStore = Store.Store {
-          Store.lookupNotifyPref = \uid -> queryState notifyState (Acid.LookupNotifyPref uid)
-        , Store.addNotifyPref = \uid pref -> updateState notifyState (Acid.AddNotifyPref uid pref)
-        , Store.getNotificationData = Acid.unNotifyData <$> queryState notifyState Acid.GetNotifyData
-        , Store.setNotifyTime = \time -> updateState notifyState (Acid.SetNotifyTime time)
+          Store.lookupNotifyPref = liftIO . dbLookupNotifyPref pool
+        , Store.addNotifyPref = \uid pref -> liftIO $ dbAddNotifyPref pool uid pref
+        , Store.getNotificationData = liftIO $ Acid.unNotifyData <$> dbGetNotifyData pool
+        , Store.setNotifyTime = liftIO . dbSetNotifyTime pool
         }
-    , Store.backendState = [abstractAcidStateComponent notifyState]
+    , Store.backendState = []  -- no AcidState; data lives in PostgreSQL
     }
 
 ----------------------------
@@ -186,30 +184,63 @@ notifyChunksOf n xs = let (h, t) = splitAt n xs in h : notifyChunksOf n t
 -- State Component
 --
 
-notifyStateComponent :: PgConnection -> IO (StateComponent AcidState Acid.NotifyData)
-notifyStateComponent serverPgConn = do
-  -- Seed the meta table if empty
-  initData <- Acid.emptyNotifyData
-  metaRows <- runBeamPg serverPgConn $
+
+------------------------------------------------------------------------
+-- Direct database operations (no MVar, no event sourcing)
+--
+
+-- | Lookup a user's notification preference
+dbLookupNotifyPref :: PgConnection -> UserId -> IO (Maybe Acid.NotifyPref)
+dbLookupNotifyPref pool (UserId uid) = do
+  rows <- runBeamPg pool $
+    runSelectReturningList $ Beam.select $
+      filter_ (\r -> _npUserId r ==. val_ (fromIntegral uid)) $
+      all_ notifyPrefsTable
+  return $ case rows of
+    (r : _) -> Just (snd (rowToNotifyPref r))
+    []      -> Nothing
+
+-- | Add or update a user's notification preference
+dbAddNotifyPref :: PgConnection -> UserId -> Acid.NotifyPref -> IO ()
+dbAddNotifyPref pool uid pref =
+  runBeamPg pool $
+    runInsert $ insertOnConflict notifyPrefsTable
+      (insertValues [notifyPrefToRow uid pref])
+      (conflictingFields primaryKey)
+      onConflictUpdateAll
+
+-- | Get all notify data (prefs + last notify time)
+dbGetNotifyData :: PgConnection -> IO Acid.NotifyData
+dbGetNotifyData pool = runPgTx pool $ do
+  prefRows <- beamTx $
+    runSelectReturningList $ Beam.select $ all_ notifyPrefsTable
+  metaRows <- beamTx $
     runSelectReturningList $ Beam.select $ all_ notifyMetaTable
-  case metaRows of
-    [] -> do
-      let Acid.NotifyData (_, initTime) = initData
-      runBeamPg serverPgConn $
-        runInsert $ Beam.insert notifyMetaTable $ insertValues
-          [NotifyMetaRow 1 initTime]
-    _ -> return ()
+  let prefs = Map.fromList $ map rowToNotifyPref prefRows
+      lastTime = case metaRows of
+        (NotifyMetaRow _ t : _) -> t
+        [] -> error "user_notify__meta table empty"
+  return $ Acid.NotifyData (prefs, lastTime)
 
-  -- Load state
-  st <- runPgTx serverPgConn loadNotifyData
+-- | Set the last notification time
+dbSetNotifyTime :: PgConnection -> UTCTime -> IO ()
+dbSetNotifyTime pool t =
+  runBeamPg pool $
+    runUpdate $ Beam.update notifyMetaTable
+      (\r -> _nmLastTime r <-. val_ t)
+      (\_ -> val_ True)
 
-  pgSt <- mkAcidState serverPgConn st saveNotifyData
-  return StateComponent {
-      stateDesc    = "State to keep track of revision notifications"
-    , stateHandle  = pgSt
-    , getState     = queryPg pgSt (runQueryEvent Acid.GetNotifyData)
-    , putState     = \s -> do
-        runPgTx serverPgConn (saveNotifyData s)
-        _ <- swapMVar (pgMVar pgSt) s
-        return ()
-    }
+-- | Write full state to DB (for backup restore)
+dbPutNotifyData :: PgConnection -> Acid.NotifyData -> IO ()
+dbPutNotifyData pool (Acid.NotifyData (prefs, lastTime)) =
+  runPgTx pool $ do
+    beamTx $ do
+      runDelete $ Beam.delete notifyPrefsTable (\_ -> val_ True)
+      runDelete $ Beam.delete notifyMetaTable (\_ -> val_ True)
+    let rows = [ notifyPrefToRow uid pref | (uid, pref) <- Map.toList prefs ]
+    mapM_ (\chunk -> beamTx $
+      runInsert $ Beam.insert notifyPrefsTable $ insertValues chunk) (notifyChunksOf 1000 rows)
+    beamTx $
+      runInsert $ Beam.insert notifyMetaTable $ insertValues
+        [NotifyMetaRow 1 lastTime]
+

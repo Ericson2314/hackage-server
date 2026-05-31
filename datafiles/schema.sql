@@ -555,9 +555,6 @@ CREATE TABLE IF NOT EXISTS tar_index_cache_set_tar_index (id BIGSERIAL PRIMARY K
 
 
 
--- UserNotify events
-CREATE TABLE IF NOT EXISTS notify_data_add_notify_pref (id BIGSERIAL PRIMARY KEY, arg0 TEXT NOT NULL, arg1 TEXT NOT NULL);
-CREATE TABLE IF NOT EXISTS notify_data_set_notify_time (id BIGSERIAL PRIMARY KEY, arg0 TEXT NOT NULL);
 
 -- UserSignup events
 CREATE TABLE IF NOT EXISTS signup_reset_table_add_signup_reset_info (id BIGSERIAL PRIMARY KEY, arg0 TEXT NOT NULL, arg1 TEXT NOT NULL);
