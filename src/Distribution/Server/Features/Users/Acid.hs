@@ -8,7 +8,6 @@
 {-# LANGUAGE TypeFamilies #-}
 module Distribution.Server.Features.Users.Acid
   ( usersStateComponent
-  , adminsStateComponent
   , acidStore
   ) where
 
@@ -36,7 +35,6 @@ import GHC.Generics (Generic)
 acidStore :: PgConnection -> IO Store.Backend
 acidStore serverPgConn = do
   usersState <- usersStateComponent serverPgConn
-  adminsState <- adminsStateComponent serverPgConn
   let withUsers :: MonadIO m => (Acid.Users -> a) -> m a
       withUsers f = f <$> queryState usersState Acid.GetUserDb
   pure Store.Backend {
@@ -62,12 +60,12 @@ acidStore serverPgConn = do
         , Store.setUserAuth = \uid auth -> updateState usersState (Acid.SetUserAuth uid auth)
         , Store.addAuthToken = \uid token description -> updateState usersState (Acid.AddAuthToken uid token description)
         , Store.revokeAuthToken = \uid token -> updateState usersState (Acid.RevokeAuthToken uid token)
-        , Store.getAdminList = queryState adminsState Acid.GetAdminList
-        , Store.addAdmin = updateState adminsState . Acid.AddHackageAdmin
-        , Store.removeAdmin = updateState adminsState . Acid.RemoveHackageAdmin
+        , Store.getAdminList = liftIO $ dbGetAdminList serverPgConn
+        , Store.addAdmin = liftIO . dbAddHackageAdmin serverPgConn
+        , Store.removeAdmin = liftIO . dbRemoveHackageAdmin serverPgConn
         }
     , Store.backendState = [ abstractAcidStateComponent usersState
-                           , abstractAcidStateComponent adminsState
+                             -- HackageAdmins lives directly in PostgreSQL, no AcidState
                            ]
     }
 
@@ -226,20 +224,6 @@ saveUsers users = do
 ------------------------------------------------------------------------
 -- Load/save Admins
 
-loadAdmins :: PgTx Acid.HackageAdmins
-loadAdmins = do
-  rows <- beamTx $
-    runSelectReturningList $ select $ all_ adminsTable
-  let uids = [ UserId (fromIntegral uid) | AdminRow uid <- rows ]
-  return $ Acid.HackageAdmins (Group.fromList uids)
-
-saveAdmins :: Acid.HackageAdmins -> PgTx ()
-saveAdmins (Acid.HackageAdmins admins) = do
-    beamTx $ runDelete $ delete adminsTable (\_ -> val_ True)
-    let rows = [ AdminRow (fromIntegral uid) | UserId uid <- Group.toList admins ]
-    mapM_ (\chunk -> beamTx $
-      runInsert $ insert adminsTable $ insertValues chunk) (chunksOf 1000 rows)
-
 chunksOf :: Int -> [a] -> [[a]]
 chunksOf _ [] = []
 chunksOf n xs = let (h, t) = splitAt n xs in h : chunksOf n t
@@ -261,18 +245,22 @@ usersStateComponent serverPgConn = do
         return ()
     }
 
-adminsStateComponent :: PgConnection -> IO (StateComponent AcidState Acid.HackageAdmins)
-adminsStateComponent serverPgConn = do
-  st <- runPgTx serverPgConn loadAdmins
 
-  pgSt <- mkAcidState serverPgConn st saveAdmins
-  return StateComponent {
-      stateDesc    = "Admins"
-    , stateHandle  = pgSt
-    , getState     = queryPg pgSt (runQueryEvent Acid.GetHackageAdmins)
-    , putState     = \s -> do
-        runPgTx serverPgConn (saveAdmins s)
-        _ <- swapMVar (pgMVar pgSt) s
-        return ()
-    }
+-- | Get admin user IDs directly from PostgreSQL
+dbGetAdminList :: PgConnection -> IO Group.UserIdSet
+dbGetAdminList pool = do
+  rows <- runBeamPg pool $ runSelectReturningList $ select $ all_ adminsTable
+  return $ Group.fromList [ UserId (fromIntegral uid) | AdminRow uid <- rows ]
+
+-- | Add an admin
+dbAddHackageAdmin :: PgConnection -> UserId -> IO ()
+dbAddHackageAdmin pool (UserId uid) =
+  runBeamPg pool $ runInsert $ insert adminsTable $ insertValues
+    [AdminRow (fromIntegral uid)]
+
+-- | Remove an admin
+dbRemoveHackageAdmin :: PgConnection -> UserId -> IO ()
+dbRemoveHackageAdmin pool (UserId uid) =
+  runBeamPg pool $ runDelete $ delete adminsTable
+    (\r -> _adUserId r ==. val_ (fromIntegral uid))
 
