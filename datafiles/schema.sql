@@ -544,10 +544,6 @@ CREATE TABLE IF NOT EXISTS tag_alias_add_tag_alias (id BIGSERIAL PRIMARY KEY, ar
 
 
 
--- PreferredVersions events
-CREATE TABLE IF NOT EXISTS preferred_versions_set_preferred_ranges (id BIGSERIAL PRIMARY KEY, arg0 TEXT NOT NULL, arg1 TEXT NOT NULL);
-CREATE TABLE IF NOT EXISTS preferred_versions_set_deprecated_versions (id BIGSERIAL PRIMARY KEY, arg0 TEXT NOT NULL, arg1 TEXT NOT NULL);
-CREATE TABLE IF NOT EXISTS preferred_versions_set_deprecated_for (id BIGSERIAL PRIMARY KEY, arg0 TEXT NOT NULL, arg1 TEXT NOT NULL);
 
 -- Distro events
 CREATE TABLE IF NOT EXISTS distros_add_distro (id BIGSERIAL PRIMARY KEY, arg0 TEXT NOT NULL);

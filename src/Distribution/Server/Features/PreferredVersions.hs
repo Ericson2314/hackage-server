@@ -12,7 +12,6 @@ module Distribution.Server.Features.PreferredVersions (
     classifyVersions,
 
     PreferredRender(..),
-    preferredStateComponent,
 
     maybeBestVersion,
   ) where
@@ -20,7 +19,6 @@ module Distribution.Server.Features.PreferredVersions (
 import Distribution.Server.Framework
 
 import qualified Distribution.Server.Features.PreferredVersions.Acid as Acid
-import Distribution.Server.Features.PreferredVersions.Acid (preferredStateComponent)
 import qualified Distribution.Server.Features.PreferredVersions.Store as Store
 import Distribution.Server.Features.PreferredVersions.State
 import Distribution.Server.Features.PreferredVersions.Types
