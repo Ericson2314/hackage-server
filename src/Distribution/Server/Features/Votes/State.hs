@@ -1,6 +1,10 @@
-{-# LANGUAGE OverloadedStrings, MultiParamTypeClasses, FlexibleInstances, DeriveAnyClass, DeriveGeneric, DerivingStrategies, DeriveDataTypeable, GeneralizedNewtypeDeriving,
-             TypeFamilies, TemplateHaskell #-}
-
+{-# LANGUAGE DeriveDataTypeable #-}
+{-# LANGUAGE DerivingStrategies #-}
+{-# LANGUAGE GeneralizedNewtypeDeriving #-}
+{-# LANGUAGE TypeFamilies #-}
+{-# LANGUAGE TemplateHaskell #-}
+-- | Votes state type — kept for backup/restore compatibility.
+-- The live server reads/writes directly from PostgreSQL.
 module Distribution.Server.Features.Votes.State where
 
 import Distribution.Server.Features.Votes.Types
@@ -8,56 +12,36 @@ import Distribution.Server.Framework.MemSize
 
 import Distribution.Package (PackageName)
 import Distribution.Server.Users.Types (UserId)
+import Distribution.Server.Framework.Instances ()
 import Distribution.Server.Users.UserIdSet (UserIdSet)
 import qualified Distribution.Server.Users.UserIdSet as UserIdSet
-
-import Distribution.Server.Users.State ()
 
 import Data.Map (Map)
 import qualified Data.Map as Map
 import Data.List
-import Data.Maybe (fromMaybe)
-import Control.Arrow ((&&&))
-import Distribution.Server.Framework.EventSourcing (Query, Update, makeAcidic)
-import Distribution.Server.Framework.BeamInstances ()
 import Data.SafeCopy (base, extension, deriveSafeCopy, Migrate(..))
 
-import qualified Control.Monad.State as State
-import Control.Monad.Reader.Class (ask)
-
-newtype VotesState_v0 = VotesState_v0 { votesMap :: Map PackageName UserIdSet }
-
-newtype VotesState = VotesState (Map PackageName (Map UserId Score))
+-- | In-memory representation, used only for backup/restore.
+newtype VotesState = VotesState { unVotesState :: Map PackageName (Map UserId Score) }
   deriving stock (Show, Eq)
   deriving newtype (MemSize)
 
--- SafeCopy instances
+newtype VotesState_v0 = VotesState_v0 { votesMap :: Map PackageName UserIdSet }
+
 deriveSafeCopy 0 'base      ''VotesState_v0
 deriveSafeCopy 1 'extension ''VotesState
 
 instance Migrate VotesState where
     type MigrateFrom VotesState = VotesState_v0
-
     migrate (VotesState_v0 m) = VotesState (Map.map go m)
       where
         go :: UserIdSet -> Map UserId Score
         go = Map.fromList . map (\x->(x,3)) . UserIdSet.toList
 
---
-
 initialVotesState :: VotesState
 initialVotesState = VotesState Map.empty
 
--- helper function
-userVotedForPackage :: PackageName -> UserId -> Map PackageName (Map UserId Score) -> Bool
-userVotedForPackage pkgname uid votes =
-    case Map.lookup pkgname votes of
-      Nothing     -> False
-      Just m -> case Map.lookup uid m of
-                  Nothing -> False
-                  Just _ -> True
-
--- Using a Bayesian average (m=1.5, C=2) to calculate scoring
+-- | Bayesian average scoring
 votesScore :: Map UserId Score -> Float
 votesScore m =
      let grouping = map (\g -> (head g, fromIntegral (length g) :: Score)) . group . sort . Map.elems $ m
@@ -66,72 +50,3 @@ votesScore m =
                  fromIntegral (2 + sum (map snd grouping))
          roundedScore = fromIntegral (round (score * 4) :: Int) / 4
      in roundedScore
-
--- All the acid state transactions
-
-addVote :: PackageName -> UserId -> Score -> Update VotesState Float
-addVote pkgname uid score = do
-    VotesState votes <- State.get
-    let votes' = Map.insertWith Map.union pkgname (Map.singleton uid score) votes
-    State.put $! VotesState votes'
-    return $ votesScore $ fromMaybe Map.empty $ Map.lookup pkgname votes'
-
-removeVote :: PackageName -> UserId -> Update VotesState Bool
-removeVote pkgname uid = do
-    VotesState votes <- State.get
-    if userVotedForPackage pkgname uid votes
-       then do let votes' = Map.adjust (Map.delete uid) pkgname votes
-               State.put $! VotesState votes'
-               return True
-       else return False
-
-getPackageVoteCount :: PackageName -> Query VotesState Int
-getPackageVoteCount pkgname = do
-    VotesState votes <- ask
-    case Map.lookup pkgname votes of
-      Nothing     -> return 0
-      Just m      -> return $! Map.size m
-
-getPackageVoteScore :: PackageName -> Query VotesState Float
-getPackageVoteScore pkgname = do
-    VotesState votes <- ask
-    case Map.lookup pkgname votes of
-      Nothing     -> return 0
-      Just m      -> return $! votesScore m
-
-getPackageUserVoted :: PackageName -> UserId -> Query VotesState Bool
-getPackageUserVoted pkgname uid = do
-    VotesState votes <- ask
-    return $! userVotedForPackage pkgname uid votes
-
-getPackageUserVote :: PackageName -> UserId -> Query VotesState (Maybe Score)
-getPackageUserVote pkgname uid = do
-    VotesState votes <- ask
-    return $! Map.lookup uid =<< Map.lookup pkgname votes
-
-getAllPackageVoteSets :: Query VotesState (Map PackageName (Map UserId Score))
-getAllPackageVoteSets = do
-    VotesState votes <- ask
-    return votes
-
-
--- get and replace the entire state, for backups
-
-getVotesState :: Query VotesState VotesState
-getVotesState = ask
-
-replaceVotesState :: VotesState -> Update VotesState ()
-replaceVotesState = State.put
-
-makeAcidic
-  ''VotesState
-  [ 'addVote
-  , 'removeVote
-  , 'getPackageVoteCount
-  , 'getPackageVoteScore
-  , 'getPackageUserVoted
-  , 'getPackageUserVote
-  , 'getAllPackageVoteSets
-  , 'getVotesState
-  , 'replaceVotesState
-  ]

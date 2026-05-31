@@ -477,9 +477,6 @@ CREATE TABLE IF NOT EXISTS tag_alias__add_tag_alias (id BIGSERIAL PRIMARY KEY, a
 CREATE TABLE IF NOT EXISTS documentation__insert_documentation (id BIGSERIAL PRIMARY KEY, arg0 TEXT NOT NULL, arg1 TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS documentation__remove_documentation (id BIGSERIAL PRIMARY KEY, arg0 TEXT NOT NULL);
 
--- Votes events
-CREATE TABLE IF NOT EXISTS votes_state__add_vote (id BIGSERIAL PRIMARY KEY, arg0 TEXT NOT NULL, arg1 TEXT NOT NULL, arg2 TEXT NOT NULL);
-CREATE TABLE IF NOT EXISTS votes_state__remove_vote (id BIGSERIAL PRIMARY KEY, arg0 TEXT NOT NULL, arg1 TEXT NOT NULL);
 
 -- Platform events
 CREATE TABLE IF NOT EXISTS platform_packages__set_platform_package (id BIGSERIAL PRIMARY KEY, arg0 TEXT NOT NULL, arg1 TEXT NOT NULL);

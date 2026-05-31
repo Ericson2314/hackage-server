@@ -2,19 +2,22 @@
 {-# LANGUAGE DeriveGeneric #-}
 {-# LANGUAGE FlexibleInstances #-}
 {-# LANGUAGE MultiParamTypeClasses #-}
-{-# LANGUAGE RankNTypes, NamedFieldPuns, RecordWildCards, OverloadedStrings #-}
+{-# LANGUAGE NamedFieldPuns #-}
+{-# LANGUAGE OverloadedStrings #-}
+{-# LANGUAGE RankNTypes #-}
+{-# LANGUAGE RecordWildCards #-}
 {-# LANGUAGE StandaloneDeriving #-}
 {-# LANGUAGE TypeFamilies #-}
 
 -- | Implements a system to allow users to upvote packages.
---
+-- De-event-sourced: reads/writes go directly to PostgreSQL.
 module Distribution.Server.Features.Votes
   ( VotesFeature(..)
   , initVotesFeature
   ) where
 
 import Distribution.Server.Features.Votes.Types (Score)
-import qualified Distribution.Server.Features.Votes.State as Acid
+import qualified Distribution.Server.Features.Votes.State as State
 import qualified Distribution.Server.Features.Votes.Render as Render
 
 import Distribution.Server.Framework
@@ -39,8 +42,6 @@ import qualified Text.XHtml.Strict as X
 import GHC.Generics (Generic)
 import Database.Beam
 import Database.Beam.Postgres
-import Control.Concurrent.MVar (swapMVar)
-import qualified Database.PostgreSQL.Simple as PG
 import Data.List (foldl')
 import Data.Int (Int32)
 
@@ -65,15 +66,12 @@ initVotesFeature :: ServerEnv
                    -> IO ( CoreFeature
                       -> UserFeature
                       -> IO VotesFeature)
-initVotesFeature env@ServerEnv{serverPgConn} = do
-  dbVotesState      <- votesStateComponent serverPgConn
-  updateVotes       <- newHook
+initVotesFeature ServerEnv{serverPgConn} = do
+  updateVotes <- newHook
 
   return $ \coref@CoreFeature{..} userf@UserFeature{..} -> do
-    let feature = votesFeature env
-                  dbVotesState
+    let feature = votesFeature serverPgConn
                   coref userf updateVotes
-
     return feature
 
 ------------------------------------------------------------------------
@@ -110,86 +108,128 @@ votesDb = defaultDbSettings `withDbModification`
 votesTable :: DatabaseEntity Postgres VotesDb (TableEntity VoteRowT)
 votesTable = _votesRows votesDb
 
-loadVotesState :: PgTx Acid.VotesState
-loadVotesState = do
-  rows <- beamTx $
-    runSelectReturningList $ select $ all_ votesTable
-  let addRow m (VoteRow name uid score) =
-        case simpleParse (T.unpack name) of
-          Just pkgName ->
-            Map.insertWith Map.union pkgName
-              (Map.singleton (UserId (fromIntegral uid)) (fromIntegral score)) m
-          Nothing -> m
-  return $ Acid.VotesState $ foldl' addRow Map.empty rows
+------------------------------------------------------------------------
+-- Direct database operations (no MVar, no event sourcing)
+--
 
-saveVotesState :: Acid.VotesState -> PgTx ()
-saveVotesState (Acid.VotesState votes) =
-  do
-    beamTx $
-      runDelete $ delete votesTable (\_ -> val_ True)
-    let rows = [ VoteRow (T.pack $ display pkgName) (fromIntegral uid) (fromIntegral score)
-               | (pkgName, userMap) <- Map.toList votes
-               , (UserId uid, score) <- Map.toList userMap ]
-    mapM_ (insertVoteChunk) (chunksOf 1000 rows)
+-- | Get all votes as a map (for backup or bulk queries)
+dbGetAllVotes :: PgConnection -> IO (Map.Map PackageName (Map.Map UserId Score))
+dbGetAllVotes pool = runBeamPg pool $ do
+  rows <- runSelectReturningList $ select $ all_ votesTable
+  return $ foldl' addRow Map.empty rows
+  where
+    addRow m (VoteRow name uid score) =
+      case simpleParse (T.unpack name) of
+        Just pkgName ->
+          Map.insertWith Map.union pkgName
+            (Map.singleton (UserId (fromIntegral uid)) (fromIntegral score)) m
+        Nothing -> m
 
-insertVoteChunk :: [VoteRowT Identity] -> PgTx ()
-insertVoteChunk chunk =
-  beamTx $
-    runInsert $ insert votesTable $ insertValues chunk
+-- | Add or update a vote
+dbAddVote :: PgConnection -> PackageName -> UserId -> Score -> IO ()
+dbAddVote pool pkgname (UserId uid) score =
+    runPgTx pool $ do
+      -- Delete existing vote if any, then insert
+      beamTx $ runDelete $ delete votesTable
+        (\v -> _vrPkgName v ==. val_ (T.pack $ display pkgname)
+           &&. _vrUserId v  ==. val_ (fromIntegral uid))
+      beamTx $ runInsert $ insert votesTable $ insertValues
+        [VoteRow (T.pack $ display pkgname) (fromIntegral uid) (fromIntegral score)]
+
+-- | Remove a vote, returns True if it existed
+dbRemoveVote :: PgConnection -> PackageName -> UserId -> IO Bool
+dbRemoveVote pool pkgname uid = do
+    existed <- dbDidUserVote pool pkgname uid
+    when existed $
+      runBeamPg pool $
+        runDelete $ delete votesTable
+          (\v -> _vrPkgName v ==. val_ (T.pack $ display pkgname)
+             &&. _vrUserId v  ==. val_ (let UserId u = uid in fromIntegral u))
+    return existed
+
+-- | Check if a user voted for a package
+dbDidUserVote :: PgConnection -> PackageName -> UserId -> IO Bool
+dbDidUserVote pool pkgname (UserId uid) = do
+    rows <- runBeamPg pool $
+      runSelectReturningList $ select $
+        filter_ (\v -> _vrPkgName v ==. val_ (T.pack $ display pkgname)
+                   &&. _vrUserId v  ==. val_ (fromIntegral uid)) $
+        all_ votesTable
+    return (not (null rows))
+
+-- | Get number of votes for a package
+dbPkgNumVotes :: PgConnection -> PackageName -> IO Int
+dbPkgNumVotes pool pkgname = do
+    rows <- runBeamPg pool $
+      runSelectReturningList $ select $
+        filter_ (\v -> _vrPkgName v ==. val_ (T.pack $ display pkgname)) $
+        all_ votesTable
+    return (length rows)
+
+-- | Get score for a package
+dbPkgScore :: PgConnection -> PackageName -> IO Float
+dbPkgScore pool pkgname = do
+    rows <- runBeamPg pool $
+      runSelectReturningList $ select $
+        filter_ (\v -> _vrPkgName v ==. val_ (T.pack $ display pkgname)) $
+        all_ votesTable
+    let userScores = Map.fromList
+          [ (UserId (fromIntegral uid), fromIntegral score)
+          | VoteRow _ uid score <- rows ]
+    return $ if Map.null userScores then 0 else State.votesScore userScores
+
+-- | Get a user's vote for a package
+dbPkgUserVote :: PgConnection -> PackageName -> UserId -> IO (Maybe Score)
+dbPkgUserVote pool pkgname (UserId uid) = do
+    rows <- runBeamPg pool $
+      runSelectReturningList $ select $
+        filter_ (\v -> _vrPkgName v ==. val_ (T.pack $ display pkgname)
+                   &&. _vrUserId v  ==. val_ (fromIntegral uid)) $
+        all_ votesTable
+    return $ case rows of
+      (VoteRow _ _ score : _) -> Just (fromIntegral score)
+      [] -> Nothing
+
+-- | Write full state to DB (for backup restore)
+dbPutAllVotes :: PgConnection -> State.VotesState -> IO ()
+dbPutAllVotes pool (State.VotesState votes) =
+    runPgTx pool $ do
+      beamTx $ runDelete $ delete votesTable (\_ -> val_ True)
+      let rows = [ VoteRow (T.pack $ display pkgName) (fromIntegral uid) (fromIntegral score)
+                 | (pkgName, userMap) <- Map.toList votes
+                 , (UserId uid, score) <- Map.toList userMap ]
+      mapM_ insertChunk (chunksOf 1000 rows)
+  where
+    insertChunk chunk = beamTx $
+      runInsert $ insert votesTable $ insertValues chunk
 
 chunksOf :: Int -> [a] -> [[a]]
 chunksOf _ [] = []
 chunksOf n xs = let (h, t) = splitAt n xs in h : chunksOf n t
 
 ------------------------------------------------------------------------
+-- Feature
+--
 
--- | Define the backing store (i.e. database component)
-votesStateComponent :: PgConnection -> IO (StateComponent AcidState Acid.VotesState)
-votesStateComponent serverPgConn = do
-  -- Load state
-  loaded <- runPgTx serverPgConn loadVotesState
-
-  pgSt <- mkAcidState serverPgConn loaded saveVotesState
-  return StateComponent {
-      stateDesc    = "Backing store for Map PackageName -> Users who voted for it"
-    , stateHandle  = pgSt
-    , getState     = queryPg pgSt (runQueryEvent Acid.GetVotesState)
-    , putState     = \s -> do
-        runPgTx serverPgConn (saveVotesState s)
-        _ <- swapMVar (pgMVar pgSt) s
-        return ()
-    , resetState   = \_ -> votesStateComponent serverPgConn
-    , backupState  = \_ _ -> []
-    , restoreState = RestoreBackup {
-                         restoreEntry    = error "Unexpected backup entry"
-                       , restoreFinalize = return $ Acid.VotesState Map.empty
-                       }
-   }
-
-
--- | Default constructor for building this feature.
-votesFeature ::  ServerEnv
-             -> StateComponent AcidState Acid.VotesState
+votesFeature :: PgConnection
              -> CoreFeature                    -- To get site package list
              -> UserFeature                    -- To authenticate users
              -> Hook (PackageName, Float) ()
              -> VotesFeature
 
-votesFeature  ServerEnv{..}
-              votesState
-              CoreFeature { coreResource = CoreResource{..} }
-              UserFeature{..}
-              votesUpdated
+votesFeature pool
+             CoreFeature { coreResource = CoreResource{..} }
+             UserFeature{..}
+             votesUpdated
   = VotesFeature{..}
   where
-    votesFeatureInterface   = (emptyHackageFeature "votes") {
+    votesFeatureInterface = (emptyHackageFeature "votes") {
         featureDesc      = "Allow users to upvote packages",
         featureResources = [ packagesVotesResource
                            , packageVotesResource
                            ]
-      , featureState     = [abstractAcidStateComponent votesState]
+      , featureState     = []  -- no AcidState; data lives in PostgreSQL
       }
-
 
     -- Define resources for this feature's URIs
 
@@ -216,10 +256,10 @@ votesFeature  ServerEnv{..}
     servePackageVotesGet :: DynamicPath -> ServerPartE Response
     servePackageVotesGet _ = do
       cacheControlWithoutETag [Public, maxAgeMinutes 10]
-      votesMap <- queryState votesState Acid.GetAllPackageVoteSets
+      allVotes <- liftIO $ dbGetAllVotes pool
       ok . toResponse $ objectL
-        [ (display pkgname, toJSON (Acid.votesScore pkgMap))
-        | (pkgname, pkgMap) <- Map.toList votesMap ]
+        [ (display pkgname, toJSON (State.votesScore pkgMap))
+        | (pkgname, pkgMap) <- Map.toList allVotes ]
 
     -- Get the number of votes a package has. If the package
     -- has never been voted for, returns 0.
@@ -229,11 +269,10 @@ votesFeature  ServerEnv{..}
       guardValidPackageName pkgname
       cacheControlWithoutETag [Public, maxAgeMinutes 10]
       voteCount <- pkgNumVotes pkgname
-      let obj = objectL
-                  [ ("packageName", string $ display pkgname)
-                  , ("numVotes",    toJSON voteCount)
-                  ]
-      ok . toResponse $ obj
+      ok . toResponse $ objectL
+        [ ("packageName", string $ display pkgname)
+        , ("numVotes",    toJSON voteCount)
+        ]
 
     -- Add a vote to :packageName (must match name exactly)
     servePackageVotePut :: DynamicPath -> ServerPartE Response
@@ -248,7 +287,7 @@ votesFeature  ServerEnv{..}
         "2" -> pure 2
         "3" -> pure 3
         _   -> fail "invalid score value received"
-      _ <- updateState votesState (Acid.AddVote pkgname uid score)
+      liftIO $ dbAddVote pool pkgname uid score
       pkgScore <- pkgNumScore pkgname
       runHook_ votesUpdated (pkgname, pkgScore)
       ok . toResponse $ "Package voted for successfully"
@@ -260,11 +299,9 @@ votesFeature  ServerEnv{..}
       uid     <- guardAuthorised [AnyKnownUser]
       pkgname <- packageInPath dpath
       guardValidPackageName pkgname
-
-      success <- updateState votesState (Acid.RemoveVote pkgname uid)
+      success <- liftIO $ dbRemoveVote pool pkgname uid
       pkgScore <- pkgNumScore pkgname
       when success $ runHook_ votesUpdated (pkgname, pkgScore)
-
       let responseMsg | success   = "Package vote removed successfully."
                       | otherwise = "User has not voted for this package."
       ok . toResponse $ responseMsg
@@ -274,21 +311,17 @@ votesFeature  ServerEnv{..}
     -- Returns true if a user has previously voted for the
     -- package in question.
     didUserVote :: MonadIO m => PackageName -> UserId -> m Bool
-    didUserVote pkgname uid =
-      queryState votesState (Acid.GetPackageUserVoted pkgname uid)
+    didUserVote pkgname uid = liftIO $ dbDidUserVote pool pkgname uid
 
     -- Returns the number of votes a package has.
     pkgNumVotes :: MonadIO m => PackageName -> m Int
-    pkgNumVotes pkgname =
-      queryState votesState (Acid.GetPackageVoteCount pkgname)
+    pkgNumVotes pkgname = liftIO $ dbPkgNumVotes pool pkgname
 
     pkgNumScore :: MonadIO m => PackageName -> m Float
-    pkgNumScore pkgname =
-      queryState votesState (Acid.GetPackageVoteScore pkgname)
+    pkgNumScore pkgname = liftIO $ dbPkgScore pool pkgname
 
     pkgUserVote :: MonadIO m => PackageName -> UserId -> m (Maybe Score)
-    pkgUserVote pkgname uid =
-      queryState votesState (Acid.GetPackageUserVote pkgname uid)
+    pkgUserVote pkgname uid = liftIO $ dbPkgUserVote pool pkgname uid
 
     -- Renders the HTML for the "Votes:" section on package pages.
     renderVotesHtml :: PackageName -> ServerPartE X.Html
