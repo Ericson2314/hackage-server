@@ -16,6 +16,7 @@ module Distribution.Server.Features.Tags (
   ) where
 
 import Distribution.Server.Framework
+import Distribution.Server.Framework.PgTx (beamTx)
 import Distribution.Server.Framework.BackupDump
 
 import Distribution.Server.Features.Tags.Types
@@ -51,8 +52,6 @@ import qualified Data.Text as T
 import GHC.Generics (Generic)
 import Database.Beam
 import Database.Beam.Postgres
-import Control.Concurrent.MVar (swapMVar)
-import qualified Database.PostgreSQL.Simple as PG
 
 data TagsFeature = TagsFeature {
     tagsFeatureInterface :: HackageFeature,
@@ -109,14 +108,12 @@ initTagsFeature :: ServerEnv
                     -> UserFeature
                     -> IO TagsFeature)
 initTagsFeature ServerEnv{serverPgConn} = do
-    tagsState <- tagsStateComponent serverPgConn
-    tagAlias <- tagsAliasComponent serverPgConn
     specials  <- newMemStateWHNF Acid.emptyPackageTags
     updateTag <- newHook
     tagProposalLog <- newMemStateWHNF Map.empty
 
     return $ \core@CoreFeature{..} upload user -> do
-      let feature = tagsFeature core upload user tagsState tagAlias specials updateTag tagProposalLog
+      let feature = tagsFeature core upload user serverPgConn specials updateTag tagProposalLog
 
       registerHookJust packageChangeHook isPackageChangeAny $ \(pkgid, mpkginfo) ->
         case mpkginfo of
@@ -124,10 +121,10 @@ initTagsFeature ServerEnv{serverPgConn} = do
           Just pkginfo -> do
             let pkgname = packageName pkgid
                 itags = constructImmutableTags . pkgDesc . pkgLatestRevision $ pkginfo
-            curtags <- queryState tagsState $ Acid.TagsForPackage pkgname
-            aliases <- mapM (queryState tagAlias . Acid.GetTagAlias) (itags ++ Set.toList curtags)
+            curtags <- dbTagsForPackage serverPgConn pkgname
+            aliases <- mapM (dbGetTagAlias serverPgConn) (itags ++ Set.toList curtags)
             let newtags = Set.fromList aliases
-            updateState tagsState . Acid.SetPackageTags pkgname $ newtags
+            dbSetPackageTags serverPgConn pkgname newtags
             runHook_ updateTag (Set.singleton pkgname, newtags)
 
       return feature
@@ -224,10 +221,14 @@ rebuildTagPackages pkgTags =
     addPkg acc pkgName tags =
       Set.foldl' (\m t -> Map.insertWith Set.union t (Set.singleton pkgName) m) acc tags
 
-loadPackageTags :: PgTx Acid.PackageTags
-loadPackageTags = do
-  -- Load tag assignments
-  assignRows <- beamTx $
+------------------------------------------------------------------------
+-- Direct database operations (no MVar, no event sourcing)
+--
+
+-- | Get all package tags
+dbGetPackageTags :: PgConnection -> IO Acid.PackageTags
+dbGetPackageTags pool = do
+  assignRows <- runBeamPg pool $
     runSelectReturningList $ select $ all_ tagAssignmentsTable
   let pkgTags = foldl' addAssign Map.empty assignRows
       addAssign m (TagAssignmentRow name tag) =
@@ -237,130 +238,133 @@ loadPackageTags = do
               (Set.singleton (Tag (T.unpack tag))) m
           Nothing -> m
 
-  -- Load review tags
-  reviewRows <- beamTx $
+  reviewRows <- runBeamPg pool $
     runSelectReturningList $ select $ all_ tagReviewsTable
   let reviews = foldl' addReview Map.empty reviewRows
       addReview m (TagReviewRow name tag isAdd) =
         case simpleParse (T.unpack name) of
           Just pkgName ->
             let t = Tag (T.unpack tag)
-                update (adds, dels) = if isAdd
+                update' (adds, dels) = if isAdd
                   then (Set.insert t adds, dels)
                   else (adds, Set.insert t dels)
-            in Map.alter (Just . update . maybe (Set.empty, Set.empty) id) pkgName m
+            in Map.alter (Just . update' . maybe (Set.empty, Set.empty) id) pkgName m
           Nothing -> m
 
-  -- Compute reverse index
   let tagPkgs = rebuildTagPackages pkgTags
-
   return $ Acid.PackageTags pkgTags tagPkgs reviews
 
-savePackageTags :: Acid.PackageTags -> PgTx ()
-savePackageTags (Acid.PackageTags pkgTags _tagPkgs reviews) =
-  do
-    -- Delete and reinsert assignments
-    beamTx $
-      runDelete $ delete tagAssignmentsTable (\_ -> val_ True)
-    let assignRows =
-          [ TagAssignmentRow (T.pack $ display pkgName) (T.pack tagStr)
-          | (pkgName, tags) <- Map.toList pkgTags
-          , Tag tagStr <- Set.toList tags ]
-    mapM_ (insertAssignChunk) (chunksOf 1000 assignRows)
+-- | Get tags for a single package
+dbTagsForPackage :: PgConnection -> PackageName -> IO (Set Tag)
+dbTagsForPackage pool pkgname = do
+  rows <- runBeamPg pool $
+    runSelectReturningList $ select $
+      filter_ (\r -> _taPkgName r ==. val_ (T.pack $ display pkgname)) $
+      all_ tagAssignmentsTable
+  return $ Set.fromList [ Tag (T.unpack tag) | TagAssignmentRow _ tag <- rows ]
 
-    -- Delete and reinsert reviews
-    beamTx $
-      runDelete $ delete tagReviewsTable (\_ -> val_ True)
-    let reviewRows =
-          [ TagReviewRow (T.pack $ display pkgName) (T.pack tagStr) isAdd
-          | (pkgName, (adds, dels)) <- Map.toList reviews
-          , (Tag tagStr, isAdd) <- map (\t -> (t, True)) (Set.toList adds)
-                                ++ map (\t -> (t, False)) (Set.toList dels) ]
-    mapM_ (insertReviewChunk) (chunksOf 1000 reviewRows)
+-- | Get packages for a tag
+dbPackagesForTag :: PgConnection -> Tag -> IO (Set PackageName)
+dbPackagesForTag pool (Tag tagStr) = do
+  rows <- runBeamPg pool $
+    runSelectReturningList $ select $
+      filter_ (\r -> _taTag r ==. val_ (T.pack tagStr)) $
+      all_ tagAssignmentsTable
+  return $ Set.fromList [ pkgName | TagAssignmentRow name _ <- rows
+                                  , Just pkgName <- [simpleParse (T.unpack name)] ]
 
-insertAssignChunk :: [TagAssignmentT Identity] -> PgTx ()
-insertAssignChunk chunk =
-  beamTx $
-    runInsert $ insert tagAssignmentsTable $ insertValues chunk
+-- | Get tag list (reverse index)
+dbGetTagList :: PgConnection -> IO [(Tag, Set PackageName)]
+dbGetTagList pool = do
+  pt <- dbGetPackageTags pool
+  return $ Map.toList (Acid.tagPackages pt)
 
-insertReviewChunk :: [TagReviewT Identity] -> PgTx ()
-insertReviewChunk chunk =
-  beamTx $
-    runInsert $ insert tagReviewsTable $ insertValues chunk
+-- | Set tags for a package (replace)
+dbSetPackageTags :: PgConnection -> PackageName -> Set Tag -> IO ()
+dbSetPackageTags pool pkgname tags =
+  runPgTx pool $ do
+    beamTx $ runDelete $ delete tagAssignmentsTable
+      (\r -> _taPkgName r ==. val_ (T.pack $ display pkgname))
+    let rows = [ TagAssignmentRow (T.pack $ display pkgname) (T.pack tagStr)
+               | Tag tagStr <- Set.toList tags ]
+    mapM_ (\chunk -> beamTx $
+      runInsert $ insert tagAssignmentsTable $ insertValues chunk) (chunksOf 1000 rows)
 
-loadTagAlias :: PgTx Acid.TagAlias
-loadTagAlias = do
-  rows <- beamTx $
+-- | Set packages for a tag (replace)
+dbSetTagPackages :: PgConnection -> Tag -> Set PackageName -> IO ()
+dbSetTagPackages pool (Tag tagStr) pkgs =
+  runPgTx pool $ do
+    beamTx $ runDelete $ delete tagAssignmentsTable
+      (\r -> _taTag r ==. val_ (T.pack tagStr))
+    let rows = [ TagAssignmentRow (T.pack $ display pkgName) (T.pack tagStr)
+               | pkgName <- Set.toList pkgs ]
+    mapM_ (\chunk -> beamTx $
+      runInsert $ insert tagAssignmentsTable $ insertValues chunk) (chunksOf 1000 rows)
+
+-- | Get review tags for a package
+dbLookupReviewTags :: PgConnection -> PackageName -> IO (Set Tag, Set Tag)
+dbLookupReviewTags pool pkgname = do
+  rows <- runBeamPg pool $
+    runSelectReturningList $ select $
+      filter_ (\r -> _trPkgName r ==. val_ (T.pack $ display pkgname)) $
+      all_ tagReviewsTable
+  let adds = Set.fromList [ Tag (T.unpack tag) | TagReviewRow _ tag True <- rows ]
+      dels = Set.fromList [ Tag (T.unpack tag) | TagReviewRow _ tag False <- rows ]
+  return (adds, dels)
+
+-- | Insert review tags (merge with existing)
+dbInsertReviewTags :: PgConnection -> PackageName -> Set Tag -> Set Tag -> IO ()
+dbInsertReviewTags pool pkgname addTags delTags = do
+  let addRows = [ TagReviewRow (T.pack $ display pkgname) (T.pack tagStr) True
+                | Tag tagStr <- Set.toList addTags ]
+      delRows = [ TagReviewRow (T.pack $ display pkgname) (T.pack tagStr) False
+                | Tag tagStr <- Set.toList delTags ]
+  mapM_ (\r -> runBeamPg pool $ runInsert $ insert tagReviewsTable $ insertValues [r]) (addRows ++ delRows)
+
+-- | Replace review tags for a package
+dbInsertReviewTags' :: PgConnection -> PackageName -> Set Tag -> Set Tag -> IO ()
+dbInsertReviewTags' pool pkgname addTags delTags =
+  runPgTx pool $ do
+    beamTx $ runDelete $ delete tagReviewsTable
+      (\r -> _trPkgName r ==. val_ (T.pack $ display pkgname))
+    let addRows = [ TagReviewRow (T.pack $ display pkgname) (T.pack tagStr) True
+                  | Tag tagStr <- Set.toList addTags ]
+        delRows = [ TagReviewRow (T.pack $ display pkgname) (T.pack tagStr) False
+                  | Tag tagStr <- Set.toList delTags ]
+    mapM_ (\chunk -> beamTx $
+      runInsert $ insert tagReviewsTable $ insertValues chunk) (chunksOf 1000 (addRows ++ delRows))
+
+-- | Get tag alias
+dbGetTagAlias :: PgConnection -> Tag -> IO Tag
+dbGetTagAlias pool tag = do
+  aliases <- dbGetTagAliases pool
+  return $ Acid.getTagAliasValue tag aliases
+
+-- | Get all tag aliases
+dbGetTagAliases :: PgConnection -> IO Acid.TagAlias
+dbGetTagAliases pool = do
+  rows <- runBeamPg pool $
     runSelectReturningList $ select $ all_ tagAliasesTable
   let addRow m (TagAliasRow canonical alias) =
         Map.insertWith Set.union (Tag (T.unpack canonical))
           (Set.singleton (Tag (T.unpack alias))) m
   return $ Acid.TagAlias $ foldl' addRow Map.empty rows
 
-saveTagAlias :: Acid.TagAlias -> PgTx ()
-saveTagAlias (Acid.TagAlias aliases) =
-  do
-    beamTx $
-      runDelete $ delete tagAliasesTable (\_ -> val_ True)
-    let rows = [ TagAliasRow (T.pack canonical) (T.pack alias)
-               | (Tag canonical, aliasSet) <- Map.toList aliases
-               , Tag alias <- Set.toList aliasSet ]
-    mapM_ (insertAliasChunk) (chunksOf 1000 rows)
-
-insertAliasChunk :: [TagAliasRowT Identity] -> PgTx ()
-insertAliasChunk chunk =
-  beamTx $
-    runInsert $ insert tagAliasesTable $ insertValues chunk
+-- | Add a tag alias
+dbAddTagAlias :: PgConnection -> Tag -> Tag -> IO ()
+dbAddTagAlias pool (Tag canonical) (Tag alias) =
+  runBeamPg pool $
+    runInsert $ insert tagAliasesTable $ insertValues
+      [TagAliasRow (T.pack canonical) (T.pack alias)]
 
 chunksOf :: Int -> [a] -> [[a]]
 chunksOf _ [] = []
 chunksOf n xs = let (h, t) = splitAt n xs in h : chunksOf n t
 
-------------------------------------------------------------------------
-
-tagsStateComponent :: PgConnection -> IO (StateComponent AcidState Acid.PackageTags)
-tagsStateComponent serverPgConn = do
-  -- Load state
-  loaded <- runPgTx serverPgConn loadPackageTags
-
-  pgSt <- mkAcidState serverPgConn loaded savePackageTags
-  return StateComponent {
-      stateDesc    = "Package tags"
-    , stateHandle  = pgSt
-    , getState     = queryPg pgSt (runQueryEvent Acid.GetPackageTags)
-    , putState     = \s -> do
-        runPgTx serverPgConn (savePackageTags s)
-        _ <- swapMVar (pgMVar pgSt) s
-        return ()
-    , backupState  = \_ pkgTags -> [csvToBackup ["tags.csv"] $ tagsToCSV pkgTags]
-    , restoreState = tagsBackup
-    , resetState   = \_ -> tagsStateComponent serverPgConn
-    }
-
-tagsAliasComponent :: PgConnection -> IO (StateComponent AcidState Acid.TagAlias)
-tagsAliasComponent serverPgConn = do
-  -- Load state
-  loaded <- runPgTx serverPgConn loadTagAlias
-
-  pgSt <- mkAcidState serverPgConn loaded saveTagAlias
-  return StateComponent {
-      stateDesc    = "Tags Alias"
-    , stateHandle  = pgSt
-    , getState     = queryPg pgSt (runQueryEvent Acid.GetTagAliasesState)
-    , putState     = \s -> do
-        runPgTx serverPgConn (saveTagAlias s)
-        _ <- swapMVar (pgMVar pgSt) s
-        return ()
-    , backupState  = \_ aliases -> [csvToBackup ["aliases.csv"] $ aliasToCSV aliases]
-    , restoreState = aliasBackup
-    , resetState   = \_ -> tagsAliasComponent serverPgConn
-    }
-
 tagsFeature :: CoreFeature
             -> UploadFeature
             -> UserFeature
-            -> StateComponent AcidState Acid.PackageTags
-            -> StateComponent AcidState Acid.TagAlias
+            -> PgConnection
             -> MemState Acid.PackageTags
             -> Hook (Set PackageName, Set Tag) ()
             -> MemState (Map PackageName (Set Tag, Set Tag))
@@ -369,8 +373,7 @@ tagsFeature :: CoreFeature
 tagsFeature CoreFeature{ queryGetPackageIndex }
             UploadFeature{ maintainersGroup, trusteesGroup }
             UserFeature{ guardAuthorised' }
-            tagsState
-            tagsAlias
+            pool
             calculatedTags
             tagsUpdated
             tagProposalLog
@@ -401,7 +404,7 @@ tagsFeature CoreFeature{ queryGetPackageIndex }
             , packageTagsListing
             ]
       , featurePostInit = initImmutableTags
-      , featureState    = [abstractAcidStateComponent tagsState]
+      , featureState    = []  -- no AcidState; data lives in PostgreSQL
       , featureCaches   = [
             CacheComponent {
               cacheDesc       = "calculated tags",
@@ -414,38 +417,38 @@ tagsFeature CoreFeature{ queryGetPackageIndex }
     initImmutableTags = do
             index <- queryGetPackageIndex
             let calcTags = Acid.tagPackages $ constructImmutableTagIndex index
-            aliases <- mapM (queryState tagsAlias . Acid.GetTagAlias) $ Map.keys calcTags
+            aliases <- mapM (liftIO . dbGetTagAlias pool) $ Map.keys calcTags
             let calcTags' = Map.toList . Map.fromListWith Set.union $ zip aliases (Map.elems calcTags)
             forM_ calcTags' $ uncurry setCalculatedTag
 
     queryGetTagList :: MonadIO m => m [(Tag, Set PackageName)]
-    queryGetTagList = queryState tagsState Acid.GetTagList
+    queryGetTagList = liftIO $ dbGetTagList pool
 
     queryTagsForPackage :: MonadIO m => PackageName -> m (Set Tag)
-    queryTagsForPackage pkgname = queryState tagsState (Acid.TagsForPackage pkgname)
+    queryTagsForPackage pkgname = liftIO (dbTagsForPackage pool pkgname)
 
     queryAliasForTag :: MonadIO m => Tag -> m Tag
-    queryAliasForTag tag = queryState tagsAlias (Acid.GetTagAlias tag)
+    queryAliasForTag tag = liftIO (dbGetTagAlias pool tag)
 
     queryReviewTagsForPackage :: MonadIO m => PackageName -> m (Set Tag,Set Tag)
-    queryReviewTagsForPackage pkgname = queryState tagsState (Acid.LookupReviewTags pkgname)
+    queryReviewTagsForPackage pkgname = liftIO (dbLookupReviewTags pool pkgname)
 
     setCalculatedTag :: Tag -> Set PackageName -> IO ()
     setCalculatedTag tag pkgs = do
       modifyMemState calculatedTags (Acid.setTag tag pkgs)
-      void $ updateState tagsState $ Acid.SetTagPackages tag pkgs
+      void $ liftIO $ dbSetTagPackages pool tag pkgs
       runHook_ tagsUpdated (pkgs, Set.singleton tag)
 
     withTagPath :: DynamicPath -> (Tag -> Set PackageName -> ServerPartE a) -> ServerPartE a
     withTagPath dpath func = case simpleParse =<< lookup "tag" dpath of
         Nothing -> mzero
         Just tag -> do
-            pkgs <- queryState tagsState $ Acid.PackagesForTag tag
+            pkgs <- liftIO $ dbPackagesForTag pool tag
             func tag pkgs
 
     collectTags :: MonadIO m => Set PackageName -> m (Map PackageName (Set Tag))
     collectTags pkgs = do
-        pkgMap <- liftM Acid.packageTags $ queryState tagsState Acid.GetPackageTags
+        pkgMap <- liftM Acid.packageTags $ liftIO $ dbGetPackageTags pool
         return $ Map.fromDistinctAscList . map (\pkg -> (pkg, Map.findWithDefault Set.empty pkg pkgMap)) $ Set.toList pkgs
 
     mergeTags :: Maybe String -> Tag -> ServerPartE ()
@@ -453,7 +456,7 @@ tagsFeature CoreFeature{ queryGetPackageIndex }
         case simpleParse =<< targetTag of
             Just (Tag orig) -> do
                 index <- queryGetPackageIndex
-                void $ updateState tagsAlias $ Acid.AddTagAlias (Tag orig) deprTag
+                void $ liftIO $ dbAddTagAlias pool (Tag orig) deprTag
                 void $ constructMergedTagIndex (Tag orig) deprTag index
             _ -> errBadRequest "Tag not recognised" [MText "Couldn't parse tag. It should be a single tag."]
 
@@ -465,7 +468,7 @@ tagsFeature CoreFeature{ queryGetPackageIndex }
                 if Set.member depr pkgTags
                     then do
                         let newTags = Set.delete depr (Set.insert orig pkgTags)
-                        void $ updateState tagsState $ Acid.SetPackageTags pn newTags
+                        void $ liftIO $ dbSetPackageTags pool pn newTags
                         runHook_ tagsUpdated (Set.singleton pn, newTags)
                         return $ Acid.setTags pn newTags calcTags
                     else return $ Acid.setTags pn pkgTags calcTags
@@ -481,7 +484,7 @@ tagsFeature CoreFeature{ queryGetPackageIndex }
                         if trustainer
                             then do
                                 calcTags <- queryTagsForPackage pkgname
-                                aliases <- mapM (queryState tagsAlias . Acid.GetTagAlias) add
+                                aliases <- mapM (liftIO . dbGetTagAlias pool) add
                                 revTags <- queryReviewTagsForPackage pkgname
                                 let tagSet = (addTags `Set.union` calcTags) `Set.difference` delTags
                                     addTags = Set.fromList aliases
@@ -495,18 +498,18 @@ tagsFeature CoreFeature{ queryGetPackageIndex }
                                     addRev = Set.difference (fst revTags) (Set.fromList add `Set.union` Set.fromList radd')
                                     delRev = Set.difference (snd revTags) (Set.fromList del `Set.union` Set.fromList rdel')
                                     modifyTags (a, d) = (a `Set.intersection` addRev, d `Set.intersection` delRev)
-                                updateState tagsState $ Acid.SetPackageTags pkgname tagSet
-                                updateState tagsState $ Acid.InsertReviewTags' pkgname addRev delRev
+                                liftIO $ dbSetPackageTags pool pkgname tagSet
+                                liftIO $ dbInsertReviewTags' pool pkgname addRev delRev
                                 modifyMemState tagProposalLog (Map.adjust modifyTags pkgname)
                                 runHook_ tagsUpdated (Set.singleton pkgname, tagSet)
                                 return ()
                             else if user
                                 then do
-                                    aliases <- mapM (queryState tagsAlias . Acid.GetTagAlias) add
+                                    aliases <- mapM (liftIO . dbGetTagAlias pool) add
                                     calcTags <- queryTagsForPackage pkgname
                                     let addTags = Set.fromList aliases `Set.difference` calcTags
                                         delTags = Set.fromList del `Set.intersection` calcTags
-                                    updateState tagsState $ Acid.InsertReviewTags pkgname addTags delTags
+                                    liftIO $ dbInsertReviewTags pool pkgname addTags delTags
                                     modifyMemState tagProposalLog (Map.insertWith (<>) pkgname (addTags, delTags))
                                     return ()
                                 else errBadRequest "Authorization Error" [MText "You need to be logged in to propose tags"]

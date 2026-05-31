@@ -1,4 +1,5 @@
-{-# LANGUAGE OverloadedStrings, MultiParamTypeClasses, FlexibleInstances, DeriveAnyClass, DeriveGeneric, DerivingStrategies, DeriveDataTypeable, TypeFamilies, TemplateHaskell, GeneralizedNewtypeDeriving #-}
+{-# LANGUAGE DeriveDataTypeable #-}
+{-# LANGUAGE TemplateHaskell #-}
 
 module Distribution.Server.Features.Tags.State where
 
@@ -9,18 +10,13 @@ import Distribution.Server.Framework.MemSize
 
 import Distribution.Package
 
-import Distribution.Server.Framework.EventSourcing (Query, Update, makeAcidic)
-import Distribution.Server.Framework.BeamInstances ()
 import Data.Map (Map)
 import qualified Data.Map as Map
 import Data.Set (Set)
 import qualified Data.Set as Set
 import Data.SafeCopy (base, deriveSafeCopy)
-import Data.Functor ( (<&>) )
 import Data.Maybe (fromMaybe)
 import Data.List (find, foldl')
-import Control.Monad.State (get, put, modify)
-import Control.Monad.Reader (ask, asks)
 import Control.DeepSeq
 
 data PackageTags = PackageTags {
@@ -34,21 +30,6 @@ data PackageTags = PackageTags {
 
 
 data TagAlias = TagAlias (Map Tag (Set Tag)) deriving (Eq, Show)
-
-addTagAlias :: Tag -> Tag -> Update TagAlias ()
-addTagAlias tag alias = do
-        TagAlias  m <- get
-        put (TagAlias (Map.insertWith Set.union tag (Set.singleton alias) m))
-
-lookupTagAlias :: Tag -> Query TagAlias (Maybe (Set Tag))
-lookupTagAlias tag
-    = do TagAlias m <- ask
-         return (Map.lookup tag m)
-
-getTagAlias :: Tag -> Query TagAlias Tag
-getTagAlias tag = ask <&> \ (TagAlias m) ->
-  if Map.member tag m then tag
-  else maybe tag fst $ find (Set.member tag . snd) $ Map.toList m
 
 emptyPackageTags :: PackageTags
 emptyPackageTags = PackageTags Map.empty Map.empty Map.empty
@@ -126,95 +107,12 @@ instance MemSize PackageTags where
 initialPackageTags :: PackageTags
 initialPackageTags = emptyPackageTags
 
-tagsForPackage :: PackageName -> Query PackageTags (Set Tag)
-tagsForPackage name = asks $ Map.findWithDefault Set.empty name . packageTags
-
-packagesForTag :: Tag -> Query PackageTags (Set PackageName)
-packagesForTag tag = asks $ Map.findWithDefault Set.empty tag . tagPackages
-
-getTagList :: Query PackageTags [(Tag, Set PackageName)]
-getTagList = asks $ Map.toList . tagPackages
-
-getPackageTags :: Query PackageTags PackageTags
-getPackageTags = ask
-
-replacePackageTags :: PackageTags -> Update PackageTags ()
-replacePackageTags = put
-
-getTagAliasesState :: Query TagAlias TagAlias
-getTagAliasesState = ask
-
-addTagAliasesState :: TagAlias -> Update TagAlias ()
-addTagAliasesState = put
-
-
-setPackageTags :: PackageName -> Set Tag -> Update PackageTags ()
-setPackageTags name tagList = modify $ setTags name tagList
-
-setTagPackages :: Tag -> Set PackageName -> Update PackageTags ()
-setTagPackages tag pkgList = modify $ setTag tag pkgList
-
-
--- | Tag a package. Returns True if the element was inserted, and False if
--- the tag as already present (same result though)
-addPackageTag :: PackageName -> Tag -> Update PackageTags Bool
-addPackageTag name tag = do
-    pkgTags <- get
-    case addTag name tag pkgTags of
-        Nothing -> return False
-        Just pkgTags' -> put pkgTags' >> return True
-
--- | Untag a package. Return True if the element was removed, and False if
--- it wasn't there in the first place (again, same outcome)
-removePackageTag :: PackageName -> Tag -> Update PackageTags Bool
-removePackageTag name tag = do
-    pkgTags <- get
-    case removeTag name tag pkgTags of
-        Nothing -> return False
-        Just pkgTags' -> put pkgTags' >> return True
-
-clearReviewTags :: PackageName -> Update PackageTags ()
-clearReviewTags pkgname = do
-        PackageTags p t r <- get
-        put (PackageTags p t (Map.insert pkgname (Set.empty,Set.empty) r))
-
-insertReviewTags :: PackageName -> Set Tag -> Set Tag -> Update PackageTags ()
-insertReviewTags pkgname add del = do
-        PackageTags p t r <- get
-        put (PackageTags p t (Map.insertWith insertReviewHelper pkgname (add,del) r))
-
-insertReviewTags' :: PackageName -> Set Tag -> Set Tag -> Update PackageTags ()
-insertReviewTags' pkgname add del = do
-        PackageTags p t r <- get
-        put (PackageTags p t (Map.insert pkgname (add,del) r))
-
+-- | Look up tag for an alias — pure function used by db layer
+getTagAliasValue :: Tag -> TagAlias -> Tag
+getTagAliasValue tag (TagAlias m) =
+  if Map.member tag m then tag
+  else maybe tag fst $ find (Set.member tag . snd) $ Map.toList m
 
 insertReviewHelper :: (Set Tag, Set Tag) -> (Set Tag, Set Tag) -> (Set Tag, Set Tag)
 insertReviewHelper (a,b) (c,d) = (Set.union a c, Set.union b d)
-
-lookupReviewTags :: PackageName -> Query PackageTags (Set Tag, Set Tag)
-lookupReviewTags pkgname = asks $ Map.findWithDefault (Set.empty, Set.empty) pkgname . reviewTags
-
-
-$(makeAcidic ''TagAlias ['addTagAlias
-                        ,'getTagAlias
-                        ,'lookupTagAlias
-                        ,'addTagAliasesState
-                        ,'getTagAliasesState
-                      ])
-
-$(makeAcidic ''PackageTags ['tagsForPackage
-                         ,'packagesForTag
-                         ,'getTagList
-                         ,'getPackageTags
-                         ,'replacePackageTags
-                         ,'setPackageTags
-                         ,'setTagPackages
-                         ,'addPackageTag
-                         ,'removePackageTag
-                         ,'insertReviewTags
-                         ,'insertReviewTags'
-                         ,'lookupReviewTags
-                         ,'clearReviewTags
-                         ])
 

@@ -462,14 +462,6 @@ CREATE TABLE IF NOT EXISTS hackage_admins__add_hackage_admin (id BIGSERIAL PRIMA
 CREATE TABLE IF NOT EXISTS hackage_admins__remove_hackage_admin (id BIGSERIAL PRIMARY KEY, arg0 TEXT NOT NULL);
 
 
--- Tags events
-CREATE TABLE IF NOT EXISTS package_tags__add_package_tag (id BIGSERIAL PRIMARY KEY, arg0 TEXT NOT NULL, arg1 TEXT NOT NULL);
-CREATE TABLE IF NOT EXISTS package_tags__remove_package_tag (id BIGSERIAL PRIMARY KEY, arg0 TEXT NOT NULL, arg1 TEXT NOT NULL);
-CREATE TABLE IF NOT EXISTS package_tags__set_package_tags (id BIGSERIAL PRIMARY KEY, arg0 TEXT NOT NULL, arg1 TEXT NOT NULL);
-CREATE TABLE IF NOT EXISTS package_tags__set_tag_packages (id BIGSERIAL PRIMARY KEY, arg0 TEXT NOT NULL, arg1 TEXT NOT NULL);
-CREATE TABLE IF NOT EXISTS package_tags__insert_review_tags (id BIGSERIAL PRIMARY KEY, arg0 TEXT NOT NULL, arg1 TEXT NOT NULL, arg2 TEXT NOT NULL);
-CREATE TABLE IF NOT EXISTS package_tags__clear_review_tags (id BIGSERIAL PRIMARY KEY, arg0 TEXT NOT NULL);
-CREATE TABLE IF NOT EXISTS tag_alias__add_tag_alias (id BIGSERIAL PRIMARY KEY, arg0 TEXT NOT NULL, arg1 TEXT NOT NULL);
 
 
 
