@@ -23,6 +23,7 @@ import Distribution.Server.Features.UserSignup.Backup
 import Distribution.Server.Features.UserSignup.Types
 
 import Distribution.Server.Framework
+import Distribution.Server.Framework.PgTx (beamTx)
 import Distribution.Server.Framework.Templating
 import Distribution.Server.Framework.BackupDump
 
@@ -50,8 +51,6 @@ import GHC.Generics (Generic)
 import           Data.Int (Int32)
 import Database.Beam
 import Database.Beam.Postgres
-import qualified Database.PostgreSQL.Simple as PG
-import Control.Concurrent.MVar (swapMVar)
 import Data.Time
 import Network.Mail.Mime
 import Network.URI (URI(..), URIAuth(..))
@@ -189,52 +188,69 @@ signupResetToRow nonce (ResetInfo (UserId uid) ts) =
     , _sreTimestamp           = ts
     }
 
-loadSignupResetTable :: PgTx Acid.SignupResetTable
-loadSignupResetTable = do
-  rows <- beamTx $
+------------------------------------------------------------------------
+-- Direct database operations (no MVar, no event sourcing)
+--
+
+-- | Get all signup/reset entries
+dbGetSignupResetTable :: PgConnection -> IO Acid.SignupResetTable
+dbGetSignupResetTable pool = do
+  rows <- runBeamPg pool $
     runSelectReturningList $ select $ all_ signupResetEntriesTable
   let entries = concatMap (maybe [] (:[]) . rowToSignupResetEntry) rows
   return $ Acid.SignupResetTable (Map.fromList entries)
 
-saveSignupResetTable :: Acid.SignupResetTable -> PgTx ()
-saveSignupResetTable (Acid.SignupResetTable tbl) =
-  do
-    beamTx $
-      runDelete $ delete signupResetEntriesTable (\_ -> val_ True)
-    let rows = [ signupResetToRow nonce info | (nonce, info) <- Map.toList tbl ]
-    mapM_ insertSignupResetChunk (chunksOf 1000 rows)
+-- | Lookup a signup/reset entry by nonce
+dbLookupSignupResetInfo :: PgConnection -> Nonce -> IO (Maybe SignupResetInfo)
+dbLookupSignupResetInfo pool nonce = do
+  rows <- runBeamPg pool $
+    runSelectReturningList $ select $
+      filter_ (\r -> _sreNonce r ==. val_ (T.pack (renderNonce nonce))) $
+      all_ signupResetEntriesTable
+  return $ case rows of
+    (r : _) -> fmap snd (rowToSignupResetEntry r)
+    []      -> Nothing
 
-insertSignupResetChunk :: [SignupResetEntryT Identity] -> PgTx ()
-insertSignupResetChunk chunk =
-  beamTx $
-    runInsert $ insert signupResetEntriesTable $ insertValues chunk
+-- | Add a signup/reset entry. Returns True if newly inserted.
+dbAddSignupResetInfo :: PgConnection -> Nonce -> SignupResetInfo -> IO Bool
+dbAddSignupResetInfo pool nonce info =
+  runPgTx pool $ do
+    alreadyExists <- beamTx $ fmap (maybe False id) $ runSelectReturningOne $ select $ pure $
+      exists_ (filter_ (\r -> _sreNonce r ==. val_ (T.pack (renderNonce nonce))) $
+               all_ signupResetEntriesTable)
+    if alreadyExists
+      then return False
+      else do
+        beamTx $ runInsert $ insert signupResetEntriesTable $ insertValues
+          [signupResetToRow nonce info]
+        return True
+
+-- | Delete a signup/reset entry by nonce
+dbDeleteSignupResetInfo :: PgConnection -> Nonce -> IO ()
+dbDeleteSignupResetInfo pool nonce =
+  runBeamPg pool $
+    runDelete $ delete signupResetEntriesTable
+      (\r -> _sreNonce r ==. val_ (T.pack (renderNonce nonce)))
+
+-- | Delete all expired entries
+dbDeleteAllExpired :: PgConnection -> UTCTime -> IO ()
+dbDeleteAllExpired pool expireTime =
+  runBeamPg pool $
+    runDelete $ delete signupResetEntriesTable
+      (\r -> _sreTimestamp r <=. val_ expireTime)
+
+-- | Write full state to DB (for backup restore)
+dbPutSignupResetTable :: PgConnection -> Acid.SignupResetTable -> IO ()
+dbPutSignupResetTable pool (Acid.SignupResetTable tbl) =
+  runPgTx pool $ do
+    beamTx $ runDelete $ delete signupResetEntriesTable (\_ -> val_ True)
+    let rows = [ signupResetToRow nonce info | (nonce, info) <- Map.toList tbl ]
+    mapM_ (\chunk -> beamTx $
+      runInsert $ insert signupResetEntriesTable $ insertValues chunk) (chunksOf 1000 rows)
 
 chunksOf :: Int -> [a] -> [[a]]
 chunksOf _ [] = []
 chunksOf n xs = let (h, t) = splitAt n xs in h : chunksOf n t
-
-------------------------------------------------------------------------
-
-signupResetStateComponent :: PgConnection -> IO (StateComponent AcidState Acid.SignupResetTable)
-signupResetStateComponent serverPgConn = do
-  -- Load state
-  st <- runPgTx serverPgConn loadSignupResetTable
-
-  pgSt <- mkAcidState serverPgConn st saveSignupResetTable
-  return StateComponent {
-      stateDesc    = "State to keep track of outstanding requests for user signup and password resets"
-    , stateHandle  = pgSt
-    , getState     = queryPg pgSt (runQueryEvent Acid.GetSignupResetTable)
-    , putState     = \s -> do
-        runPgTx serverPgConn (saveSignupResetTable s)
-        _ <- swapMVar (pgMVar pgSt) s
-        return ()
-    , backupState  = \backuptype tbl ->
-        [csvToBackup ["signups.csv"] (signupInfoToCSV backuptype tbl)
-        ,csvToBackup ["resets.csv"]  (resetInfoToCSV backuptype tbl)]
-    , restoreState = signupResetBackup
-    , resetState   = \_ -> signupResetStateComponent serverPgConn
-    }
 
 
 ----------------------------------------
@@ -248,9 +264,6 @@ initUserSignupFeature :: ServerEnv
                           -> IO UserSignupFeature)
 initUserSignupFeature env@ServerEnv{ serverPgConn, serverTemplatesDir,
                                      serverTemplatesMode } = do
-    -- Canonical state
-    signupResetState <- signupResetStateComponent serverPgConn
-
     -- Page templates
     templates <- loadTemplates serverTemplatesMode
                    [serverTemplatesDir, serverTemplatesDir </> "UserSignupReset"]
@@ -262,7 +275,7 @@ initUserSignupFeature env@ServerEnv{ serverPgConn, serverTemplatesDir,
     return $ \users userdetails upload -> do
       let feature = userSignupFeature env
                       users userdetails upload
-                      signupResetState templates
+                      templates
       return feature
 
 
@@ -270,12 +283,11 @@ userSignupFeature :: ServerEnv
                   -> UserFeature
                   -> UserDetailsFeature
                   -> UploadFeature
-                  -> StateComponent AcidState Acid.SignupResetTable
                   -> Templates
                   -> UserSignupFeature
-userSignupFeature ServerEnv{serverBaseURI, serverCron}
+userSignupFeature ServerEnv{serverBaseURI, serverCron, serverPgConn}
                   UserFeature{..} UserDetailsFeature{..}
-                  UploadFeature{uploadersGroup} signupResetState templates
+                  UploadFeature{uploadersGroup} templates
   = UserSignupFeature {..}
 
   where
@@ -286,7 +298,7 @@ userSignupFeature ServerEnv{serverBaseURI, serverCron}
                             signupRequestResource,
                             resetRequestsResource,
                             resetRequestResource]
-      , featureState     = [abstractAcidStateComponent signupResetState]
+      , featureState     = []  -- no AcidState; data lives in PostgreSQL
       , featureCaches    = []
       , featureReloadFiles = reloadTemplates templates
       , featurePostInit  = setupExpireCronJob
@@ -339,30 +351,30 @@ userSignupFeature ServerEnv{serverBaseURI, serverCron}
 
     queryAllSignupResetInfo :: MonadIO m => m [SignupResetInfo]
     queryAllSignupResetInfo =
-          queryState signupResetState Acid.GetSignupResetTable
+          liftIO (dbGetSignupResetTable serverPgConn)
       >>= \(Acid.SignupResetTable tbl) -> return (Map.elems tbl)
 
     querySignupInfo :: Nonce -> MonadIO m => m (Maybe SignupResetInfo)
     querySignupInfo nonce =
-        justSignupInfo <$> queryState signupResetState (Acid.LookupSignupResetInfo nonce)
+        justSignupInfo <$> liftIO (dbLookupSignupResetInfo serverPgConn nonce)
       where
         justSignupInfo (Just info@SignupInfo{}) = Just info
         justSignupInfo _                        = Nothing
 
     queryResetInfo :: Nonce -> MonadIO m => m (Maybe SignupResetInfo)
     queryResetInfo nonce =
-        justResetInfo <$> queryState signupResetState (Acid.LookupSignupResetInfo nonce)
+        justResetInfo <$> liftIO (dbLookupSignupResetInfo serverPgConn nonce)
       where
         justResetInfo (Just info@ResetInfo{}) = Just info
         justResetInfo _                       = Nothing
 
     updateAddSignupResetInfo :: Nonce -> SignupResetInfo -> MonadIO m => m Bool
     updateAddSignupResetInfo nonce signupInfo =
-        updateState signupResetState (Acid.AddSignupResetInfo nonce signupInfo)
+        liftIO $ dbAddSignupResetInfo serverPgConn nonce signupInfo
 
     updateDeleteSignupResetInfo :: Nonce -> MonadIO m => m ()
     updateDeleteSignupResetInfo nonce =
-        updateState signupResetState (Acid.DeleteSignupResetInfo nonce)
+        liftIO $ dbDeleteSignupResetInfo serverPgConn nonce
 
     -- Expiry
     --
@@ -374,7 +386,7 @@ userSignupFeature ServerEnv{serverBaseURI, serverCron}
         cronJobAction    = do
           now <- getCurrentTime
           let expire = now { utctDay = addDays (-7) (utctDay now) }
-          updateState signupResetState (Acid.DeleteAllExpired expire)
+          dbDeleteAllExpired serverPgConn expire
       }
 
     -- Request handlers
