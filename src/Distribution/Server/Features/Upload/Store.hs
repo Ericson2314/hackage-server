@@ -5,7 +5,6 @@ module Distribution.Server.Features.Upload.Store
   , Store(..)
   ) where
 
-import Distribution.Server.Framework (AbstractStateComponent)
 import Distribution.Server.Users.Group (UserIdSet)
 
 import Distribution.Package (PackageName)
@@ -15,7 +14,6 @@ import Control.Monad.Trans (MonadIO)
 
 data Backend = Backend {
     backendStore :: Store
-  , backendState :: [AbstractStateComponent]
   }
 
 data Store = Store {

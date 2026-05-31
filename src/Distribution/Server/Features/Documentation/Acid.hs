@@ -36,7 +36,6 @@ acidStore _name pool =
         , Store.insertDocumentation = \pkgid blobid -> liftIO $ dbInsertDocumentation pool pkgid blobid
         , Store.removeDocumentation = liftIO . dbRemoveDocumentation pool
         }
-    , Store.backendState = []  -- no AcidState; data lives in PostgreSQL
     }
 
 ------------------------------------------------------------------------

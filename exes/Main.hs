@@ -27,7 +27,6 @@ import System.Posix.Signals as Signal
          ( Signal
          , installHandler
          , Handler(Catch)
-         , sigUSR1
          , sigHUP
          )
 import System.IO
@@ -97,7 +96,6 @@ main = topHandler $ do
     commands =
       [ runCommand     `commandAddActionNoArgs` runAction
       , initCommand    `commandAddActionNoArgs` initAction
-      , checkpointCommand `commandAddActionNoArgs` checkpointAction
       ]
 
     commandAddActionNoArgs cmd action =
@@ -244,17 +242,10 @@ runCommand =
       commandOptions      = options
     }
   where
-    notes pname = "Note: the " ++ pname ++ " data lock prevents two "
-               ++ "state-accessing modes from\nbeing run simultaneously.\n\n"
-               ++ "On unix systems you can tell the server to checkpoint its "
-               ++ "database state using:\n"
-               ++ " $ kill -USR1 $the_pid\n"
-               ++ "where $the_pid is the process id of the running server. "
-               ++ "Similarly,\n"
-               ++ " $ kill -USR2 $the_pid\n"
-               ++ "starts an online backup.\n"
-               ++ "Reload html (and other) templates:\n"
+    notes _pname =
+                  "On unix systems you can reload html (and other) templates using:\n"
                ++ " $ kill -HUP $the_pid\n"
+               ++ "where $the_pid is the process id of the running server.\n"
     options _  =
       [ optionVerbosity
           flagRunVerbosity (\v flags -> flags { flagRunVerbosity = v })
@@ -383,11 +374,6 @@ runAction opts = do
 
     onSigTermCleanShutdown
 
-    let checkpointHandler server = do
-          lognotice verbosity "Writing checkpoint..."
-          Server.checkpoint server
-          lognotice verbosity "Done"
-
     let reloadHandler server = do
           lognotice verbosity "Dropping cached static files..."
           Server.reloadDatafiles server
@@ -395,7 +381,6 @@ runAction opts = do
 
     let useTempServer = fromFlag (flagRunTemp opts)
     withServer config' useTempServer $ \server ->
-      withHandler sigUSR1 (checkpointHandler server) $
       withHandler sigHUP  (reloadHandler server) $ do
         lognotice verbosity $ "Ready! Point your browser at " ++ show hosturi
         Server.run server
@@ -615,84 +600,6 @@ initAction opts = do
 
 
 -------------------------------------------------------------------------------
--- Checkpoint command
---
--- Flushes event logs to state tables. After checkpointing, the database
--- is ready for pg_dump.
-
-data CheckpointFlags = CheckpointFlags {
-    flagCheckpointVerbosity :: Flag Verbosity,
-    flagCheckpointStateDir  :: Flag FilePath,
-    flagCheckpointStaticDir :: Flag FilePath,
-    flagCheckpointDbConnStr :: Flag String
-  }
-
-defaultCheckpointFlags :: CheckpointFlags
-defaultCheckpointFlags = CheckpointFlags {
-    flagCheckpointVerbosity = Flag Verbosity.normal,
-    flagCheckpointStateDir  = NoFlag,
-    flagCheckpointStaticDir = NoFlag,
-    flagCheckpointDbConnStr = NoFlag
-  }
-
-checkpointCommand :: CommandUI CheckpointFlags
-checkpointCommand =
-    CommandUI {
-      commandName         = "checkpoint",
-      commandSynopsis     = "Flush event logs and prepare for pg_dump.",
-      commandUsage        = usageAlternatives "checkpoint" ["[FLAGS]"],
-      commandDescription  = Just longDesc,
-      commandNotes        = Nothing,
-      commandDefaultFlags = defaultCheckpointFlags,
-      commandOptions      = options
-    }
-  where
-    longDesc _ = "Flushes all event logs to their corresponding state tables,\n"
-              ++ "so that a pg_dump captures a consistent snapshot.\n\n"
-              ++ "To back up the server:\n"
-              ++ "  1. hackage-server checkpoint\n"
-              ++ "  2. pg_dump <dbname> > backup.sql\n"
-              ++ "  3. tar cf blobs.tar state/blobs/\n\n"
-              ++ "To restore:\n"
-              ++ "  1. createdb <dbname>\n"
-              ++ "  2. psql <dbname> < backup.sql\n"
-              ++ "  3. tar xf blobs.tar\n"
-              ++ "  4. hackage-server run\n"
-    options _  =
-      [ optionVerbosity
-          flagCheckpointVerbosity (\v flags -> flags { flagCheckpointVerbosity = v })
-      , optionStateDir
-          flagCheckpointStateDir (\v flags -> flags { flagCheckpointStateDir = v })
-      , optionStaticDir
-          flagCheckpointStaticDir (\v flags -> flags { flagCheckpointStaticDir = v })
-      , option [] ["db-conn-str"]
-          "PostgreSQL connection string (default: dbname=hackage)"
-          flagCheckpointDbConnStr (\v flags -> flags { flagCheckpointDbConnStr = v })
-          (reqArgFlag "CONNSTR")
-      ]
-
-checkpointAction :: CheckpointFlags -> IO ()
-checkpointAction opts = do
-    defaults <- Server.defaultServerConfig
-
-    let dbConnStr = maybe (confDbConnStr defaults) BS8.pack (flagToMaybe (flagCheckpointDbConnStr opts))
-        stateDir  = fromFlagOrDefault (confStateDir defaults)  (flagCheckpointStateDir  opts)
-        staticDir = fromFlagOrDefault (confStaticDir defaults) (flagCheckpointStaticDir opts)
-        verbosity = fromFlag (flagCheckpointVerbosity opts)
-        config    = defaults {
-                      confVerbosity = verbosity,
-                      confStateDir  = stateDir,
-                      confStaticDir = staticDir,
-                      confDbConnStr = dbConnStr
-                     }
-
-    withServer config False $ \server -> do
-      lognotice verbosity "Writing checkpoint..."
-      Server.checkpoint server
-      lognotice verbosity "Done. Database is ready for pg_dump."
-
-
--------------------------------------------------------------------------------
 -- common action functions
 --
 
@@ -714,7 +621,6 @@ withServer config doTemp = bracket initialise shutdown
       return server
 
     shutdown server = do
-      -- This only shuts down happstack-state and writes a checkpoint;
       -- the HTTP part takes care of itself
       loginfo verbosity "Shutting down..."
       Server.shutdown server

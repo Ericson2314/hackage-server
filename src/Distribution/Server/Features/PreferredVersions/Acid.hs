@@ -43,7 +43,6 @@ acidStore pool =
         , Store.setPreferredInfo = \name ranges versions -> liftIO $ dbSetPreferredInfo pool name ranges versions
         , Store.setMigratedEphemeralPrefs = liftIO $ dbSetMigratedEphemeralPrefs pool
         }
-    , Store.backendState = []  -- no AcidState; data lives in PostgreSQL
     }
 
 ------------------------------------------------------------------------

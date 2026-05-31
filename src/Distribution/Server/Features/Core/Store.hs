@@ -5,7 +5,6 @@ module Distribution.Server.Features.Core.Store
   , Store(..)
   ) where
 
-import Distribution.Server.Framework (AbstractStateComponent)
 import Distribution.Server.Features.Core.State (PackagesState)
 import Distribution.Server.Packages.Index (TarIndexEntry)
 import Distribution.Server.Packages.Types
@@ -20,7 +19,6 @@ import Data.Time.Clock (UTCTime)
 
 data Backend = Backend {
     backendStore :: Store
-  , backendState :: [AbstractStateComponent]
   }
 
 data Store = Store {

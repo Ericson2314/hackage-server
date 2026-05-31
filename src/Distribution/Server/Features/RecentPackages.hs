@@ -71,7 +71,6 @@ recentPackagesFeature _
   = (RecentPackagesFeature{..}, updateRecentCache)
   where
     recentPackagesFeatureInterface = (emptyHackageFeature "recentPackages") {
-      featureState     = [],
       featureCaches    = [
             CacheComponent {
               cacheDesc       = "recent packages and revisions",

@@ -8,7 +8,6 @@ module Distribution.Server (
     initialise,
     run,
     shutdown,
-    checkpoint,
     reloadDatafiles,
 
     -- * Server configuration
@@ -20,7 +19,6 @@ module Distribution.Server (
     hasSavedState,
 
     -- * Server state
-    serverState,
     initState,
 
     -- * Temporary server while loading data
@@ -233,13 +231,6 @@ run server@Server{ serverEnv = env } = do
     exists <- doesDirectoryExist staticDir
     when (not exists) $ fail $ "The static files directory " ++ staticDir ++ " does not exist."
 
-    addCronJob (serverCron env) CronJob {
-      cronJobName      = "Checkpoint all the server state",
-      cronJobFrequency = WeeklyJobFrequency,
-      cronJobOneShot   = False,
-      cronJobAction    = checkpoint server
-    }
-
     mapM_ Feature.featureRunHook (serverFeatures server)
 
     runServer listenOn $ do
@@ -297,31 +288,16 @@ shutdown :: Server -> IO ()
 shutdown server =
   Features.shutdownAllFeatures (serverFeatures server)
 
---TODO: stop accepting incoming connections,
--- wait for connections to be processed.
-
--- | Write out a checkpoint of the server state. This makes recovery quicker
--- because fewer logged transactions have to be replayed.
---
-checkpoint :: Server -> IO ()
-checkpoint server =
-  Features.checkpointAllFeatures (serverFeatures server)
-
 reloadDatafiles :: Server -> IO ()
 reloadDatafiles server =
   mapM_ Feature.featureReloadFiles (serverFeatures server)
 
--- | Return /one/ abstract state component per feature
-serverState :: Server -> [(String, AbstractStateComponent)]
-serverState server = [ (featureName feature, mconcat (featureState feature))
-                     | feature <- serverFeatures server
-                     ]
 
 -- | Initialize a fresh server with a default admin account.
 -- The PostgreSQL schema is already created; this just adds the admin user.
 initState ::  Server -> (String, String) -> IO ()
 initState server (admin, pass) = do
-    checkpoint server
+    -- create default admin user
     let UserFeature{updateAddUser, adminGroup} = serverUserFeature server
     muid <- case simpleParse admin of
         Just uname -> do

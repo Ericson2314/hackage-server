@@ -131,7 +131,7 @@ versionsFeature ServerEnv{ serverVerbosity = verbosity }
                 UploadFeature{..}
                 TagsFeature{..}
                 UserFeature{ guardAuthorised_ }
-                Store.Backend{backendStore = preferredStore, backendState}
+                Store.Backend{backendStore = preferredStore}
                 deprecatedHook
                 updatePreferredHook
   = VersionsFeature{..}
@@ -147,7 +147,6 @@ versionsFeature ServerEnv{ serverVerbosity = verbosity }
             ]
       , featurePostInit = do updateDeprecatedTags
                              ephemeralPrefsMigration
-      , featureState    = backendState
       }
 
     queryGetPreferredInfo :: MonadIO m => PackageName -> m PreferredInfo

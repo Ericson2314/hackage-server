@@ -5,7 +5,6 @@ module Distribution.Server.Features.Users.Store
   , Store(..)
   ) where
 
-import Distribution.Server.Framework (AbstractStateComponent)
 import Distribution.Server.Users.Group (UserIdSet)
 import Distribution.Server.Users.Types (AuthToken, UserAuth, UserId, UserInfo, UserName)
 import Distribution.Server.Users.Users
@@ -22,7 +21,6 @@ import Data.Text (Text)
 
 data Backend = Backend {
     backendStore :: Store
-  , backendState :: [AbstractStateComponent]
   }
 
 data Store = Store {

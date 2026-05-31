@@ -6,7 +6,6 @@ module Distribution.Server.Features.AnalyticsPixels.Store
   ) where
 
 import Distribution.Server.Features.AnalyticsPixels.Types
-import Distribution.Server.Framework (AbstractStateComponent)
 
 import Distribution.Package (PackageName)
 
@@ -15,7 +14,6 @@ import Data.Set (Set)
 
 data Backend = Backend {
     backendStore :: Store
-  , backendState :: [AbstractStateComponent]
   }
 
 data Store = Store {

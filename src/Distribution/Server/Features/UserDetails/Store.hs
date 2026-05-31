@@ -6,7 +6,6 @@ module Distribution.Server.Features.UserDetails.Store
   ) where
 
 import Distribution.Server.Features.UserDetails.Types
-import Distribution.Server.Framework (AbstractStateComponent)
 import Distribution.Server.Users.Types (UserId)
 
 import Control.Monad.Trans (MonadIO)
@@ -14,7 +13,6 @@ import Data.Text (Text)
 
 data Backend = Backend {
     backendStore :: Store
-  , backendState :: [AbstractStateComponent]
   }
 
 data Store = Store {

@@ -35,7 +35,6 @@ acidStore pool =
       , addPackageAnalyticsPixel = \name pixel -> liftIO $ dbAddPackageAnalyticsPixel pool name pixel
       , removePackageAnalyticsPixel = \name pixel -> liftIO $ dbRemovePackageAnalyticsPixel pool name pixel
       }
-    , backendState = []  -- no AcidState; data lives in PostgreSQL
     }
 
 ------------------------------------------------------------------------

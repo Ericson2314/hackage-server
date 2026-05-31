@@ -7,14 +7,12 @@ module Distribution.Server.Features.PackageCandidates.Store
 
 import Distribution.Package (PackageId, PackageName)
 import Distribution.Server.Features.PackageCandidates.Types (CandPkgInfo)
-import Distribution.Server.Framework (AbstractStateComponent)
 import Distribution.Server.Packages.Types (PkgInfo)
 
 import Control.Monad.Trans (MonadIO)
 
 data Backend = Backend {
     backendStore :: Store
-  , backendState :: [AbstractStateComponent]
   }
 
 data Store = Store {

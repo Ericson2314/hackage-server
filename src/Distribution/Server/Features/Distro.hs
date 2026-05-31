@@ -83,7 +83,7 @@ distroFeature :: UserFeature
               -> DistroFeature
 distroFeature UserFeature{..}
               CoreFeature{coreResource=CoreResource{packageInPath}}
-              Store.Backend{backendStore = distrosStore, backendState}
+              Store.Backend{backendStore = distrosStore}
               maintainersGroupResource
               distroGroup
   = DistroFeature{..}
@@ -98,7 +98,6 @@ distroFeature UserFeature{..}
             , distroPackages
             , distroPackage
             ]
-      , featureState = backendState
       }
 
     queryPackageStatus :: MonadIO m => PackageName -> m [(DistroName, DistroPackageInfo)]

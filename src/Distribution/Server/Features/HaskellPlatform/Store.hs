@@ -5,7 +5,6 @@ module Distribution.Server.Features.HaskellPlatform.Store
   , Store(..)
   ) where
 
-import Distribution.Server.Framework (AbstractStateComponent)
 
 import Distribution.Package (PackageName)
 import Distribution.Version (Version)
@@ -14,7 +13,6 @@ import Control.Monad.Trans (MonadIO)
 
 data Backend = Backend {
     backendStore :: Store
-  , backendState :: [AbstractStateComponent]
   }
 
 data Store = Store {

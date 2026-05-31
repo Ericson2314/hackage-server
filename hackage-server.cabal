@@ -238,7 +238,6 @@ library
     Distribution.Server.Framework.Logging
     Distribution.Server.Framework.BeamInstances
     Distribution.Server.Framework.BeamPrefixed
-    Distribution.Server.Framework.EventSourcing
     Distribution.Server.Framework.Feature
     Distribution.Server.Framework.PostgreSQL
     Distribution.Server.Framework.PgTx

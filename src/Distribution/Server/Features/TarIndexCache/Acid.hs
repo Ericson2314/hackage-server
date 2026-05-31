@@ -34,7 +34,6 @@ acidStore pool =
         , findTarIndex          = dbFindTarIndex pool
         , setTarIndex           = dbSetTarIndex pool
         }
-    , backendState = []  -- no AcidState; data lives in PostgreSQL
     }
 
 ------------------------------------------------------------------------

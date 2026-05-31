@@ -61,7 +61,6 @@ acidStore serverPgConn = do
         , Store.addAdmin = liftIO . dbAddHackageAdmin serverPgConn
         , Store.removeAdmin = liftIO . dbRemoveHackageAdmin serverPgConn
         }
-    , Store.backendState = []  -- no AcidState; data lives in PostgreSQL
     }
 
 ------------------------------------------------------------------------

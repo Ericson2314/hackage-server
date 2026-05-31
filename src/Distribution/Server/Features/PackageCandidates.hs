@@ -174,7 +174,7 @@ candidatesFeature ServerEnv{serverBlobStore = store}
                              }
                   UploadFeature{..}
                   TarIndexCacheFeature{packageTarball, findToplevelFile}
-                  Store.Backend{backendStore = candidatesStore, backendState}
+                  Store.Backend{backendStore = candidatesStore}
   = PackageCandidatesFeature{..}
   where
     candidatesFeatureInterface = (emptyHackageFeature "candidates") {
@@ -192,7 +192,6 @@ candidatesFeature ServerEnv{serverBlobStore = store}
             , candidateContents
             , candidateChangeLog
             ]
-      , featureState = backendState
       }
 
     queryGetCandidateIndex :: MonadIO m => m (PackageIndex CandPkgInfo)

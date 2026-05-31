@@ -99,7 +99,6 @@ initBrowseFeature ServerEnv{serverTemplatesDir, serverTemplatesMode} = do
               ]
             }
           ]
-        , featureState = []
         }
 
 data PaginationConfig = PaginationConfig

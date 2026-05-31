@@ -41,7 +41,6 @@ acidStore pool =
         , Store.addPackageMaintainer = \name -> liftIO . dbAddPackageMaintainer pool name
         , Store.removePackageMaintainer = \name -> liftIO . dbRemovePackageMaintainer pool name
         }
-    , Store.backendState = []  -- no AcidState; data lives in PostgreSQL
     }
 
 ------------------------------------------------------------------------

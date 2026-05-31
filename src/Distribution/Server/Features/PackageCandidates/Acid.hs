@@ -31,5 +31,4 @@ acidStore pool = do
               Nothing   -> (False, st)
               Just cand -> (True, st { State.candidateList = PackageIndex.insert (cand { candPkgInfo = pkginfo }) (State.candidateList st) })
         }
-    , Store.backendState = []  -- no AcidState; data lives in PostgreSQL
     }

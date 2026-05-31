@@ -84,7 +84,7 @@ votesFeature ::  ServerEnv
              -> VotesFeature
 
 votesFeature  ServerEnv{..}
-              Backend{backendStore = votesState, backendState}
+              Backend{backendStore = votesState}
               CoreFeature { coreResource = CoreResource{..} }
               UserFeature{..}
               votesUpdated
@@ -95,7 +95,6 @@ votesFeature  ServerEnv{..}
         featureResources = [ packagesVotesResource
                            , packageVotesResource
                            ]
-      , featureState     = backendState
       }
 
 

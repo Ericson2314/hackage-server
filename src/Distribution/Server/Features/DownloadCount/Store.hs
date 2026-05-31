@@ -6,7 +6,6 @@ module Distribution.Server.Features.DownloadCount.Store
   ) where
 
 import qualified Distribution.Server.Features.DownloadCount.State as State
-import Distribution.Server.Framework (AbstractStateComponent)
 
 import Distribution.Package (PackageId)
 
@@ -15,7 +14,6 @@ import Data.Time.Calendar (Day)
 
 data Backend = Backend {
     backendStore :: Store
-  , backendState :: [AbstractStateComponent]
   }
 
 data Store = Store {

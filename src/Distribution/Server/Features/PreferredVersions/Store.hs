@@ -7,7 +7,6 @@ module Distribution.Server.Features.PreferredVersions.Store
 
 import Distribution.Package (PackageName)
 import Distribution.Server.Features.PreferredVersions.State (PreferredInfo)
-import Distribution.Server.Framework (AbstractStateComponent)
 import Distribution.Version (Version, VersionRange)
 
 import Control.Monad.Trans (MonadIO)
@@ -15,7 +14,6 @@ import Data.Map (Map)
 
 data Backend = Backend {
     backendStore :: Store
-  , backendState :: [AbstractStateComponent]
   }
 
 data Store = Store {

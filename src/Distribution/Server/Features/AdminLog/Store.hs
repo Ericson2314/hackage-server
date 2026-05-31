@@ -6,7 +6,6 @@ module Distribution.Server.Features.AdminLog.Store
   ) where
 
 import Distribution.Server.Features.AdminLog.Types (AdminAction)
-import Distribution.Server.Framework (AbstractStateComponent)
 import Distribution.Server.Users.Types (UserId)
 
 import Control.Monad.Trans (MonadIO)
@@ -15,7 +14,6 @@ import qualified Data.ByteString.Lazy.Char8 as BS
 
 data Backend = Backend {
     backendStore :: Store
-  , backendState :: [AbstractStateComponent]
   }
 
 data Store = Store {

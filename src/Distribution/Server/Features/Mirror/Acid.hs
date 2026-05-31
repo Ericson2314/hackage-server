@@ -30,7 +30,6 @@ acidStore pool =
         , addMirrorClient      = liftIO . dbAddMirrorClient pool
         , removeMirrorClient   = liftIO . dbRemoveMirrorClient pool
         }
-    , backendState = []  -- no AcidState; data lives in PostgreSQL
     }
 
 ------------------------------------------------------------------------

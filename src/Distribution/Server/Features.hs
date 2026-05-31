@@ -443,21 +443,10 @@ initHackageFeatures env@ServerEnv{serverVerbosity = verbosity} = do
       logTiming verbosity ("Initialising " ++ feature ++ " feature done") action
 
 
--- | Checkpoint a feature's persistent state to disk.
-featureCheckpoint :: HackageFeature -> IO ()
-featureCheckpoint = mapM_ abstractStateCheckpoint . featureState
-
--- | Checkpoint all features' persistent state.
-checkpointAllFeatures :: [HackageFeature] -> IO ()
-checkpointAllFeatures = mapM_ featureCheckpoint
-
--- | Cleanly shut down a feature: run its pre-shutdown hook, then close its
--- state components.
+-- | Cleanly shut down a feature: run its pre-shutdown hook.
 featureShutdown :: HackageFeature -> IO ()
-featureShutdown feature = do
-  featurePreShutdown feature
-  mapM_ abstractStateClose (featureState feature)
+featureShutdown = featurePreShutdown
 
--- | Cleanly shut down all features' state components.
+-- | Cleanly shut down all features.
 shutdownAllFeatures :: [HackageFeature] -> IO ()
 shutdownAllFeatures   = mapM_ featureShutdown . reverse

@@ -5,7 +5,6 @@ module Distribution.Server.Features.Vouch.Store
   , Store(..)
   ) where
 
-import Distribution.Server.Framework (AbstractStateComponent)
 import Distribution.Server.Users.Types (UserId)
 
 import Control.Monad.Trans (MonadIO)
@@ -13,7 +12,6 @@ import Data.Time (UTCTime)
 
 data Backend = Backend {
     backendStore :: Store
-  , backendState :: [AbstractStateComponent]
   }
 
 data Store = Store {

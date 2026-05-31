@@ -345,21 +345,8 @@ initCoreFeature env@ServerEnv{serverPgConn, serverCacheDelay,
         logTiming verbosity "migrating PkgTarball" $
           Store.migratePackageTarballs packagesStore
 
-        -- Create a checkpoint
-        --
-        -- Creating a checkpoint after the migration is important for two
-        -- reasons: one, the migration is expensive and we don't want to  repeat
-        -- it. But there is a second, more important reason. Until we have
-        -- migrated we do not have a package log. This means that if we have a
-        -- DB with no checkpoints at all but some old style (pre introduction of
-        -- the package log) transactions as well as some new style transactions
-        -- (post introduction of the package log), those new transactions will
-        -- not be updating the package log. Since migration does not happen
-        -- until _after_ replaying all those transactions, this means we would
-        -- reconstruct the package log rather than use the package log as it was
-        -- constructed in the first place, and we might potentially lose
-        -- information.
-        return () -- each update is already durable
+        -- No checkpoint needed — each update writes directly to PostgreSQL
+        return ()
 
       rec let (feature, getIndexTarball)
                 = coreFeature env users
@@ -404,7 +391,7 @@ coreFeature :: ServerEnv
                , IO IndexTarballInfo )
 
 coreFeature ServerEnv{serverBlobStore = store} UserFeature{..}
-            Store.Backend{backendStore = packagesStore, backendState} cacheIndexTarball
+            Store.Backend{backendStore = packagesStore} cacheIndexTarball
             packageChangeHook
             preIndexUpdateHook
             packageDownloadHook
@@ -427,7 +414,6 @@ coreFeature ServerEnv{serverBlobStore = store} UserFeature{..}
           , coreAdminDeauth
           , corePackUserDeauth
           ]
-      , featureState    = backendState
       , featureCaches   = [
             CacheComponent {
               cacheDesc       = "main package index tarball",

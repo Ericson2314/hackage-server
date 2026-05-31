@@ -32,7 +32,6 @@ acidStore pool =
         , Store.setUserNameContact = \uid name email -> liftIO $ dbSetUserNameContact pool uid name email
         , Store.setUserAdminInfo = \uid kind notes -> liftIO $ dbSetUserAdminInfo pool uid kind notes
         }
-    , Store.backendState = []  -- no AcidState; data lives in PostgreSQL
     }
 
 ---------------------

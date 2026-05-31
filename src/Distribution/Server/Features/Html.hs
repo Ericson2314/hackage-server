@@ -258,7 +258,6 @@ htmlFeature env@ServerEnv{..}
   where
     htmlFeatureInterface = (emptyHackageFeature "html") {
         featureResources = htmlResources
-      , featureState     = []
       , featureCaches    = [
            CacheComponent {
              cacheDesc       = "packages page by category",

@@ -383,7 +383,7 @@ userNotifyFeature UserFeature{..}
                   TagsFeature{..}
                   ReverseFeature{queryReverseIndex}
                   VouchFeature{drainQueuedNotifications}
-                  Store.Backend{backendStore = notifyStore, backendState}
+                  Store.Backend{backendStore = notifyStore}
                   templates
   = UserNotifyFeature {..}
 
@@ -392,7 +392,6 @@ userNotifyFeature UserFeature{..}
     userNotifyFeatureInterface = (emptyHackageFeature "user-notify") {
         featureDesc      = "Notifications to users on metadata updates."
       , featureResources = [userNotifyResource] -- TODO we can add json features here for updating prefs
-      , featureState     = backendState
       , featureCaches    = []
       , featureReloadFiles = reloadTemplates templates
       , featurePostInit  = setupNotifyCronJob

@@ -75,7 +75,6 @@ acidStore _name pool = do
         , Store.setFailStatus = \pkgid status -> liftIO $ dbModifyBuildReports pool (BuildReports.setFailStatus pkgid status)
         , Store.addRptAllLogsCovg = \pkgid report -> modifyAdd (BuildReports.addRptLogTestCovg pkgid report)
         }
-    , Store.backendState = []  -- no AcidState; data lives in PostgreSQL
     }
 
 ------------------------------------------------------------------------

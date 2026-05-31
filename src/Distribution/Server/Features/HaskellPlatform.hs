@@ -63,7 +63,6 @@ platformFeature Store.Backend{..}
               platformPackage
             , platformPackages
             ]
-      , featureState = backendState
       }
 
     platformResource = fix $ \r -> PlatformResource

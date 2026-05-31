@@ -17,7 +17,7 @@ import Text.XHtml.Strict (prettyHtmlFragment, stringToHtml, li)
 import Distribution.Server.Framework ((</>), DynamicPath, HackageFeature, IsHackageFeature, IsHackageFeature(..))
 import Distribution.Server.Framework (MessageSpan(MText), Method(..), Response, ServerEnv(..), ServerPartE)
 import Distribution.Server.Framework (emptyHackageFeature, errBadRequest)
-import Distribution.Server.Framework (featureDesc, featureReloadFiles, featureResources, featureState)
+import Distribution.Server.Framework (featureDesc, featureReloadFiles, featureResources)
 import Distribution.Server.Framework (liftIO, resourceAt, resourceDesc, resourceGet)
 import Distribution.Server.Framework (resourcePost, toResponse)
 import Distribution.Server.Framework.Templating (($=), TemplateAttr, getTemplate, loadTemplates, reloadTemplates, templateUnescaped)
@@ -166,7 +166,6 @@ initVouchFeature ServerEnv{serverPgConn, serverTemplatesDir, serverTemplatesMode
               , resourcePost = [("html", handlePostVouch)]
               }
             ]
-          , featureState = Store.backendState vouchBackend
           , featureReloadFiles = reloadTemplates templates
           },
       drainQueuedNotifications = Store.drainQueuedNotifications vouchStore

@@ -122,7 +122,6 @@ downloadFeature CoreFeature{}
         featureResources = [ topDownloads downloadResource
                            ]
       , featureRunHook   = void $ forkIO (flushDownloadsLoop serverFlushDownloadsPeriod)
-      , featureState     = Store.backendState inMemBackend
       , featurePreShutdown = shutdownFlush
       , featureCaches    = [
             CacheComponent {

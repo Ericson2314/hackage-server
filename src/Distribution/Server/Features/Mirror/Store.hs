@@ -5,7 +5,6 @@ module Distribution.Server.Features.Mirror.Store
   , Store(..)
   ) where
 
-import Distribution.Server.Framework (AbstractStateComponent)
 import Distribution.Server.Users.UserIdSet (UserIdSet)
 import Distribution.Server.Users.Types (UserId)
 
@@ -13,7 +12,6 @@ import Control.Monad.Trans (MonadIO)
 
 data Backend = Backend {
     backendStore :: Store
-  , backendState :: [AbstractStateComponent]
   }
 
 data Store = Store {

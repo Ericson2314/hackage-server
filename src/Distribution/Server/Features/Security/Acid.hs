@@ -45,7 +45,6 @@ acidStore _env pool =
         , Store.resignSnapshotAndTimestamp = \maxAge now -> liftIO $
             dbModifySecurityState pool (State.resignSnapshotAndTimestamp maxAge now)
         }
-    , Store.backendState = []  -- no AcidState; data lives in PostgreSQL
     }
 
 ------------------------------------------------------------------------

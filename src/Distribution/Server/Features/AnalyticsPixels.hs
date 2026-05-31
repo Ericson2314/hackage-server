@@ -77,7 +77,7 @@ analyticsPixelsFeature :: ServerEnv
                       -> AnalyticsPixelsFeature
 
 analyticsPixelsFeature  ServerEnv{..}
-              Store.Backend{backendStore = analyticsPixelsState, backendState}
+              Store.Backend{backendStore = analyticsPixelsState}
               CoreFeature { coreResource = CoreResource{..} }
               UserFeature{..}
               UploadFeature{..}
@@ -88,7 +88,6 @@ analyticsPixelsFeature  ServerEnv{..}
     analyticsPixelsFeatureInterface  = (emptyHackageFeature "AnalyticsPixels") {
         featureDesc      = "Allow users to attach analytics pixels to their packages",
         featureResources = [analyticsPixelsResource, userAnalyticsPixelsResource]
-      , featureState     = backendState
       }
 
     analyticsPixelsResource :: Resource

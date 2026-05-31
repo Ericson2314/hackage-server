@@ -72,7 +72,6 @@ searchFeature ServerEnv{serverBaseURI} CoreFeature{..} ListFeature{getAllLists}
           , searchPackagesResource
 --          , searchSuggestResource
           ]
-      , featureState  = []
       , featureCaches = [
             CacheComponent {
               cacheDesc       = "package search engine",

@@ -48,7 +48,6 @@ acidStore pool =
         , Store.insertReviewTags = \pkgname add del -> liftIO $ dbInsertReviewTags pool pkgname add del
         , Store.replaceReviewTags = \pkgname add del -> liftIO $ dbInsertReviewTags' pool pkgname add del
         }
-    , Store.backendState = []  -- no AcidState; data lives in PostgreSQL
     }
 
 ------------------------------------------------------------------------

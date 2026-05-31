@@ -6,7 +6,6 @@ module Distribution.Server.Features.UserSignup.Store
   ) where
 
 import Distribution.Server.Features.UserSignup.Types (SignupResetInfo)
-import Distribution.Server.Framework (AbstractStateComponent)
 import Distribution.Server.Util.Nonce (Nonce)
 
 import Control.Monad.Trans (MonadIO)
@@ -14,7 +13,6 @@ import Data.Time (UTCTime)
 
 data Backend = Backend {
     backendStore :: Store
-  , backendState :: [AbstractStateComponent]
   }
 
 data Store = Store {

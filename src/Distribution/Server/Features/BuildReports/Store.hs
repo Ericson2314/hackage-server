@@ -9,14 +9,12 @@ import Distribution.Package (PackageId)
 import Distribution.Server.Features.BuildReports.BuildReport (BuildReport)
 import Distribution.Server.Features.BuildReports.BuildReports
   ( BuildReportId, BuildCovg, BuildLog, BuildStatus, TestLog, TestReportLog )
-import Distribution.Server.Framework (AbstractStateComponent)
 
 import Control.Monad.Trans (MonadIO)
 import Data.Time.Clock (UTCTime)
 
 data Backend = Backend {
     backendStore :: Store
-  , backendState :: [AbstractStateComponent]
   }
 
 data Store = Store {

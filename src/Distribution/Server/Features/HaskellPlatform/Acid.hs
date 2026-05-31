@@ -40,7 +40,6 @@ acidStore pool =
         , setPlatform = \pkgname versions -> liftIO $ dbSetPlatformPackage pool pkgname (Set.fromList versions)
         , removePlatform = \pkgname -> liftIO $ dbSetPlatformPackage pool pkgname Set.empty
         }
-    , backendState = []  -- no AcidState; data lives in PostgreSQL
     }
 
 ------------------------------------------------------------------------

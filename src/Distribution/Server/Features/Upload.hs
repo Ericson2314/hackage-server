@@ -161,7 +161,7 @@ uploadFeature ServerEnv{serverBlobStore = store}
                          , updateAddPackage
                          }
               UserFeature{..}
-              UploadStore.Backend{backendStore = uploadStore, backendState = uploadStateComponents}
+              UploadStore.Backend{backendStore = uploadStore}
               trusteesGroup    trusteesGroupResource
               uploadersGroup   uploadersGroupResource
               maintainersGroup maintainersGroupResource
@@ -180,7 +180,6 @@ uploadFeature ServerEnv{serverBlobStore = store}
             , groupResource     uploadersGroupResource
             , groupUserResource uploadersGroupResource
             ]
-      , featureState = uploadStateComponents
       }
 
     uploadResource = UploadResource

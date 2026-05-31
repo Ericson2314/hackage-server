@@ -140,7 +140,6 @@ userSignupFeature ServerEnv{serverBaseURI, serverCron}
                             signupRequestResource,
                             resetRequestsResource,
                             resetRequestResource]
-      , featureState     = Store.backendState signupResetBackend
       , featureCaches    = []
       , featureReloadFiles = reloadTemplates templates
       , featurePostInit  = setupExpireCronJob

@@ -70,14 +70,13 @@ userDetailsFeature :: Templates
                    -> CoreFeature
                    -> UploadFeature
                    -> UserDetailsFeature
-userDetailsFeature templates Store.Backend{backendStore = userDetailsStore, backendState} UserFeature{..} CoreFeature{..} UploadFeature{uploadersGroup}
+userDetailsFeature templates Store.Backend{backendStore = userDetailsStore} UserFeature{..} CoreFeature{..} UploadFeature{uploadersGroup}
   = UserDetailsFeature {..}
 
   where
     userDetailsFeatureInterface = (emptyHackageFeature "user-details") {
         featureDesc      = "Extra information about user accounts, email addresses etc."
       , featureResources = [userNameContactResource, userAdminInfoResource]
-      , featureState     = backendState
       , featureCaches    = []
       }
 

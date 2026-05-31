@@ -38,7 +38,6 @@ acidStore pool =
         , Store.getNotificationData = liftIO $ Acid.unNotifyData <$> dbGetNotifyData pool
         , Store.setNotifyTime = liftIO . dbSetNotifyTime pool
         }
-    , Store.backendState = []  -- no AcidState; data lives in PostgreSQL
     }
 
 ----------------------------

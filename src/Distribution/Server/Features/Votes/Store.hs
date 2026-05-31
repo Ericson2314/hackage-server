@@ -7,7 +7,6 @@ module Distribution.Server.Features.Votes.Store
   ) where
 
 import Distribution.Server.Features.Votes.Types
-import Distribution.Server.Framework.Feature (AbstractStateComponent)
 import Distribution.Server.Users.Types (UserId)
 
 import Distribution.Package (PackageName)
@@ -19,7 +18,6 @@ import qualified Data.Map as Map
 
 data Backend = Backend {
     backendStore :: Store
-  , backendState :: [AbstractStateComponent]
   }
 
 data Store = Store {

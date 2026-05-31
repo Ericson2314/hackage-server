@@ -16,7 +16,6 @@ serverCrashFeature = (emptyHackageFeature "crash") {
         , resourceGet  = [ ("", throwUserError) ]
         }
       ]
-  , featureState = []
   }
 
 throwUserError :: DynamicPath -> ServerPartE Response

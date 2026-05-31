@@ -43,7 +43,6 @@ acidStore pool =
       , getPackageUserVoted   = \pkgname uid -> liftIO $ dbDidUserVote pool pkgname uid
       , getPackageUserVote    = \pkgname uid -> liftIO $ dbPkgUserVote pool pkgname uid
       }
-    , backendState = []  -- no AcidState; data lives in PostgreSQL
     }
 
 ------------------------------------------------------------------------

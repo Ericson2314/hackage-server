@@ -7,7 +7,6 @@ module Distribution.Server.Features.Tags.Store
 
 import Distribution.Package (PackageName)
 import Distribution.Server.Features.Tags.Types (Tag)
-import Distribution.Server.Framework (AbstractStateComponent)
 
 import Control.Monad.Trans (MonadIO)
 import Data.Map (Map)
@@ -15,7 +14,6 @@ import Data.Set (Set)
 
 data Backend = Backend {
     backendStore :: Store
-  , backendState :: [AbstractStateComponent]
   }
 
 data Store = Store {

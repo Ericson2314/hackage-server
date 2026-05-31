@@ -296,7 +296,7 @@ userFeature :: Templates
             -> GroupResource
             -> ServerEnv
             -> (UserFeature, UserGroup)
-userFeature templates UserStore.Backend{backendStore = userStore, backendState = userStateComponents}
+userFeature templates UserStore.Backend{backendStore = userStore}
              groupIndex userAdded authFailHook groupChangedHook
              adminGroup adminResource userFeatureServerEnv
   = (UserFeature {..}, adminGroupDesc)
@@ -316,7 +316,6 @@ userFeature templates UserStore.Backend{backendStore = userStore, backendState =
               groupResource adminResource
             , groupUserResource adminResource
             ]
-      , featureState = userStateComponents
       , featureCaches = [
             CacheComponent {
               cacheDesc       = "user group index",

@@ -106,7 +106,7 @@ buildReportsFeature name
                                 , lookupPackageId
                                 , corePackagePage
                                 }
-                    Store.Backend{backendStore = reportsStore, backendState}
+                    Store.Backend{backendStore = reportsStore}
   = ReportsFeature{..}
   where
     reportsFeatureInterface = (emptyHackageFeature name) {
@@ -121,7 +121,6 @@ buildReportsFeature name
             , reportsReset
             , reportsTestsEnabled
             ]
-      , featureState = backendState
       }
 
     reportsResource = ReportsResource

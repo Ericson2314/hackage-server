@@ -138,7 +138,6 @@ reverseFeature queryGetPackageIndex
     reverseFeatureInterface = (emptyHackageFeature "reverse") {
         featureResources = map ($ reverseResource) []
       , featurePostInit  = initReverseIndex
-      , featureState     = []
       , featureCaches    = [
               CacheComponent {
                      cacheDesc       = "reverse index",

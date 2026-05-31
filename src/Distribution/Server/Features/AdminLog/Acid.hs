@@ -32,7 +32,6 @@ acidStore pool =
           getAdminLog = liftIO $ State.adminLog <$> dbGetAdminLog pool
         , addAdminLog = \(ts, uid, action, reason) -> liftIO $ dbAddAdminLogEntry pool ts uid action reason
         }
-    , backendState = []  -- no AcidState; data lives in PostgreSQL
     }
 
 ------------------------------------------------------------------------

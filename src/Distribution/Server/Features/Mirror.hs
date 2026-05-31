@@ -93,7 +93,7 @@ mirrorFeature ServerEnv{serverBlobStore = store}
                          , updateSetPackageUploader
                          }
               UserFeature{..}
-              Store.Backend{backendStore = mirrorersState, backendState}
+              Store.Backend{backendStore = mirrorersState}
               mirrorGroup mirrorGroupResource
   = (MirrorFeature{..}, mirrorersGroupDesc)
   where
@@ -109,7 +109,6 @@ mirrorFeature ServerEnv{serverBlobStore = store}
             [ groupResource     mirrorGroupResource
             , groupUserResource mirrorGroupResource
             ]
-      , featureState = backendState
       }
 
     mirrorResource = MirrorResource {

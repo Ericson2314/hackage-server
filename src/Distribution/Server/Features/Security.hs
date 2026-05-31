@@ -103,12 +103,11 @@ initSecurityFeature env = do
 securityFeature :: ServerEnv
                 -> Store.Backend
                 -> SecurityFeature
-securityFeature env Store.Backend{backendStore = securityStore, backendState = securityStateComponents} =
+securityFeature env Store.Backend{backendStore = securityStore} =
     SecurityFeature{..}
   where
     securityFeatureInterface = (emptyHackageFeature "security") {
         featureDesc        = "TUF Security"
-      , featureState       = securityStateComponents
       , featureReloadFiles = updateRootMirrorsAndKeys env securityStore
       , featurePostInit    = updateRootMirrorsAndKeys env securityStore
                           >> setupResignCronJob env securityStore

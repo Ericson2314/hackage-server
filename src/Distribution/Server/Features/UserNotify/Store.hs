@@ -6,7 +6,6 @@ module Distribution.Server.Features.UserNotify.Store
   ) where
 
 import qualified Distribution.Server.Features.UserNotify.Acid as Acid
-import Distribution.Server.Framework (AbstractStateComponent)
 import Distribution.Server.Users.Types (UserId)
 
 import Control.Monad.Trans (MonadIO)
@@ -15,7 +14,6 @@ import Data.Time (UTCTime)
 
 data Backend = Backend {
     backendStore :: Store
-  , backendState :: [AbstractStateComponent]
   }
 
 data Store = Store {

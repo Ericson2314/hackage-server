@@ -132,7 +132,7 @@ tagsFeature :: CoreFeature
 tagsFeature CoreFeature{ queryLatestPackages }
             UploadFeature{ maintainersGroup, trusteesGroup }
             UserFeature{ guardAuthorised' }
-            Store.Backend{backendStore = tagsStore, backendState}
+            Store.Backend{backendStore = tagsStore}
             calculatedTags
             tagsUpdated
             tagProposalLog
@@ -163,7 +163,6 @@ tagsFeature CoreFeature{ queryLatestPackages }
             , packageTagsListing
             ]
       , featurePostInit = initImmutableTags
-      , featureState    = backendState
       , featureCaches   = [
             CacheComponent {
               cacheDesc       = "calculated tags",

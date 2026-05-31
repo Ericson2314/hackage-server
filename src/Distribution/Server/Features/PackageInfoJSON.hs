@@ -164,7 +164,6 @@ initPackageInfoJSONFeature _env = do
             , Framework.featureResources = jsonResources
             , Framework.featureCaches    = []
             , Framework.featurePostInit  = pure ()
-            , Framework.featureState     = []
             }
       }
 

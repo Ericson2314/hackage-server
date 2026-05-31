@@ -62,21 +62,8 @@ instance MemSize PackagesState where
 
 -- | Initial packages state
 --
--- NOTE: If we are starting from a fresh DB, obviously migration is not needed.
--- However, if we are not, but we _are_ starting from an initial DB value, this
--- must mean we are starting a server with an existing DB but no checkpoint. In
--- this case we might have old transactions to replay, so we might have to
--- migrate. The need for migration is indicated by having a 'Left' value for
--- the 'packageUpdateLog'.
---
--- If we failed to migrate these old transactions, two things would go wrong:
---
--- * We would add the 'CabalFileEntry's to the package log, but we would be
---   missing the corresponding TUF entries.
--- * Since the transaction has a 'PkgTarball' as argument, we would end up with
---   migrated 'PkgTarball's in the package DB (that is, 'PkgTarball_v2_v1's),
---   BUT with a non-'Left' update log, so we would fail to notice on start-up
---   that we need to migrate.
+-- The 'freshDB' flag controls whether the update log starts as 'Right' (fresh,
+-- no migration needed) or 'Left' (needs migration on first startup).
 initialPackagesState :: Bool -> PackagesState
 initialPackagesState freshDB = PackagesState {
     packageIndex     = mempty,

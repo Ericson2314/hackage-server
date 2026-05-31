@@ -5,7 +5,6 @@ module Distribution.Server.Features.Documentation.Store
   , Store(..)
   ) where
 
-import Distribution.Server.Framework (AbstractStateComponent)
 import Distribution.Server.Framework.BlobStorage (BlobId)
 
 import Distribution.Package (PackageId, PackageIdentifier)
@@ -15,7 +14,6 @@ import Data.Map (Map)
 
 data Backend = Backend {
     backendStore :: Store
-  , backendState :: [AbstractStateComponent]
   }
 
 data Store = Store {

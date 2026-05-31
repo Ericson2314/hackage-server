@@ -54,15 +54,14 @@ initAdminLogFeature ServerEnv{serverPgConn} = do
 adminLogFeature :: UserFeature
                 -> Store.Backend
                 -> AdminLogFeature
-adminLogFeature UserFeature{..} Store.Backend{backendStore = adminLogStore, backendState}
+adminLogFeature UserFeature{..} Store.Backend{backendStore = adminLogStore}
   = AdminLogFeature {..}
 
   where
     adminLogFeatureInterface =
       (emptyHackageFeature "admin-actions-log") {
         featureDesc      = "Log of additions and removals of users from groups.",
-        featureResources = [adminLogResource],
-        featureState     = backendState
+        featureResources = [adminLogResource]
       }
 
     adminLogResource :: Resource

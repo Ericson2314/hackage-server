@@ -54,7 +54,6 @@ acidStore pool = do
           -- each update is already durable
         , Store.checkpointInMemStats = return ()
         }
-    , Store.backendState = []  -- no AcidState; data lives in PostgreSQL
     }
 
 ------------------------------------------------------------------------

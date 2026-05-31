@@ -35,7 +35,6 @@ acidStore pool =
         , Store.queueVouchCompleteNotification = liftIO . dbAddNotNotified pool
         , Store.drainQueuedNotifications = liftIO $ dbDrainNotNotified pool
         }
-    , Store.backendState = []  -- no AcidState; data lives in PostgreSQL
     }
 
 ------------------------------------------------------------------------

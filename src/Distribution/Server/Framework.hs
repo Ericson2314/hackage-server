@@ -9,7 +9,6 @@ module Distribution.Server.Framework (
     module Happstack.Server.Error,
     module Happstack.Server.Monads,
     module Happstack.Server.Types,
-    module Distribution.Server.Framework.EventSourcing,
     module Distribution.Server.Framework.PostgreSQL,
     module Distribution.Server.Framework.PgTx,
     module Distribution.Server.Framework.MemState,
@@ -45,7 +44,6 @@ import Happstack.Server.Error
 import Happstack.Server.Monads
 import Happstack.Server.Types
 
-import Distribution.Server.Framework.EventSourcing
 import Distribution.Server.Framework.PostgreSQL
 import Distribution.Server.Framework.PgTx
 import Distribution.Server.Framework.MemState

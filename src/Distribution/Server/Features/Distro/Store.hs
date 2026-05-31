@@ -7,7 +7,6 @@ module Distribution.Server.Features.Distro.Store
 
 import Distribution.Package (PackageName)
 import Distribution.Server.Features.Distro.Types (DistroName, DistroPackageInfo)
-import Distribution.Server.Framework (AbstractStateComponent)
 import Distribution.Server.Users.Group (UserIdSet)
 import Distribution.Server.Users.Types (UserId)
 
@@ -15,7 +14,6 @@ import Control.Monad.Trans (MonadIO)
 
 data Backend = Backend {
     backendStore :: Store
-  , backendState :: [AbstractStateComponent]
   }
 
 data Store = Store {

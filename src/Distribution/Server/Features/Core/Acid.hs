@@ -58,6 +58,5 @@ acidStore env _verbosity conn = do
         , migratePackageTarballs = migratePkgTarball_v1_to_v2 env conn
         , createStoreCheckpoint  = return () -- each update is already durable
         }
-    , backendState = []  -- no AcidState; data lives in PostgreSQL
     }
 

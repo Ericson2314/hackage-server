@@ -506,19 +506,6 @@ CREATE TABLE IF NOT EXISTS tar_index_cache (
 );
 
 
-------------------------------------------------------------------------
--- Event tables (event log for each update operation)
---
--- Each update event is logged as a row in its event table.
--- Columns use TEXT via Show serialization of the Haskell types.
--- These tables are the durable log; checkpoint/state tables above
--- are periodic snapshots. When a state type migrates from event-sourcing
--- to direct state storage, its event tables can be dropped.
-------------------------------------------------------------------------
-
-
-
-
 
 
 

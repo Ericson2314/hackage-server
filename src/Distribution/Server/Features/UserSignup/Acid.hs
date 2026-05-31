@@ -39,7 +39,6 @@ acidStore pool =
         , Store.deleteSignupResetInfo = liftIO . dbDeleteSignupResetInfo pool
         , Store.deleteExpiredResetInfos = liftIO . dbDeleteAllExpired pool
         }
-    , Store.backendState = []  -- no AcidState; data lives in PostgreSQL
     }
 
 ---------------------

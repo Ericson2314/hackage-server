@@ -151,7 +151,6 @@ documentationFeature name
             , packageDocsWhole
             , packageDocsStats
             ]
-      , featureState = Store.backendState documentationBackend
       }
 
     queryHasDocumentation :: MonadIO m => PackageIdentifier -> m Bool

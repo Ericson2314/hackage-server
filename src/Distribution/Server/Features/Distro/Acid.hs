@@ -59,7 +59,6 @@ acidStore pool =
         , Store.putDistroPackageList = \name pkgs -> liftIO $ dbModifyDistros pool $ \st ->
             st { State.distVersions = Dist.updatePackageList name pkgs (State.distVersions st) }
         }
-    , Store.backendState = []  -- no AcidState; data lives in PostgreSQL
     }
 
 ------------------------------------------------------------------------

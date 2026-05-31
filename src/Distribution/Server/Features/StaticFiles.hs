@@ -59,7 +59,6 @@ staticFilesFeature ServerEnv{serverStaticDir, serverTemplatesMode, serverBaseURI
             resourceGet  = [("", \_ -> serveStaticTemplate name)]
           }
       | name <- toplevelTemplates ]
-  , featureState = []
   , featureErrHandlers = [("txt",  textErrorPage)
                          ,("html", htmlErrorPage)]
   , featureReloadFiles = reloadTemplates templates
