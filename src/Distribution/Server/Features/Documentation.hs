@@ -63,9 +63,8 @@ import Distribution.Server.Packages.Types
 import qualified Data.Text as T
 import GHC.Generics (Generic)
 import Database.Beam
+import Database.Beam.Backend.SQL.BeamExtensions (insertOnConflict, conflictingFields, onConflictUpdateAll)
 import Database.Beam.Postgres
-import Control.Concurrent.MVar (swapMVar)
-import qualified Database.PostgreSQL.Simple as PG
 -- TODO:
 -- 1. Write an HTML view for organizing uploads
 -- 2. Have cabal generate a standard doc tarball, and serve that here
@@ -113,16 +112,12 @@ initDocumentationFeature :: String
                              -> IO DocumentationFeature)
 initDocumentationFeature name
                          env@ServerEnv{serverPgConn} = do
-    -- Canonical state
-    documentationState <- documentationStateComponent name serverPgConn
-
     -- Hooks
     documentationChangeHook <- newHook
 
     return $ \core getPackages upload tarIndexCache reportsCore user version -> do
-      let feature = documentationFeature name env
+      let feature = documentationFeature name env serverPgConn
                                          core getPackages upload tarIndexCache reportsCore user version
-                                         documentationState
                                          documentationChangeHook
       return feature
 
@@ -160,80 +155,68 @@ docDb = defaultDbSettings `withDbModification`
 docTable :: DatabaseEntity Postgres DocDb (TableEntity DocRowT)
 docTable = _docRows docDb
 
-loadDocumentation :: PgTx Acid.Documentation
-loadDocumentation = do
-  rows <- beamTx $
+------------------------------------------------------------------------
+-- Direct database operations (no MVar, no event sourcing)
+--
+
+-- | Lookup documentation blob for a package
+dbLookupDocumentation :: PgConnection -> PackageIdentifier -> IO (Maybe BlobId)
+dbLookupDocumentation pool pkgid = do
+  rows <- runBeamPg pool $
+    runSelectReturningList $ select $
+      filter_ (\r -> _drPkgName r ==. val_ (T.pack $ display (pkgName pkgid))
+                 &&. _drPkgVersion r ==. val_ (T.pack $ display (pkgVersion pkgid))) $
+      all_ docTable
+  return $ case rows of
+    (DocRow _ _ blobHex : _) ->
+      case readBlobId (T.unpack blobHex) of
+        Right blobId -> Just blobId
+        Left _       -> Nothing
+    [] -> Nothing
+
+-- | Check if documentation exists for a package
+dbHasDocumentation :: PgConnection -> PackageIdentifier -> IO Bool
+dbHasDocumentation pool pkgid = isJust <$> dbLookupDocumentation pool pkgid
+
+-- | Get all documentation as a map
+dbGetDocumentationIndex :: PgConnection -> IO (Map.Map PackageId BlobId)
+dbGetDocumentationIndex pool = do
+  rows <- runBeamPg pool $
     runSelectReturningList $ select $ all_ docTable
   let addRow m (DocRow name ver blobHex) =
         case (simpleParse (T.unpack name), simpleParse (T.unpack ver), readBlobId (T.unpack blobHex)) of
           (Just pkgName, Just pkgVer, Right blobId) ->
             Map.insert (PackageIdentifier pkgName pkgVer) blobId m
-          _ -> m  -- skip unparseable rows
-  return $ Acid.Documentation $ foldl' addRow Map.empty rows
+          _ -> m
+  return $ foldl' addRow Map.empty rows
 
-saveDocumentation :: Acid.Documentation -> PgTx ()
-saveDocumentation (Acid.Documentation docs) =
-  do
-    beamTx $
-      runDelete $ delete docTable (\_ -> val_ True)
-    let rows = [ DocRow (T.pack $ display (pkgName pkgid))
-                        (T.pack $ display (pkgVersion pkgid))
-                        (T.pack $ blobMd5 blob)
-               | (pkgid, blob) <- Map.toList docs ]
-    mapM_ insertDocChunk (chunksOf 1000 rows)
+-- | Insert or replace documentation for a package
+dbInsertDocumentation :: PgConnection -> PackageIdentifier -> BlobId -> IO ()
+dbInsertDocumentation pool pkgid blobid =
+  runBeamPg pool $
+    runInsert $ insertOnConflict docTable
+      (insertValues
+        [DocRow (T.pack $ display (pkgName pkgid))
+                (T.pack $ display (pkgVersion pkgid))
+                (T.pack $ blobMd5 blobid)])
+      (conflictingFields primaryKey)
+      onConflictUpdateAll
 
-insertDocChunk :: [DocRowT Identity] -> PgTx ()
-insertDocChunk chunk =
-  beamTx $
-    runInsert $ insert docTable $ insertValues chunk
+-- | Remove documentation for a package
+dbRemoveDocumentation :: PgConnection -> PackageIdentifier -> IO ()
+dbRemoveDocumentation pool pkgid =
+  runBeamPg pool $
+    runDelete $ delete docTable
+      (\r -> _drPkgName r ==. val_ (T.pack $ display (pkgName pkgid))
+         &&. _drPkgVersion r ==. val_ (T.pack $ display (pkgVersion pkgid)))
 
 chunksOf :: Int -> [a] -> [[a]]
 chunksOf _ [] = []
 chunksOf n xs = let (h, t) = splitAt n xs in h : chunksOf n t
 
-------------------------------------------------------------------------
-
-documentationStateComponent :: String -> PgConnection -> IO (StateComponent AcidState Acid.Documentation)
-documentationStateComponent name serverPgConn = do
-  -- Load state
-  loaded <- runPgTx serverPgConn loadDocumentation
-
-  pgSt <- mkAcidState serverPgConn loaded saveDocumentation
-  return StateComponent {
-      stateDesc    = "Package documentation"
-    , stateHandle  = pgSt
-    , getState     = queryPg pgSt (runQueryEvent Acid.GetDocumentation)
-    , putState     = \s -> do
-        runPgTx serverPgConn (saveDocumentation s)
-        _ <- swapMVar (pgMVar pgSt) s
-        return ()
-    , backupState  = \_ -> dumpBackup
-    , restoreState = updateDocumentation (Acid.Documentation Map.empty)
-    , resetState   = \_ -> documentationStateComponent name serverPgConn
-    }
-  where
-    dumpBackup doc =
-        let exportFunc (pkgid, blob) = BackupBlob [display pkgid, "documentation.tar"] blob
-        in map exportFunc . Map.toList $ Acid.documentation doc
-
-    updateDocumentation :: Acid.Documentation -> RestoreBackup Acid.Documentation
-    updateDocumentation docs = RestoreBackup {
-        restoreEntry = \entry ->
-          case entry of
-            BackupBlob [str, "documentation.tar"] blobId | Just pkgId <- simpleParse str -> do
-              docs' <- importDocumentation pkgId blobId docs
-              return (updateDocumentation docs')
-            _ ->
-              return (updateDocumentation docs)
-      , restoreFinalize = return docs
-      }
-
-    importDocumentation :: PackageId -> BlobId -> Acid.Documentation -> Restore Acid.Documentation
-    importDocumentation pkgId blobId (Acid.Documentation docs) =
-      return (Acid.Documentation (Map.insert pkgId blobId docs))
-
 documentationFeature :: String
                      -> ServerEnv
+                     -> PgConnection
                      -> CoreResource
                      -> IO [PackageIdentifier]
                      -> UploadFeature
@@ -241,11 +224,11 @@ documentationFeature :: String
                      -> ReportsFeature
                      -> UserFeature
                      -> VersionsFeature
-                     -> StateComponent AcidState Acid.Documentation
                      -> Hook PackageId ()
                      -> DocumentationFeature
 documentationFeature name
                      env@ServerEnv{serverBlobStore = store, serverBaseURI}
+                     pool
                      CoreResource{
                          packageInPath
                        , guardValidPackageId
@@ -259,7 +242,6 @@ documentationFeature name
                      ReportsFeature{..}
                      UserFeature{ guardAuthorised_ }
                      VersionsFeature{queryGetPreferredInfo}
-                     documentationState
                      documentationChangeHook
   = DocumentationFeature{..}
   where
@@ -271,18 +253,17 @@ documentationFeature name
             , packageDocsWhole
             , packageDocsStats
             ]
-      , featureState = [abstractAcidStateComponent documentationState]
+      , featureState = []  -- no AcidState; data lives in PostgreSQL
       }
 
     queryHasDocumentation :: MonadIO m => PackageIdentifier -> m Bool
-    queryHasDocumentation pkgid = queryState documentationState (Acid.HasDocumentation pkgid)
+    queryHasDocumentation pkgid = liftIO $ dbHasDocumentation pool pkgid
 
     queryDocumentation :: MonadIO m => PackageIdentifier -> m (Maybe BlobId)
-    queryDocumentation pkgid = queryState documentationState (Acid.LookupDocumentation pkgid)
+    queryDocumentation pkgid = liftIO $ dbLookupDocumentation pool pkgid
 
     queryDocumentationIndex :: MonadIO m => m (Map.Map PackageId BlobId)
-    queryDocumentationIndex =
-      liftM Acid.documentation (queryState documentationState Acid.GetDocumentation)
+    queryDocumentationIndex = liftIO $ dbGetDocumentationIndex pool
 
     documentationResource = fix $ \r -> DocumentationResource {
         packageDocsContent = (extendResourcePath "/docs/.." corePackagePage) {
@@ -457,7 +438,7 @@ documentationFeature name
       case mres of
         Left  err -> errBadRequest "Invalid documentation tarball" [MText err]
         Right ((), blobid) -> do
-          updateState documentationState $ Acid.InsertDocumentation pkgid blobid
+          liftIO $ dbInsertDocumentation pool pkgid blobid
           runHook_ documentationChangeHook pkgid
           noContent (toResponse ())
 
@@ -490,7 +471,7 @@ documentationFeature name
       pkgid <- packageInPath dpath
       guardValidPackageId pkgid
       guardAuthorisedAsMaintainerOrTrustee (packageName pkgid)
-      updateState documentationState $ Acid.RemoveDocumentation pkgid
+      liftIO $ dbRemoveDocumentation pool pkgid
       runHook_ documentationChangeHook pkgid
       noContent (toResponse ())
 
@@ -554,7 +535,7 @@ documentationFeature name
                 tempRedirect latestPkgPath (toResponse "")
               Nothing -> errNotFoundH "Not Found" [MText "There is no documentation for this package."]
         False -> do
-          mdocs <- queryState documentationState $ Acid.LookupDocumentation pkgid
+          mdocs <- liftIO $ dbLookupDocumentation pool pkgid
           case mdocs of
             Nothing ->
               errNotFoundH "Not Found"

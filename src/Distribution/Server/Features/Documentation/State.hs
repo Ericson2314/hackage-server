@@ -1,4 +1,4 @@
-{-# LANGUAGE OverloadedStrings, MultiParamTypeClasses, FlexibleInstances, DeriveAnyClass, DeriveGeneric, DerivingStrategies, DeriveDataTypeable, TypeFamilies, TemplateHaskell #-}
+{-# LANGUAGE TemplateHaskell #-}
 
 module Distribution.Server.Features.Documentation.State where
 
@@ -7,11 +7,7 @@ import Distribution.Server.Framework.BlobStorage (BlobId)
 import Data.TarIndex () -- For SafeCopy instances
 import Distribution.Server.Framework.MemSize
 
-import Distribution.Server.Framework.EventSourcing (Query, Update, makeAcidic)
-import Distribution.Server.Framework.BeamInstances ()
 import Data.SafeCopy (base, deriveSafeCopy)
-import Control.Monad.Reader
-import qualified Control.Monad.State as State
 
 import qualified Data.Map as Map
 
@@ -27,38 +23,4 @@ instance MemSize Documentation where
 
 initialDocumentation :: Documentation
 initialDocumentation = Documentation Map.empty
-
-lookupDocumentation :: PackageIdentifier -> Query Documentation (Maybe BlobId)
-lookupDocumentation pkgId
-    = do m <- asks documentation
-         return $ Map.lookup pkgId m
-
-hasDocumentation :: PackageIdentifier -> Query Documentation Bool
-hasDocumentation pkgId
-    = lookupDocumentation pkgId >>= \x -> case x of
-         Just{} -> return True
-         _      -> return False
-
-insertDocumentation :: PackageIdentifier -> BlobId -> Update Documentation ()
-insertDocumentation pkgId blob
-    = State.modify $ \doc -> doc {documentation = Map.insert pkgId blob (documentation doc)}
-
-removeDocumentation :: PackageIdentifier -> Update Documentation ()
-removeDocumentation pkgId
-    = State.modify $ \doc -> doc {documentation = Map.delete pkgId (documentation doc)}
-
-getDocumentation :: Query Documentation Documentation
-getDocumentation = ask
-
--- |Replace all existing documentation
-replaceDocumentation :: Documentation -> Update Documentation ()
-replaceDocumentation = State.put
-
-makeAcidic ''Documentation ['insertDocumentation
-                           ,'removeDocumentation
-                           ,'lookupDocumentation
-                           ,'hasDocumentation
-                           ,'getDocumentation
-                           ,'replaceDocumentation
-                           ]
 

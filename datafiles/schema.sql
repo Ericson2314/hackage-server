@@ -479,9 +479,6 @@ CREATE TABLE IF NOT EXISTS package_tags__insert_review_tags (id BIGSERIAL PRIMAR
 CREATE TABLE IF NOT EXISTS package_tags__clear_review_tags (id BIGSERIAL PRIMARY KEY, arg0 TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS tag_alias__add_tag_alias (id BIGSERIAL PRIMARY KEY, arg0 TEXT NOT NULL, arg1 TEXT NOT NULL);
 
--- Documentation events
-CREATE TABLE IF NOT EXISTS documentation__insert_documentation (id BIGSERIAL PRIMARY KEY, arg0 TEXT NOT NULL, arg1 TEXT NOT NULL);
-CREATE TABLE IF NOT EXISTS documentation__remove_documentation (id BIGSERIAL PRIMARY KEY, arg0 TEXT NOT NULL);
 
 
 
