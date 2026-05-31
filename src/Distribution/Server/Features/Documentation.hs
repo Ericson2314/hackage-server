@@ -253,7 +253,6 @@ documentationFeature name
             , packageDocsWhole
             , packageDocsStats
             ]
-      , featureState = []  -- no AcidState; data lives in PostgreSQL
       }
 
     queryHasDocumentation :: MonadIO m => PackageIdentifier -> m Bool

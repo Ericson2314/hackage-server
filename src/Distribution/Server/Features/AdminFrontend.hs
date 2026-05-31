@@ -64,7 +64,6 @@ adminFrontendFeature _env templates
       , adminSignupsResource
       , adminResetsResource
       ]
-  , featureState = []
   , featureReloadFiles = reloadTemplates templates
   }
 

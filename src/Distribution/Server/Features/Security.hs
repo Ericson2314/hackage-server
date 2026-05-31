@@ -125,7 +125,6 @@ securityFeature env pool =
   where
     securityFeatureInterface = (emptyHackageFeature "security") {
         featureDesc        = "TUF Security"
-      , featureState       = []  -- no AcidState; data lives in PostgreSQL
       , featureReloadFiles = updateRootMirrorsAndKeys env pool
       , featurePostInit    = updateRootMirrorsAndKeys env pool
                           >> setupResignCronJob env pool

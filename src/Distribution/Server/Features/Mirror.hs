@@ -194,7 +194,6 @@ mirrorFeature ServerEnv{serverBlobStore = store}
             [ groupResource     mirrorGroupResource
             , groupUserResource mirrorGroupResource
             ]
-      , featureState = []  -- no AcidState; data lives in PostgreSQL
       }
 
     mirrorResource = MirrorResource {

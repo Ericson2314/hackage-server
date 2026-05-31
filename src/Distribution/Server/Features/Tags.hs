@@ -404,7 +404,6 @@ tagsFeature CoreFeature{ queryGetPackageIndex }
             , packageTagsListing
             ]
       , featurePostInit = initImmutableTags
-      , featureState    = []  -- no AcidState; data lives in PostgreSQL
       , featureCaches   = [
             CacheComponent {
               cacheDesc       = "calculated tags",

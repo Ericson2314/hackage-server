@@ -516,7 +516,6 @@ userFeature templates pool
               groupResource adminResource
             , groupUserResource adminResource
             ]
-      , featureState = []  -- no AcidState; data lives in PostgreSQL
       , featureCaches = [
             CacheComponent {
               cacheDesc       = "user group index",

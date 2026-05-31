@@ -298,7 +298,6 @@ userSignupFeature ServerEnv{serverBaseURI, serverCron, serverPgConn}
                             signupRequestResource,
                             resetRequestsResource,
                             resetRequestResource]
-      , featureState     = []  -- no AcidState; data lives in PostgreSQL
       , featureCaches    = []
       , featureReloadFiles = reloadTemplates templates
       , featurePostInit  = setupExpireCronJob

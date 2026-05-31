@@ -78,15 +78,6 @@ instance MemSize PreferredInfo where
     memSize (PreferredInfo a b c) = memSize3 a b c
 
 -- | Initial PreferredVersions
---
--- NOTE: If we are starting from a fresh DB, obviously migration is not needed.
--- However, if we are not, but we _are_ starting from an initial DB value, this
--- must mean we are starting a server with an existing DB but no checkpoint. In
--- this case we might have old transactions to replay, so we might have to
--- migrate.
---
--- If we failed to migrate these old transactions, we would end up with a
--- 'packageUpdateLog' without entries for @preferred-versions@.
 initialPreferredVersions :: Bool -> PreferredVersions
 initialPreferredVersions freshDB = PreferredVersions {
     preferredMap           = Map.empty

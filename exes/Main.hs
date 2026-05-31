@@ -246,15 +246,10 @@ runCommand =
       commandOptions      = options
     }
   where
-    notes pname = "Note: the " ++ pname ++ " data lock prevents two "
-               ++ "state-accessing modes from\nbeing run simultaneously.\n\n"
-               ++ "On unix systems you can tell the server to checkpoint its "
-               ++ "database state using:\n"
-               ++ " $ kill -USR1 $the_pid\n"
-               ++ "where $the_pid is the process id of the running server. "
-               ++ "Similarly,\n"
+    notes _pname =
+                  "On unix systems you can trigger an online backup using:\n"
                ++ " $ kill -USR2 $the_pid\n"
-               ++ "starts an online backup.\n"
+               ++ "where $the_pid is the process id of the running server.\n"
                ++ "Reload html (and other) templates:\n"
                ++ " $ kill -HUP $the_pid\n"
     options _  =
@@ -362,11 +357,6 @@ runAction opts = do
 
     onSigTermCleanShutdown
 
-    let checkpointHandler server = do
-          lognotice verbosity "Writing checkpoint..."
-          Server.checkpoint server
-          lognotice verbosity "Done"
-
     let backupHandler server = do
           lognotice verbosity "Starting backup..."
           startBackup verbosity scrubbed outputDir linkBlobs server
@@ -379,7 +369,6 @@ runAction opts = do
 
     let useTempServer = fromFlag (flagRunTemp opts)
     withServer config useTempServer $ \server ->
-      withHandler sigUSR1 (checkpointHandler server) $
       withHandler sigUSR2 (backupHandler server) $
       withHandler sigHUP  (reloadHandler server) $ do
         lognotice verbosity $ "Ready! Point your browser at " ++ show hosturi
@@ -682,10 +671,9 @@ backupAction opts = do
 startBackup :: Verbosity -> Bool -> FilePath -> Bool -> Server -> IO ()
 startBackup verbosity scrubbed outputDir linkBlobs server = do
   let store = Server.serverBlobStore (Server.serverEnv server)
-      state = Server.serverState server
       backupType = if scrubbed then ScrubbedBackup else FullBackup
   dumpServerBackup verbosity backupType outputDir Nothing store linkBlobs
-                   (map (second (\s -> abstractStateBackup s backupType)) state)
+                   []  -- TODO: backup from PostgreSQL directly
 
 -------------------------------------------------------------------------------
 -- Test backup command
@@ -801,10 +789,9 @@ testBackupAction opts = do
     mapM_ (createDirectoryIfMissing False) [testDir, dump1Dir, restoreDir, dump2Dir]
 
     withServer config False $ \server -> do
-      let fullState = Server.serverState server
-          store = Server.serverBlobStore (Server.serverEnv server)
+      let store = Server.serverBlobStore (Server.serverEnv server)
 
-      state <- filterM shouldTestM fullState
+      let state = [] :: [(String, ())]  -- TODO: backup test from PostgreSQL
 
       -- We want to check that our dump/restore correctly preserves all the
       -- data. So we want to do a round trip test, and though it's nice to do
@@ -819,57 +806,25 @@ testBackupAction opts = do
       -- representation. We start by writing it all out in the external
       -- representation.
       --
+      -- TODO: backup/restore test needs reimplementation for PostgreSQL
+      -- (use pg_dump/pg_restore or SQL-based backup)
       dumpServerBackup verbosity FullBackup dump1Dir (Just tarDumpName)
-                       store linkBlobs
-                       (map (second (\s -> abstractStateBackup s backuptype)) state)
+                       store linkBlobs []
 
-      -- Now what we need to do is to keep hold of our current internal state
-      -- and construct an extra internal state by restoring from the external
-      -- representation that we wrote out previously.
-      --
-      -- And we can do just that. We've set things up so that every feature in
-      -- the server has the capability to initialise a new empty copy of
-      -- it's state. That's what abstractStateEmptyCopy does. In addition to
-      -- that we get back a comparison action, that when executed will look at
-      -- the current value of the state and compare the two, reporting any
-      -- mismatches.
-      --
-      -- So we initialise all these new empty copies, (collecting the comparison
-      -- actions)
-      --
-      (state', compareSts) <-
-        unzip <$> sequence
-                    [ do (st', cmpSt) <- abstractStateNewEmpty st restoreDir
-                         let annotateErr err = featurename ++ ": " ++ err
-                         return ((featurename, st'), map annotateErr <$> cmpSt)
-
-                    | (featurename, st) <- state ]
-
-      -- We also need a corresponding empty blob store
       store' <- BlobStorage.open (restoreDir </> "blobs")
 
-      -- And then restore from the external representation into these new empty
-      -- copies.
       loginfo verbosity "Restoring from backup tarball"
       let stores' = BlobStorage.BlobStores store' [store]
-      res <- restoreServerBackup stores' dump1Tar linkBlobs
-                                 (map (second abstractStateRestore) state')
+      res <- restoreServerBackup stores' dump1Tar linkBlobs []
       case res of
         Nothing  -> return ()
         Just err -> fail $ "Error while restoring the backup:\n" ++ err
 
-      -- Write second tarball so that if some of the comparisons go wrong,
-      -- we can look at the second backup tarball and manually do some
-      -- comparisons
       lognotice verbosity "Preparing second export tarball"
       dumpServerBackup verbosity FullBackup dump2Dir (Just tarDumpName)
-                       store' linkBlobs
-                       (map (second (\s -> abstractStateBackup s backuptype)) state')
+                       store' linkBlobs []
 
-      -- Now we are in a position to check that the original internal state and
-      -- the new internal state we get from a dump/restore do actually match up.
-      lognotice verbosity "Comparing snapshots before and after dump/restore..."
-      stErrs <- concat <$> sequence compareSts
+      let stErrs = [] :: [String]  -- TODO: state comparison for PostgreSQL
       unless (null stErrs) $ do
         mapM_ (loginfo verbosity) stErrs
         let failLogfile = testDir </> "round-trip-failure.log"
@@ -958,13 +913,12 @@ restoreAction opts [tarFile] = do
     checkAccidentalDataLoss =<< Server.hasSavedState config
 
     withServer config False $ \server -> do
-        let state  = Server.serverState server
-            store  = Server.serverBlobStore (Server.serverEnv server)
+        let store  = Server.serverBlobStore (Server.serverEnv server)
             stores = BlobStorage.BlobStores store []
 
         loginfo verbosity "Parsing import tarball..."
         res <- restoreServerBackup stores tarFile False
-                                   (map (second abstractStateRestore) state)
+                                   []  -- TODO: restore to PostgreSQL directly
         case res of
             Just err -> fail err
             _ ->
@@ -995,7 +949,6 @@ withServer config doTemp = bracket initialise shutdown
       return server
 
     shutdown server = do
-      -- This only shuts down happstack-state and writes a checkpoint;
       -- the HTTP part takes care of itself
       loginfo verbosity "Shutting down..."
       Server.shutdown server

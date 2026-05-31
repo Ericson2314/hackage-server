@@ -190,7 +190,6 @@ userDetailsFeature pool templates UserFeature{..} CoreFeature{..} UploadFeature{
     userDetailsFeatureInterface = (emptyHackageFeature "user-details") {
         featureDesc      = "Extra information about user accounts, email addresses etc."
       , featureResources = [userNameContactResource, userAdminInfoResource]
-      , featureState     = []  -- no AcidState; data lives in PostgreSQL
       , featureCaches    = []
       }
 

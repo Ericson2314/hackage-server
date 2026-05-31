@@ -64,7 +64,6 @@ packageFeedFeature ServerEnv{..}
 
     packageFeedFeatureInterface = (emptyHackageFeature "package feed") {
       featureResources = [ packageFeedResource ]
-      , featureState = []
       , featureDesc = "Provides RSS feed for individual packages"
       , featureCaches = []
       , featurePostInit = pure ()

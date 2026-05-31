@@ -82,7 +82,6 @@ packageContentsFeature CoreFeature{ coreResource = CoreResource{
             , packageContentsChangeLog
             , packageContentsReadme
             ]
-      , featureState = []
       , featureDesc = "The PackageContents feature shows the contents of packages and caches their TarIndexes"
       }
 

@@ -71,8 +71,7 @@ adminLogFeature pool queryGetUserDb'
     adminLogFeatureInterface =
       (emptyHackageFeature "admin-actions-log") {
         featureDesc      = "Log of additions and removals of users from groups.",
-        featureResources = [adminLogResource],
-        featureState     = []  -- no AcidState; data lives in PostgreSQL
+        featureResources = [adminLogResource]
       }
 
     adminLogResource :: Resource

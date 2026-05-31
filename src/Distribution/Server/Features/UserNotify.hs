@@ -577,7 +577,6 @@ userNotifyFeature UserFeature{..}
     userNotifyFeatureInterface = (emptyHackageFeature "user-notify") {
         featureDesc      = "Notifications to users on metadata updates."
       , featureResources = [userNotifyResource] -- TODO we can add json features here for updating prefs
-      , featureState     = []  -- no AcidState; data lives in PostgreSQL
       , featureCaches    = []
       , featureReloadFiles = reloadTemplates templates
       , featurePostInit  = setupNotifyCronJob

@@ -362,7 +362,6 @@ versionsFeature ServerEnv{ serverVerbosity = verbosity }
             ]
       , featurePostInit = do updateDeprecatedTags
                              ephemeralPrefsMigration
-      , featureState    = []  -- no AcidState; data lives in PostgreSQL
       }
 
     queryGetPreferredInfo :: MonadIO m => PackageName -> m PreferredInfo

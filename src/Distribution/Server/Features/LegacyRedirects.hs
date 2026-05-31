@@ -29,7 +29,6 @@ legacyRedirectsFeature upload = (emptyHackageFeature "legacy") {
           , resourcePost = [("", \_ -> serveLegacyPosts upload)]
           }
       ]
-  , featureState = []
   }
 
 -- | Support for the old URL scheme from the first version of Hackage.

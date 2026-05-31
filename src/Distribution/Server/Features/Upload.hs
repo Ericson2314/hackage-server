@@ -361,7 +361,6 @@ uploadFeature ServerEnv{serverBlobStore = store}
             , groupResource     uploadersGroupResource
             , groupUserResource uploadersGroupResource
             ]
-      , featureState = []  -- no AcidState; data lives in PostgreSQL
       }
 
     uploadResource = UploadResource

@@ -103,7 +103,6 @@ sitemapFeature  ServerEnv{..}
 
     sitemapFeatureInterface = (emptyHackageFeature "sitemap") {
       featureResources  = [ xmlSitemapIndexResource, xmlSitemapResource ]
-      , featureState    = []
       , featureDesc     = "Provides sitemap for search engines"
       , featureCaches   =
           [ CacheComponent {

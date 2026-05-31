@@ -51,7 +51,6 @@ serverIntrospectFeature serverFeatures = (emptyHackageFeature "serverapi") {
                            ]
           }
       ]
-  , featureState = []
   }
 
 -------------------
@@ -92,16 +91,8 @@ apiDocPageHtml serverFeatures = hackagePage title content
           +++ p << (let desc = featureDesc feature
                     in if null desc then thespan ! [thestyle "color: red"] << "Feature description unavailable"
                                     else toHtml desc)
-          +++ stateList feature
           +++ resourceList feature
         | feature <- serverFeatures ]
-
-    stateList feature =
-      let states = map abstractStateDesc (featureState feature) in
-      if null states
-        then     p << "This feature does not have any state."
-        else     p << emphasize << "State"
-             +++ unordList states
 
     resourceList feature =
           p << emphasize << "Resources"
@@ -254,12 +245,8 @@ serveMemSizeHtml serverFeatures =
     getFeatureSizes feature =
       (,,,) <$> pure (featureName feature)
             <*> pure (featureDesc feature)
-            <*> mapM getCanonicalStateSizes (featureState feature)
+            <*> pure []  -- no in-memory state components; all state in PostgreSQL
             <*> mapM getCacheStateSizes     (featureCaches feature)
-
-    getCanonicalStateSizes component =
-      (,)   <$> pure (abstractStateDesc component)
-            <*> abstractStateSize component
 
     getCacheStateSizes component =
       (,)   <$> pure (cacheDesc component)

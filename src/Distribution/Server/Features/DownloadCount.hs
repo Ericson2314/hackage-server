@@ -327,7 +327,6 @@ downloadFeature CoreFeature{}
                            , downloadCSV
                            ]
       , featurePostInit  = void $ forkIO registerDownloads
-      , featureState     = []  -- all data lives in PostgreSQL
       , featureCaches    = [
             CacheComponent {
               cacheDesc       = "recent package downloads cache",

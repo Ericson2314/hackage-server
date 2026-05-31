@@ -228,7 +228,6 @@ votesFeature pool
         featureResources = [ packagesVotesResource
                            , packageVotesResource
                            ]
-      , featureState     = []  -- no AcidState; data lives in PostgreSQL
       }
 
     -- Define resources for this feature's URIs

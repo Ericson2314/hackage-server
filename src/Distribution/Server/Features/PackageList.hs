@@ -232,7 +232,6 @@ listFeature CoreFeature{..}
     listFeatureInterface = (emptyHackageFeature "list") {
         featurePostInit = do itemsCache
                              void $ forkIO periodicDownloadRefresh
-      , featureState    = []
       , featureCaches   = [
             CacheComponent {
               cacheDesc       = "per-package-name summary info",

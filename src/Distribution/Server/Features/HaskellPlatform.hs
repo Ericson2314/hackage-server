@@ -168,7 +168,6 @@ platformFeature pool
               platformPackage
             , platformPackages
             ]
-      , featureState = []  -- no AcidState; data lives in PostgreSQL
       }
 
     platformResource = fix $ \r -> PlatformResource

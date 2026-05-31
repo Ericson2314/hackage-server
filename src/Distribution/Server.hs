@@ -6,7 +6,6 @@ module Distribution.Server (
     initialise,
     run,
     shutdown,
-    checkpoint,
     reloadDatafiles,
 
     -- * Server configuration
@@ -16,7 +15,6 @@ module Distribution.Server (
     hasSavedState,
 
     -- * Server state
-    serverState,
     initState,
 
     -- * Temporary server while loading data
@@ -202,13 +200,6 @@ run server@Server{ serverEnv = env } = do
     exists <- doesDirectoryExist staticDir
     when (not exists) $ fail $ "The static files directory " ++ staticDir ++ " does not exist."
 
-    addCronJob (serverCron env) CronJob {
-      cronJobName      = "Checkpoint all the server state",
-      cronJobFrequency = WeeklyJobFrequency,
-      cronJobOneShot   = False,
-      cronJobAction    = checkpoint server
-    }
-
     runServer listenOn $ do
 
       handlePutPostQuotas
@@ -261,41 +252,17 @@ run server@Server{ serverEnv = env } = do
 -- | Perform a clean shutdown of the server.
 --
 shutdown :: Server -> IO ()
-shutdown server =
-  Features.shutdownAllFeatures (serverFeatures server)
-
---TODO: stop accepting incoming connections,
--- wait for connections to be processed.
-
--- | Write out a checkpoint of the server state. This makes recovery quicker
--- because fewer logged transactions have to be replayed.
---
-checkpoint :: Server -> IO ()
-checkpoint server =
-  Features.checkpointAllFeatures (serverFeatures server)
+shutdown _server = return ()
 
 reloadDatafiles :: Server -> IO ()
 reloadDatafiles server =
   mapM_ Feature.featureReloadFiles (serverFeatures server)
 
--- | Return /one/ abstract state component per feature
-serverState :: Server -> [(String, AbstractStateComponent)]
-serverState server = [ (featureName feature, mconcat (featureState feature))
-                     | feature <- serverFeatures server
-                     ]
 
 -- An alternative to an import: starts the server off to a sane initial state.
 -- To accomplish this, we import a 'null' tarball, finalizing immediately after initializing import
 initState ::  Server -> (String, String) -> IO ()
 initState server (admin, pass) = do
-    -- We take the opportunity to checkpoint all the acid-state components
-    -- upon first initialisation as this helps with migration problems later.
-    -- https://github.com/acid-state/acid-state/issues/20
-    checkpoint server
-
-    let store  = serverBlobStore (serverEnv server)
-        stores = BlobStorage.BlobStores store []
-    void . Import.importBlank stores $ map (second abstractStateRestore) (serverState server)
     -- create default admin user
     let UserFeature{updateAddUser, adminGroup} = serverUserFeature server
     muid <- case simpleParse admin of

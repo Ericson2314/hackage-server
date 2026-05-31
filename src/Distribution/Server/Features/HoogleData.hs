@@ -96,7 +96,6 @@ hoogleDataFeature docsUpdatedState hoogleBundleUpdateJob
     hoogleDataFeatureInterface = (emptyHackageFeature "hoogle-data") {
         featureDesc      = "Provide a tarball of all package's hoogle files"
       , featureResources = [hoogleBundleResource]
-      , featureState     = []
       , featureCaches    = []
       , featurePostInit  = postInit
       }

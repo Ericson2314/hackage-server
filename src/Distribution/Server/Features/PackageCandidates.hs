@@ -216,7 +216,6 @@ candidatesFeature ServerEnv{serverBlobStore = store}
             , candidateContents
             , candidateChangeLog
             ]
-      , featureState = []  -- no AcidState; data lives in PostgreSQL
       }
 
     queryGetCandidateIndex :: MonadIO m => m (PackageIndex CandPkgInfo)

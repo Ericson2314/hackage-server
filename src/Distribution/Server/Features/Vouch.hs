@@ -26,7 +26,7 @@ import Text.XHtml.Strict (prettyHtmlFragment, stringToHtml, li)
 import Distribution.Server.Framework ((</>), PgConnection, DynamicPath, HackageFeature, IsHackageFeature, IsHackageFeature(..))
 import Distribution.Server.Framework (MessageSpan(MText), Method(..), Response, ServerEnv(..), ServerPartE)
 import Distribution.Server.Framework (emptyHackageFeature, errBadRequest, runBeamPg, runPgTx)
-import Distribution.Server.Framework (featureDesc, featureReloadFiles, featureResources, featureState)
+import Distribution.Server.Framework (featureDesc, featureReloadFiles, featureResources)
 import Distribution.Server.Framework (liftIO, resourceAt, resourceDesc, resourceGet)
 import Distribution.Server.Framework.PgTx (PgTx, beamTx)
 import Distribution.Server.Framework (resourcePost, toResponse)
@@ -289,7 +289,6 @@ initVouchFeature ServerEnv{serverPgConn, serverTemplatesDir, serverTemplatesMode
               , resourcePost = [("html", handlePostVouch)]
               }
             ]
-          , featureState = []  -- no AcidState; data lives in PostgreSQL
           , featureReloadFiles = reloadTemplates templates
           },
       drainQueuedNotifications = liftIO $ dbDrainNotNotified serverPgConn

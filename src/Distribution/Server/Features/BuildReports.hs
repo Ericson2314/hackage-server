@@ -325,7 +325,6 @@ buildReportsFeature name
             , reportsReset
             , reportsTestsEnabled
             ]
-      , featureState = []  -- no AcidState; data lives in PostgreSQL
       }
 
     reportsResource = ReportsResource

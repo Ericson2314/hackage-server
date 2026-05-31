@@ -315,7 +315,6 @@ distroFeature UserFeature{..}
             , distroPackages
             , distroPackage
             ]
-      , featureState = []  -- no AcidState; data lives in PostgreSQL
       }
 
     queryPackageStatus :: MonadIO m => PackageName -> m [(DistroName, DistroPackageInfo)]

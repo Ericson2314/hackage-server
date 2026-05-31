@@ -236,7 +236,6 @@ library
     Distribution.Server.Framework.Error
     Distribution.Server.Framework.Logging
     Distribution.Server.Framework.BeamInstances
-    Distribution.Server.Framework.EventSourcing
     Distribution.Server.Framework.Feature
     Distribution.Server.Framework.PostgreSQL
     Distribution.Server.Framework.PgTx

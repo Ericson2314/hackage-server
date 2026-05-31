@@ -163,7 +163,6 @@ tarIndexCacheFeature ServerEnv{serverBlobStore = store}
         -- (TODO: We could potentially check that if a package occurs in both
         -- packages then both caches point to identical tar indices, but for
         -- that we would need to be in IO)
-      , featureState = []  -- no AcidState; data lives in PostgreSQL
       , featureResources = [
             (resourceAt "/server-status/tarindices.:format") {
                 resourceDesc   = [ (GET,    "Which tar indices have been generated?")

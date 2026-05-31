@@ -174,7 +174,6 @@ analyticsPixelsFeature pool
     analyticsPixelsFeatureInterface  = (emptyHackageFeature "AnalyticsPixels") {
         featureDesc      = "Allow users to attach analytics pixels to their packages",
         featureResources = [analyticsPixelsResource, userAnalyticsPixelsResource]
-      , featureState     = []  -- no AcidState; data lives in PostgreSQL
       }
 
     analyticsPixelsResource :: Resource
