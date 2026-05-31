@@ -12,9 +12,8 @@ module Distribution.Server.Features.DownloadCount.State where
 
 import Data.Time.Calendar (Day(..))
 import Control.Arrow (first)
-import Control.Monad (liftM, unless)
-import Data.List (foldl', groupBy)
-import Data.Function (on)
+import Control.Monad (liftM)
+import Data.List (foldl')
 import qualified Data.Map.Lazy as Map
 
 import Data.SafeCopy (base, deriveSafeCopy)
@@ -26,8 +25,6 @@ import Distribution.Package (
   , packageName
   , packageVersion
   )
-import Distribution.Text (display)
-
 import Distribution.Server.Framework.Instances ()
 import Distribution.Server.Framework.MemSize
 import Distribution.Server.Util.CountingMap
@@ -151,43 +148,11 @@ accumTotalDownloads pkgName (OnDiskPerPkg perPkg) =
     cmInsert pkgName (cmTotal perPkg)
 
 {------------------------------------------------------------------------------
-  Pure updates/queries
-------------------------------------------------------------------------------}
-
--- | Fold a day's downloads into the historical statistics.
---
--- The name of packages whose statistics changed is also returned, 
--- so that only those need writing out.
-updateHistory :: InMemStats -> OnDiskStats -> (OnDiskStats, [PackageName])
-updateHistory (InMemStats day perPkg) (OnDiskStats (NCM _ m)) =
-    ( OnDiskStats (NCM 0 (Map.unionWith cmUnion m updatesMap))
-    , Map.keys updatesMap
-    )
-  where
-    updatesMap :: Map.Map PackageName OnDiskPerPkg
-    updatesMap = Map.fromList
-      [ (pkgname, applyUpdates pkgs)
-      | pkgs <- groupBy ((==) `on` (packageName . fst))
-                        (cmToList perPkg :: [(PackageId, Int)])
-      , let pkgname = packageName (fst (head pkgs))
-      ]
-
-    applyUpdates :: [(PackageId, Int)] -> OnDiskPerPkg
-    applyUpdates pkgs = foldr (.) id
-                          [ cmInsert (day, packageVersion pkgId) count
-                          | (pkgId, count) <- pkgs ]
-                          cmEmpty
-
-{------------------------------------------------------------------------------
   MemSize
 ------------------------------------------------------------------------------}
 
 instance MemSize InMemStats where
   memSize (InMemStats a b) = memSize2 a b
-
-{------------------------------------------------------------------------------
-  Serializing on-disk stats
-------------------------------------------------------------------------------}
 
 deriveSafeCopy 0 'base ''InMemStats
 deriveSafeCopy 0 'base ''OnDiskPerPkg
