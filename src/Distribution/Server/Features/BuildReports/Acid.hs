@@ -7,8 +7,7 @@
 {-# LANGUAGE TypeFamilies          #-}
 
 module Distribution.Server.Features.BuildReports.Acid
-  ( reportsStateComponent
-  , acidStore
+  ( acidStore
   ) where
 
 import qualified Distribution.Server.Features.BuildReports.State as State
@@ -37,38 +36,46 @@ import Data.Int (Int32)
 import Data.Time.Clock (UTCTime)
 import Database.Beam hiding (time)
 import Database.Beam.Postgres
-import Control.Concurrent.MVar (swapMVar)
 
 acidStore :: String -> PgConnection -> IO Store.Backend
-acidStore name serverPgConn = do
-  reportsState <- reportsStateComponent name serverPgConn
+acidStore _name pool = do
+  let withReports :: MonadIO m => (BuildReports.BuildReports -> a) -> m a
+      withReports f = liftIO $ f <$> dbGetBuildReports pool
+      -- Read-modify-write for the 'BuildReports' operations that may fail
+      modifyMaybe :: MonadIO m => (BuildReports.BuildReports -> Maybe BuildReports.BuildReports) -> m Bool
+      modifyMaybe f = liftIO $ dbModifyBuildReports' pool $ \st ->
+        case f st of
+          Nothing  -> (False, st)
+          Just st' -> (True, st')
+      -- Read-modify-write for adding a report, returning its id
+      modifyAdd :: MonadIO m => (BuildReports.BuildReports -> (BuildReports.BuildReports, BuildReportId)) -> m BuildReportId
+      modifyAdd f = liftIO $ dbModifyBuildReports' pool $ \st ->
+        let (st', reportId) = f st in (reportId, st')
   pure Store.Backend {
       Store.backendStore = Store.Store {
-          Store.lookupReportCovg = \pkgid reportId -> queryState reportsState (State.LookupReportCovg pkgid reportId)
-        , Store.lookupPackageReports = \pkgid -> do
-            reports <- queryState reportsState (State.LookupPackageReports pkgid)
-            pure $ map (\(reportId, (report, _, _, _)) -> (reportId, report)) reports
-        , Store.reportsBetween = \earlier later -> do
-            buildReports <- queryState reportsState State.GetBuildReports
-            pure [ (pkgid, report)
-                 | (pkgid, pkgReports) <- Map.toList (BuildReports.reportsIndex buildReports)
-                 , (report, _, _, _, _) <- Map.elems (BuildReports.reports pkgReports)
-                 , Just t <- [BuildReports.time report]
-                 , t > earlier && t <= later
-                 ]
-        , Store.lookupFailCount = \pkgid -> queryState reportsState (State.LookupFailCount pkgid)
-        , Store.lookupLatestReport = \pkgid -> queryState reportsState (State.LookupLatestReport pkgid)
-        , Store.lookupRunTests = \pkgid -> queryState reportsState (State.LookupRunTests pkgid)
-        , Store.addReport = \pkgid report -> updateState reportsState (State.AddReport pkgid report)
-        , Store.deleteReport = \pkgid reportId -> updateState reportsState (State.DeleteReport pkgid reportId)
-        , Store.setBuildLog = \pkgid reportId buildLog -> updateState reportsState (State.SetBuildLog pkgid reportId buildLog)
-        , Store.setTestLog = \pkgid reportId testLog -> updateState reportsState (State.SetTestLog pkgid reportId testLog)
-        , Store.resetFailCount = \pkgid -> updateState reportsState (State.ResetFailCount pkgid)
-        , Store.setRunTests = \pkgid enabled -> updateState reportsState (State.SetRunTests pkgid enabled)
-        , Store.setFailStatus = \pkgid status -> updateState reportsState (State.SetFailStatus pkgid status)
-        , Store.addRptAllLogsCovg = \pkgid report -> updateState reportsState (State.AddRptAllLogsCovg pkgid report)
+          Store.lookupReportCovg = \pkgid reportId -> withReports (BuildReports.lookupReportCovg pkgid reportId)
+        , Store.lookupPackageReports = \pkgid -> withReports $ \st ->
+            map (\(reportId, (report, _, _, _)) -> (reportId, report)) (BuildReports.lookupPackageReports pkgid st)
+        , Store.reportsBetween = \earlier later -> withReports $ \buildReports ->
+            [ (pkgid, report)
+            | (pkgid, pkgReports) <- Map.toList (BuildReports.reportsIndex buildReports)
+            , (report, _, _, _, _) <- Map.elems (BuildReports.reports pkgReports)
+            , Just t <- [BuildReports.time report]
+            , t > earlier && t <= later
+            ]
+        , Store.lookupFailCount = \pkgid -> withReports (BuildReports.lookupFailCount pkgid)
+        , Store.lookupLatestReport = \pkgid -> withReports (BuildReports.lookupLatestReport pkgid)
+        , Store.lookupRunTests = \pkgid -> withReports (BuildReports.lookupRunTests pkgid)
+        , Store.addReport = \pkgid (bRpt, blog) -> modifyAdd (BuildReports.addReport pkgid (bRpt, blog, Nothing))
+        , Store.deleteReport = \pkgid reportId -> modifyMaybe (BuildReports.deleteReport pkgid reportId)
+        , Store.setBuildLog = \pkgid reportId buildLog -> modifyMaybe (BuildReports.setBuildLog pkgid reportId buildLog)
+        , Store.setTestLog = \pkgid reportId testLog -> modifyMaybe (BuildReports.setTestLog pkgid reportId testLog)
+        , Store.resetFailCount = \pkgid -> modifyMaybe (BuildReports.resetFailCount pkgid)
+        , Store.setRunTests = \pkgid enabled -> modifyMaybe (BuildReports.setRunTests pkgid enabled)
+        , Store.setFailStatus = \pkgid status -> liftIO $ dbModifyBuildReports pool (BuildReports.setFailStatus pkgid status)
+        , Store.addRptAllLogsCovg = \pkgid report -> modifyAdd (BuildReports.addRptLogTestCovg pkgid report)
         }
-    , Store.backendState = [abstractAcidStateComponent reportsState]
+    , Store.backendState = []  -- no AcidState; data lives in PostgreSQL
     }
 
 ------------------------------------------------------------------------
@@ -314,21 +321,28 @@ saveBuildReports (BuildReports idx) =
       beamTx $
         runInsert $ insert buildReportsMetaTable $ insertValues metaRows
 
+
 ------------------------------------------------------------------------
+-- Direct database operations (no MVar, no event sourcing)
+--
+-- | Get build reports from PostgreSQL
+dbGetBuildReports :: PgConnection -> IO BuildReports
+dbGetBuildReports pool = runPgTx pool loadBuildReports
 
-reportsStateComponent :: String -> PgConnection -> IO (StateComponent AcidState BuildReports)
-reportsStateComponent name serverPgConn = do
-  -- Load state
-  st <- runPgTx serverPgConn loadBuildReports
+-- | Write full build reports to PostgreSQL
+dbPutBuildReports :: PgConnection -> BuildReports -> IO ()
+dbPutBuildReports pool st = runPgTx pool (saveBuildReports st)
 
-  pgSt <- mkAcidState serverPgConn st saveBuildReports
-  return StateComponent {
-      stateDesc    = "Build reports"
-    , stateHandle  = pgSt
-    , getState     = queryPg pgSt (runQueryEvent State.GetBuildReports)
-    , putState     = \s -> do
-        runPgTx serverPgConn (saveBuildReports s)
-        _ <- swapMVar (pgMVar pgSt) s
-        return ()
-    }
+-- | Read-modify-write helper
+dbModifyBuildReports :: PgConnection -> (BuildReports -> BuildReports) -> IO ()
+dbModifyBuildReports pool f = do
+  st <- dbGetBuildReports pool
+  dbPutBuildReports pool (f st)
 
+-- | Read-modify-write helper that returns a value
+dbModifyBuildReports' :: PgConnection -> (BuildReports -> (a, BuildReports)) -> IO a
+dbModifyBuildReports' pool f = do
+  st <- dbGetBuildReports pool
+  let (result, st') = f st
+  dbPutBuildReports pool st'
+  return result
