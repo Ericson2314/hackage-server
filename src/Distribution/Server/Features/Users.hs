@@ -246,7 +246,6 @@ initUserFeature :: ServerEnv -> IO (IO UserFeature)
 initUserFeature serverEnv@ServerEnv{serverStateDir, serverPgConn, serverTemplatesDir, serverTemplatesMode} = do
   -- Canonical state
   usersState  <- usersStateComponent  serverPgConn
-  adminsState <- adminsStateComponent serverPgConn
 
   -- Ephemeral state
   groupIndex   <- newMemStateWHNF emptyGroupIndex
@@ -273,7 +272,7 @@ initUserFeature serverEnv@ServerEnv{serverStateDir, serverPgConn, serverTemplate
     rec let (feature@UserFeature{groupResourceAt}, adminGroupDesc)
               = userFeature templates
                             usersState
-                            adminsState
+                            serverPgConn
                             groupIndex
                             userAdded authFailHook groupChangedHook
                             adminG adminR
@@ -438,19 +437,23 @@ saveUsers users = do
 ------------------------------------------------------------------------
 -- Load/save Admins
 
-loadAdmins :: PgTx Acid.HackageAdmins
-loadAdmins = do
-  rows <- beamTx $
-    runSelectReturningList $ select $ all_ adminsTable
-  let uids = [ UserId (fromIntegral uid) | AdminRow uid <- rows ]
-  return $ Acid.HackageAdmins (Group.fromList uids)
+-- | Get admin user IDs directly from PostgreSQL
+dbGetAdminList :: PgConnection -> IO Group.UserIdSet
+dbGetAdminList pool = do
+  rows <- runBeamPg pool $ runSelectReturningList $ select $ all_ adminsTable
+  return $ Group.fromList [ UserId (fromIntegral uid) | AdminRow uid <- rows ]
 
-saveAdmins :: Acid.HackageAdmins -> PgTx ()
-saveAdmins (Acid.HackageAdmins admins) = do
-    beamTx $ runDelete $ delete adminsTable (\_ -> val_ True)
-    let rows = [ AdminRow (fromIntegral uid) | UserId uid <- Group.toList admins ]
-    mapM_ (\chunk -> beamTx $
-      runInsert $ insert adminsTable $ insertValues chunk) (chunksOf 1000 rows)
+-- | Add an admin
+dbAddHackageAdmin :: PgConnection -> UserId -> IO ()
+dbAddHackageAdmin pool (UserId uid) =
+  runBeamPg pool $ runInsert $ insert adminsTable $ insertValues
+    [AdminRow (fromIntegral uid)]
+
+-- | Remove an admin
+dbRemoveHackageAdmin :: PgConnection -> UserId -> IO ()
+dbRemoveHackageAdmin pool (UserId uid) =
+  runBeamPg pool $ runDelete $ delete adminsTable
+    (\r -> _adUserId r ==. val_ (fromIntegral uid))
 
 chunksOf :: Int -> [a] -> [[a]]
 chunksOf _ [] = []
@@ -476,27 +479,10 @@ usersStateComponent serverPgConn = do
     , resetState   = \_ -> usersStateComponent serverPgConn
     }
 
-adminsStateComponent :: PgConnection -> IO (StateComponent AcidState Acid.HackageAdmins)
-adminsStateComponent serverPgConn = do
-  st <- runPgTx serverPgConn loadAdmins
-
-  pgSt <- mkAcidState serverPgConn st saveAdmins
-  return StateComponent {
-      stateDesc    = "Admins"
-    , stateHandle  = pgSt
-    , getState     = queryPg pgSt (runQueryEvent Acid.GetHackageAdmins)
-    , putState     = \s -> do
-        runPgTx serverPgConn (saveAdmins s)
-        _ <- swapMVar (pgMVar pgSt) s
-        return ()
-    , backupState  = \_ (Acid.HackageAdmins admins) -> [csvToBackup ["admins.csv"] (groupToCSV admins)]
-    , restoreState = Acid.HackageAdmins <$> groupBackup ["admins.csv"]
-    , resetState   = \_ -> adminsStateComponent serverPgConn
-    }
 
 userFeature :: Templates
             -> StateComponent AcidState Acid.Users
-            -> StateComponent AcidState Acid.HackageAdmins
+            -> PgConnection
             -> MemState GroupIndex
             -> Hook () ()
             -> Hook Auth.AuthError (Maybe ErrorResponse)
@@ -505,7 +491,7 @@ userFeature :: Templates
             -> GroupResource
             -> ServerEnv
             -> (UserFeature, UserGroup)
-userFeature templates usersState adminsState
+userFeature templates usersState pool
              groupIndex userAdded authFailHook groupChangedHook
              adminGroup adminResource userFeatureServerEnv
   = (UserFeature {..}, adminGroupDesc)
@@ -527,7 +513,7 @@ userFeature templates usersState adminsState
             ]
       , featureState = [
             abstractAcidStateComponent usersState
-          , abstractAcidStateComponent adminsState
+          -- HackageAdmins lives directly in PostgreSQL, no AcidState
           ]
       , featureCaches = [
             CacheComponent {
@@ -925,7 +911,7 @@ userFeature templates usersState adminsState
     -- Arguments: the auth'd user id, the user path id (derived from the :username)
     canChangePassword :: MonadIO m => UserId -> UserId -> m Bool
     canChangePassword uid userPathId = do
-        admins <- queryState adminsState Acid.GetAdminList
+        admins <- liftIO $ dbGetAdminList pool
         return $ uid == userPathId || (uid `Group.member` admins)
 
     --FIXME: this thing is a total mess!
@@ -955,9 +941,9 @@ userFeature templates usersState adminsState
     adminGroupDesc :: UserGroup
     adminGroupDesc = UserGroup {
           groupDesc             = nullDescription { groupTitle = "Hackage admins" },
-          queryUserGroup        = queryState  adminsState   Acid.GetAdminList,
-          addUserToGroup        = updateState adminsState . Acid.AddHackageAdmin,
-          removeUserFromGroup   = updateState adminsState . Acid.RemoveHackageAdmin,
+          queryUserGroup        = dbGetAdminList pool,
+          addUserToGroup        = dbAddHackageAdmin pool,
+          removeUserFromGroup   = dbRemoveHackageAdmin pool,
           groupsAllowedToAdd    = [adminGroupDesc],
           groupsAllowedToDelete = [adminGroupDesc]
         }

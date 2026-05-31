@@ -111,33 +111,8 @@ $(deriveSafeCopy 0 'base ''HackageAdmins)
 instance MemSize HackageAdmins where
     memSize (HackageAdmins a) = memSize1 a
 
-getHackageAdmins :: Query HackageAdmins HackageAdmins
-getHackageAdmins = ask
-
-getAdminList :: Query HackageAdmins UserIdSet
-getAdminList = asks adminList
-
-modifyHackageAdmins :: (UserIdSet -> UserIdSet) -> Update HackageAdmins ()
-modifyHackageAdmins func = State.modify (\users -> users { adminList = func (adminList users) })
-
-addHackageAdmin :: UserId -> Update HackageAdmins ()
-addHackageAdmin uid = modifyHackageAdmins (Group.insert uid)
-
-removeHackageAdmin :: UserId -> Update HackageAdmins ()
-removeHackageAdmin uid = modifyHackageAdmins (Group.delete uid)
-
-replaceHackageAdmins :: UserIdSet -> Update HackageAdmins ()
-replaceHackageAdmins ulist = modifyHackageAdmins (const ulist)
-
 initialHackageAdmins :: HackageAdmins
 initialHackageAdmins = HackageAdmins Group.empty
-
-$(makeAcidic ''HackageAdmins
-                 ['getHackageAdmins
-                 ,'getAdminList
-                 ,'addHackageAdmin
-                 ,'removeHackageAdmin
-                 ,'replaceHackageAdmins])
 
 --------------------------------------------------------------------------
 data MirrorClients = MirrorClients {
