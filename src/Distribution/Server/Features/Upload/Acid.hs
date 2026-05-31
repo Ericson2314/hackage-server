@@ -7,12 +7,10 @@
 {-# LANGUAGE StandaloneDeriving #-}
 {-# LANGUAGE TypeFamilies #-}
 module Distribution.Server.Features.Upload.Acid
-  ( trusteesStateComponent
-  , uploadersStateComponent
-  , maintainersStateComponent
-  , acidStore
+  ( acidStore
   ) where
 
+import Distribution.Package (PackageName)
 import qualified Distribution.Server.Features.Upload.Store as Store
 import Distribution.Server.Framework
 import qualified Distribution.Server.Features.Upload.State as Acid
@@ -26,30 +24,24 @@ import GHC.Generics (Generic)
 import Data.Int (Int32)
 import Database.Beam
 import Database.Beam.Postgres
-import Control.Concurrent.MVar (swapMVar)
+import Database.Beam.Backend.SQL.BeamExtensions (insertOnConflict, conflictingFields, onConflictDoNothing)
 import qualified Data.Text as T
 
 acidStore :: PgConnection -> IO Store.Backend
-acidStore pgConn = do
-  trusteesState <- trusteesStateComponent pgConn
-  uploadersState <- uploadersStateComponent pgConn
-  maintainersState <- maintainersStateComponent pgConn
+acidStore pool =
   pure Store.Backend {
       Store.backendStore = Store.Store {
-          Store.getTrustees = queryState trusteesState Acid.GetTrusteesList
-        , Store.addTrustee = updateState trusteesState . Acid.AddHackageTrustee
-        , Store.removeTrustee = updateState trusteesState . Acid.RemoveHackageTrustee
-        , Store.getUploaders = queryState uploadersState Acid.GetUploadersList
-        , Store.addUploader = updateState uploadersState . Acid.AddHackageUploader
-        , Store.removeUploader = updateState uploadersState . Acid.RemoveHackageUploader
-        , Store.getPackageMaintainers = \name -> queryState maintainersState (Acid.GetPackageMaintainers name)
-        , Store.addPackageMaintainer = \name -> updateState maintainersState . Acid.AddPackageMaintainer name
-        , Store.removePackageMaintainer = \name -> updateState maintainersState . Acid.RemovePackageMaintainer name
+          Store.getTrustees = liftIO $ dbGetTrustees pool
+        , Store.addTrustee = liftIO . dbAddTrustee pool
+        , Store.removeTrustee = liftIO . dbRemoveTrustee pool
+        , Store.getUploaders = liftIO $ dbGetUploaders pool
+        , Store.addUploader = liftIO . dbAddUploader pool
+        , Store.removeUploader = liftIO . dbRemoveUploader pool
+        , Store.getPackageMaintainers = liftIO . dbGetPackageMaintainers pool
+        , Store.addPackageMaintainer = \name -> liftIO . dbAddPackageMaintainer pool name
+        , Store.removePackageMaintainer = \name -> liftIO . dbRemovePackageMaintainer pool name
         }
-    , Store.backendState = [ abstractAcidStateComponent trusteesState
-                           , abstractAcidStateComponent uploadersState
-                           , abstractAcidStateComponent maintainersState
-                           ]
+    , Store.backendState = []  -- no AcidState; data lives in PostgreSQL
     }
 
 ------------------------------------------------------------------------
@@ -202,45 +194,83 @@ chunksOf n xs = let (h, t) = splitAt n xs in h : chunksOf n t
 
 ------------------------------------------------------------------------
 
-trusteesStateComponent :: PgConnection -> IO (StateComponent AcidState Acid.HackageTrustees)
-trusteesStateComponent serverPgConn = do
-  st <- runPgTx serverPgConn loadTrustees
-  pgSt <- mkAcidState serverPgConn st saveTrustees
-  return StateComponent {
-      stateDesc    = "Trustees"
-    , stateHandle  = pgSt
-    , getState     = queryPg pgSt (runQueryEvent Acid.GetHackageTrustees)
-    , putState     = \s -> do
-        runPgTx serverPgConn (saveTrustees s)
-        _ <- swapMVar (pgMVar pgSt) s
-        return ()
-    }
 
-uploadersStateComponent :: PgConnection -> IO (StateComponent AcidState Acid.HackageUploaders)
-uploadersStateComponent serverPgConn = do
-  st <- runPgTx serverPgConn loadUploaders
-  pgSt <- mkAcidState serverPgConn st saveUploaders
-  return StateComponent {
-      stateDesc    = "Uploaders"
-    , stateHandle  = pgSt
-    , getState     = queryPg pgSt (runQueryEvent Acid.GetHackageUploaders)
-    , putState     = \s -> do
-        runPgTx serverPgConn (saveUploaders s)
-        _ <- swapMVar (pgMVar pgSt) s
-        return ()
-    }
 
-maintainersStateComponent :: PgConnection -> IO (StateComponent AcidState Acid.PackageMaintainers)
-maintainersStateComponent serverPgConn = do
-  st <- runPgTx serverPgConn loadMaintainers
-  pgSt <- mkAcidState serverPgConn st saveMaintainers
-  return StateComponent {
-      stateDesc    = "Package maintainers"
-    , stateHandle  = pgSt
-    , getState     = queryPg pgSt (runQueryEvent Acid.AllPackageMaintainers)
-    , putState     = \s -> do
-        runPgTx serverPgConn (saveMaintainers s)
-        _ <- swapMVar (pgMVar pgSt) s
-        return ()
-    }
 
+
+------------------------------------------------------------------------
+-- Direct database operations (no MVar, no event sourcing)
+--
+
+-- Trustees
+dbGetTrustees :: PgConnection -> IO Group.UserIdSet
+dbGetTrustees pool = do
+  rows <- runBeamPg pool $ runSelectReturningList $ select $ all_ trusteesTable
+  return $ Group.fromList [ Users.UserId (fromIntegral uid) | TrusteeRow uid <- rows ]
+
+dbAddTrustee :: PgConnection -> Users.UserId -> IO ()
+dbAddTrustee pool (Users.UserId uid) =
+  -- These are set-membership tables (entire row is the primary key),
+  -- so ON CONFLICT DO NOTHING makes the insert idempotent: adding a
+  -- member that already exists is a no-op rather than an error.
+  runBeamPg pool $ runInsert $ insertOnConflict trusteesTable
+    (insertValues [TrusteeRow (fromIntegral uid)])
+    (conflictingFields primaryKey)
+    onConflictDoNothing
+
+dbRemoveTrustee :: PgConnection -> Users.UserId -> IO ()
+dbRemoveTrustee pool (Users.UserId uid) =
+  runBeamPg pool $ runDelete $ delete trusteesTable
+    (\r -> _trUserId r ==. val_ (fromIntegral uid))
+
+-- Uploaders
+dbGetUploaders :: PgConnection -> IO Group.UserIdSet
+dbGetUploaders pool = do
+  rows <- runBeamPg pool $ runSelectReturningList $ select $ all_ uploadersTable
+  return $ Group.fromList [ Users.UserId (fromIntegral uid) | UploaderRow uid <- rows ]
+
+dbAddUploader :: PgConnection -> Users.UserId -> IO ()
+dbAddUploader pool (Users.UserId uid) =
+  -- Set-membership table; see comment on dbAddTrustee
+  runBeamPg pool $ runInsert $ insertOnConflict uploadersTable
+    (insertValues [UploaderRow (fromIntegral uid)])
+    (conflictingFields primaryKey)
+    onConflictDoNothing
+
+dbRemoveUploader :: PgConnection -> Users.UserId -> IO ()
+dbRemoveUploader pool (Users.UserId uid) =
+  runBeamPg pool $ runDelete $ delete uploadersTable
+    (\r -> _upUserId r ==. val_ (fromIntegral uid))
+
+-- Maintainers
+dbGetPackageMaintainers :: PgConnection -> PackageName -> IO Group.UserIdSet
+dbGetPackageMaintainers pool pkgname = do
+  rows <- runBeamPg pool $
+    runSelectReturningList $ select $
+      filter_ (\r -> _mtPkgName r ==. val_ (T.pack $ display pkgname)) $
+      all_ maintainersTable
+  return $ Group.fromList [ Users.UserId (fromIntegral uid) | MaintainerRow _ uid <- rows ]
+
+dbAddPackageMaintainer :: PgConnection -> PackageName -> Users.UserId -> IO ()
+dbAddPackageMaintainer pool pkgname (Users.UserId uid) =
+  -- Set-membership table; see comment on dbAddTrustee
+  runBeamPg pool $ runInsert $ insertOnConflict maintainersTable
+    (insertValues [MaintainerRow (T.pack $ display pkgname) (fromIntegral uid)])
+    (conflictingFields primaryKey)
+    onConflictDoNothing
+
+dbRemovePackageMaintainer :: PgConnection -> PackageName -> Users.UserId -> IO ()
+dbRemovePackageMaintainer pool pkgname (Users.UserId uid) =
+  runBeamPg pool $ runDelete $ delete maintainersTable
+    (\r -> _mtPkgName r ==. val_ (T.pack $ display pkgname)
+       &&. _mtUserId r  ==. val_ (fromIntegral uid))
+
+dbSetPackageMaintainers :: PgConnection -> PackageName -> Group.UserIdSet -> IO ()
+dbSetPackageMaintainers pool pkgname uids =
+  runPgTx pool $ do
+    beamTx $ runDelete $ delete maintainersTable
+      (\r -> _mtPkgName r ==. val_ (T.pack $ display pkgname))
+    let rows = [ MaintainerRow (T.pack $ display pkgname) (fromIntegral uid)
+               | Users.UserId uid <- Group.toList uids ]
+    mapM_ (\chunk -> beamTx $
+      runInsert $ insert maintainersTable $ insertValues chunk) (chunksOf 1000 rows)
