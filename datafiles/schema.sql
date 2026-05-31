@@ -479,11 +479,6 @@ CREATE TABLE IF NOT EXISTS documentation__remove_documentation (id BIGSERIAL PRI
 CREATE TABLE IF NOT EXISTS tar_index_cache__set_tar_index (id BIGSERIAL PRIMARY KEY, arg0 TEXT NOT NULL, arg1 TEXT NOT NULL);
 
 
--- UserDetails events
-CREATE TABLE IF NOT EXISTS user_details_table__set_user_details (id BIGSERIAL PRIMARY KEY, arg0 TEXT NOT NULL, arg1 TEXT NOT NULL);
-CREATE TABLE IF NOT EXISTS user_details_table__set_user_name_contact (id BIGSERIAL PRIMARY KEY, arg0 TEXT NOT NULL, arg1 TEXT NOT NULL, arg2 TEXT NOT NULL);
-CREATE TABLE IF NOT EXISTS user_details_table__set_user_admin_info (id BIGSERIAL PRIMARY KEY, arg0 TEXT NOT NULL, arg1 TEXT NOT NULL, arg2 TEXT NOT NULL);
-CREATE TABLE IF NOT EXISTS user_details_table__delete_user_details (id BIGSERIAL PRIMARY KEY, arg0 TEXT NOT NULL);
 
 -- UserNotify events
 CREATE TABLE IF NOT EXISTS notify_data__add_notify_pref (id BIGSERIAL PRIMARY KEY, arg0 TEXT NOT NULL, arg1 TEXT NOT NULL);

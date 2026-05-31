@@ -15,10 +15,9 @@ module Distribution.Server.Features.UserDetails (
   ) where
 
 import qualified Distribution.Server.Features.UserDetails.Acid as Acid
-import Distribution.Server.Features.UserDetails.Backup
 import Distribution.Server.Features.UserDetails.Types
 import Distribution.Server.Framework
-import Distribution.Server.Framework.BackupDump
+import Distribution.Server.Framework.PgTx (beamTx)
 import Distribution.Server.Framework.Templating
 
 import Distribution.Server.Features.Users
@@ -30,16 +29,13 @@ import Distribution.Server.Util.Validators (guardValidLookingEmail, guardValidLo
 
 import qualified Data.Text as T
 import qualified Data.Aeson as Aeson
-import qualified Data.IntMap as IntMap
-import Data.List (foldl')
 
 import Distribution.Text (display)
 
 import GHC.Generics (Generic)
 import Database.Beam
+import Database.Beam.Backend.SQL.BeamExtensions (insertOnConflict, conflictingFields, onConflictUpdateSet)
 import Database.Beam.Postgres
-import Control.Concurrent.MVar (swapMVar)
-import qualified Database.PostgreSQL.Simple as PG
 import Data.Int (Int32)
 
 
@@ -108,55 +104,56 @@ showAccountKind (Just AccountKindRealUser) = Just "AccountKindRealUser"
 showAccountKind (Just AccountKindSpecial)  = Just "AccountKindSpecial"
 showAccountKind Nothing                    = Nothing
 
-loadUserDetailsTable :: PgTx Acid.UserDetailsTable
-loadUserDetailsTable = do
-  rows <- beamTx $
-    runSelectReturningList $ select $ all_ userDetailsDbTable
-  let addRow m (UserDetailRow uid name email akind notes) =
-        IntMap.insert (fromIntegral uid) (AccountDetails name email (parseAccountKind akind) notes) m
-  return $ Acid.UserDetailsTable $ foldl' addRow IntMap.empty rows
-
-saveUserDetailsTable :: Acid.UserDetailsTable -> PgTx ()
-saveUserDetailsTable (Acid.UserDetailsTable tbl) =
-  do
-    beamTx $
-      runDelete $ delete userDetailsDbTable (\_ -> val_ True)
-    let rows = [ UserDetailRow (fromIntegral uid)
-                   (accountName d) (accountContactEmail d)
-                   (showAccountKind (accountKind d)) (accountAdminNotes d)
-               | (uid, d) <- IntMap.toList tbl ]
-    mapM_ insertUserDetailChunk (chunksOf 1000 rows)
-
-insertUserDetailChunk :: [UserDetailRowT Identity] -> PgTx ()
-insertUserDetailChunk chunk =
-  beamTx $
-    runInsert $ insert userDetailsDbTable $ insertValues chunk
-
-chunksOf :: Int -> [a] -> [[a]]
-chunksOf _ [] = []
-chunksOf n xs = let (h, t) = splitAt n xs in h : chunksOf n t
-
 ------------------------------------------------------------------------
+-- Direct database operations (no MVar, no event sourcing)
+--
 
-userDetailsStateComponent :: PgConnection -> IO (StateComponent AcidState Acid.UserDetailsTable)
-userDetailsStateComponent serverPgConn = do
-  -- Load state
-  loaded <- runPgTx serverPgConn loadUserDetailsTable
+-- | Lookup user details
+dbLookupUserDetails :: PgConnection -> UserId -> IO (Maybe AccountDetails)
+dbLookupUserDetails pool (UserId uid) = do
+  rows <- runBeamPg pool $
+    runSelectReturningList $ select $
+      filter_ (\r -> _udUserId r ==. val_ (fromIntegral uid)) $
+      all_ userDetailsDbTable
+  return $ case rows of
+    (UserDetailRow _ name email akind notes : _) ->
+      Just (AccountDetails name email (parseAccountKind akind) notes)
+    [] -> Nothing
 
-  pgSt <- mkAcidState serverPgConn loaded saveUserDetailsTable
-  return StateComponent {
-      stateDesc    = "Extra details associated with user accounts, email addresses etc"
-    , stateHandle  = pgSt
-    , getState     = queryPg pgSt (runQueryEvent Acid.GetUserDetailsTable)
-    , putState     = \s -> do
-        runPgTx serverPgConn (saveUserDetailsTable s)
-        _ <- swapMVar (pgMVar pgSt) s
-        return ()
-    , backupState  = \backuptype users ->
-        [csvToBackup ["users.csv"] (userDetailsToCSV backuptype users)]
-    , restoreState = userDetailsBackup
-    , resetState   = \_ -> userDetailsStateComponent serverPgConn
-    }
+-- | Set full user details
+dbSetUserDetails :: PgConnection -> UserId -> AccountDetails -> IO ()
+dbSetUserDetails pool (UserId uid) d = do
+  runPgTx pool $ do
+    beamTx $ runDelete $ delete userDetailsDbTable
+      (\r -> _udUserId r ==. val_ (fromIntegral uid))
+    beamTx $ runInsert $ insert userDetailsDbTable $ insertValues
+      [UserDetailRow (fromIntegral uid)
+         (accountName d) (accountContactEmail d)
+         (showAccountKind (accountKind d)) (accountAdminNotes d)]
+
+-- | Set name and contact email (upsert via INSERT ... ON CONFLICT)
+dbSetUserNameContact :: PgConnection -> UserId -> T.Text -> T.Text -> IO ()
+dbSetUserNameContact pool (UserId uid) name email =
+  runBeamPg pool $
+    runInsert $ insertOnConflict userDetailsDbTable
+      (insertValues [UserDetailRow (fromIntegral uid) name email Nothing T.empty])
+      (conflictingFields (\r -> _udUserId r))
+      (onConflictUpdateSet (\fields _oldValues ->
+        mconcat [ _udName fields <-. val_ name
+                , _udContactEmail fields <-. val_ email
+                ]))
+
+-- | Set admin info (upsert via INSERT ... ON CONFLICT)
+dbSetUserAdminInfo :: PgConnection -> UserId -> Maybe AccountKind -> T.Text -> IO ()
+dbSetUserAdminInfo pool (UserId uid) akind notes =
+  runBeamPg pool $
+    runInsert $ insertOnConflict userDetailsDbTable
+      (insertValues [UserDetailRow (fromIntegral uid) T.empty T.empty (showAccountKind akind) notes])
+      (conflictingFields (\r -> _udUserId r))
+      (onConflictUpdateSet (\fields _oldValues ->
+        mconcat [ _udAccountKind fields <-. val_ (showAccountKind akind)
+                , _udAdminNotes fields <-. val_ notes
+                ]))
 
 ----------------------------------------
 -- Feature definition & initialisation
@@ -168,9 +165,6 @@ initUserDetailsFeature :: ServerEnv
                            -> UploadFeature
                            -> IO UserDetailsFeature)
 initUserDetailsFeature ServerEnv{serverPgConn, serverTemplatesDir, serverTemplatesMode} = do
-    -- Canonical state
-    usersDetailsState <- userDetailsStateComponent serverPgConn
-
     --TODO: link up to user feature to delete
 
     templates <-
@@ -179,24 +173,24 @@ initUserDetailsFeature ServerEnv{serverPgConn, serverTemplatesDir, serverTemplat
       [ "user-details-form.html" ]
 
     return $ \users core upload -> do
-      let feature = userDetailsFeature templates usersDetailsState users core upload
+      let feature = userDetailsFeature serverPgConn templates users core upload
       return feature
 
 
-userDetailsFeature :: Templates
-                   -> StateComponent AcidState Acid.UserDetailsTable
+userDetailsFeature :: PgConnection
+                   -> Templates
                    -> UserFeature
                    -> CoreFeature
                    -> UploadFeature
                    -> UserDetailsFeature
-userDetailsFeature templates userDetailsState UserFeature{..} CoreFeature{..} UploadFeature{uploadersGroup}
+userDetailsFeature pool templates UserFeature{..} CoreFeature{..} UploadFeature{uploadersGroup}
   = UserDetailsFeature {..}
 
   where
     userDetailsFeatureInterface = (emptyHackageFeature "user-details") {
         featureDesc      = "Extra information about user accounts, email addresses etc."
       , featureResources = [userNameContactResource, userAdminInfoResource]
-      , featureState     = [abstractAcidStateComponent userDetailsState]
+      , featureState     = []  -- no AcidState; data lives in PostgreSQL
       , featureCaches    = []
       }
 
@@ -231,11 +225,10 @@ userDetailsFeature templates userDetailsState UserFeature{..} CoreFeature{..} Up
     --
 
     queryUserDetails :: MonadIO m => UserId -> m (Maybe AccountDetails)
-    queryUserDetails uid = queryState userDetailsState (Acid.LookupUserDetails uid)
+    queryUserDetails uid = liftIO $ dbLookupUserDetails pool uid
 
     updateUserDetails :: MonadIO m => UserId -> AccountDetails -> m ()
-    updateUserDetails uid udetails = do
-      updateState userDetailsState (Acid.SetUserDetails uid udetails)
+    updateUserDetails uid udetails = liftIO $ dbSetUserDetails pool uid udetails
 
     -- Request handlers
     --
@@ -287,14 +280,14 @@ userDetailsFeature templates userDetailsState UserFeature{..} CoreFeature{..} Up
         NameAndContact name email <- expectAesonContent
         guardValidLookingName name
         guardValidLookingEmail email
-        updateState userDetailsState (Acid.SetUserNameContact uid name email)
+        liftIO $ dbSetUserNameContact pool uid name email
         noContent $ toResponse ()
 
     handlerDeleteUserNameContact :: DynamicPath -> ServerPartE Response
     handlerDeleteUserNameContact dpath = do
         uid <- lookupUserName =<< userNameInPath dpath
         guardAuthorised_ [IsUserId uid, InGroup adminGroup]
-        updateState userDetailsState (Acid.SetUserNameContact uid T.empty T.empty)
+        liftIO $ dbSetUserNameContact pool uid T.empty T.empty
         noContent $ toResponse ()
 
     handlerGetAdminInfo :: DynamicPath -> ServerPartE Response
@@ -316,12 +309,12 @@ userDetailsFeature templates userDetailsState UserFeature{..} CoreFeature{..} Up
         guardAuthorised_ [InGroup adminGroup]
         uid <- lookupUserName =<< userNameInPath dpath
         AdminInfo akind notes <- expectAesonContent
-        updateState userDetailsState (Acid.SetUserAdminInfo uid akind notes)
+        liftIO $ dbSetUserAdminInfo pool uid akind notes
         noContent $ toResponse ()
 
     handlerDeleteAdminInfo :: DynamicPath -> ServerPartE Response
     handlerDeleteAdminInfo dpath = do
         guardAuthorised_ [InGroup adminGroup]
         uid <- lookupUserName =<< userNameInPath dpath
-        updateState userDetailsState (Acid.SetUserAdminInfo uid Nothing T.empty)
+        liftIO $ dbSetUserAdminInfo pool uid Nothing T.empty
         noContent $ toResponse ()
