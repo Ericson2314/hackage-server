@@ -245,7 +245,6 @@ deriveJSON (compatAesonOptionsDropPrefix "ui_")  ''UserGroupResource
 initUserFeature :: ServerEnv -> IO (IO UserFeature)
 initUserFeature serverEnv@ServerEnv{serverStateDir, serverPgConn, serverTemplatesDir, serverTemplatesMode} = do
   -- Canonical state
-  usersState  <- usersStateComponent  serverPgConn
 
   -- Ephemeral state
   groupIndex   <- newMemStateWHNF emptyGroupIndex
@@ -271,7 +270,6 @@ initUserFeature serverEnv@ServerEnv{serverStateDir, serverPgConn, serverTemplate
     --
     rec let (feature@UserFeature{groupResourceAt}, adminGroupDesc)
               = userFeature templates
-                            usersState
                             serverPgConn
                             groupIndex
                             userAdded authFailHook groupChangedHook
@@ -461,27 +459,34 @@ chunksOf n xs = let (h, t) = splitAt n xs in h : chunksOf n t
 
 ------------------------------------------------------------------------
 
-usersStateComponent :: PgConnection -> IO (StateComponent AcidState Acid.Users)
-usersStateComponent serverPgConn = do
-  st <- runPgTx serverPgConn loadUsers
+-- | Get user database from PostgreSQL
+dbGetUserDb :: PgConnection -> IO Acid.Users
+dbGetUserDb pool = runPgTx pool loadUsers
 
-  pgSt <- mkAcidState serverPgConn st saveUsers
-  return StateComponent {
-      stateDesc    = "List of users"
-    , stateHandle  = pgSt
-    , getState     = queryPg pgSt (runQueryEvent Acid.GetUserDb)
-    , putState     = \s -> do
-        runPgTx serverPgConn (saveUsers s)
-        _ <- swapMVar (pgMVar pgSt) s
-        return ()
-    , backupState  = usersBackup
-    , restoreState = usersRestore
-    , resetState   = \_ -> usersStateComponent serverPgConn
-    }
+-- | Write full user database to PostgreSQL
+dbPutUserDb :: PgConnection -> Acid.Users -> IO ()
+dbPutUserDb pool st = runPgTx pool (saveUsers st)
+
+-- | Read-modify-write helper that returns a value
+dbModifyUsers :: PgConnection -> (Acid.Users -> Either err (Acid.Users, a)) -> IO (Either err a)
+dbModifyUsers pool f = do
+  users <- dbGetUserDb pool
+  case f users of
+    Left err         -> return (Left err)
+    Right (users',a) -> do dbPutUserDb pool users'
+                           return (Right a)
+
+-- | Read-modify-write helper for simpler updates
+dbModifyUsers_ :: PgConnection -> (Acid.Users -> Either err Acid.Users) -> IO (Maybe err)
+dbModifyUsers_ pool f = do
+  users <- dbGetUserDb pool
+  case f users of
+    Left err     -> return (Just err)
+    Right users' -> do dbPutUserDb pool users'
+                       return Nothing
 
 
 userFeature :: Templates
-            -> StateComponent AcidState Acid.Users
             -> PgConnection
             -> MemState GroupIndex
             -> Hook () ()
@@ -491,7 +496,7 @@ userFeature :: Templates
             -> GroupResource
             -> ServerEnv
             -> (UserFeature, UserGroup)
-userFeature templates usersState pool
+userFeature templates pool
              groupIndex userAdded authFailHook groupChangedHook
              adminGroup adminResource userFeatureServerEnv
   = (UserFeature {..}, adminGroupDesc)
@@ -511,10 +516,7 @@ userFeature templates usersState pool
               groupResource adminResource
             , groupUserResource adminResource
             ]
-      , featureState = [
-            abstractAcidStateComponent usersState
-          -- HackageAdmins lives directly in PostgreSQL, no AcidState
-          ]
+      , featureState = []  -- no AcidState; data lives in PostgreSQL
       , featureCaches = [
             CacheComponent {
               cacheDesc       = "user group index",
@@ -583,18 +585,18 @@ userFeature templates usersState pool
     --
 
     queryGetUserDb :: MonadIO m => m Acid.Users
-    queryGetUserDb = queryState usersState Acid.GetUserDb
+    queryGetUserDb = liftIO (dbGetUserDb pool)
 
     updateAddUser :: MonadIO m => UserName -> UserAuth -> m (Either Acid.ErrUserNameClash UserId)
-    updateAddUser uname auth = updateState usersState (Acid.AddUserEnabled uname auth)
+    updateAddUser uname auth = liftIO $ dbModifyUsers pool (Acid.addUserEnabled uname auth)
 
     updateSetUserEnabledStatus :: MonadIO m => UserId -> Bool
                                -> m (Maybe (Either Acid.ErrNoSuchUserId Acid.ErrDeletedUser))
-    updateSetUserEnabledStatus uid isenabled = updateState usersState (Acid.SetUserEnabledStatus uid isenabled)
+    updateSetUserEnabledStatus uid isenabled = liftIO $ dbModifyUsers_ pool (Acid.setUserEnabledStatus uid isenabled)
 
     updateSetUserAuth :: MonadIO m => UserId -> UserAuth
                       -> m (Maybe (Either Acid.ErrNoSuchUserId Acid.ErrDeletedUser))
-    updateSetUserAuth uid auth = updateState usersState (Acid.SetUserAuth uid auth)
+    updateSetUserAuth uid auth = liftIO $ dbModifyUsers_ pool (Acid.setUserAuth uid auth)
 
     --
     -- Authorisation: authentication checks and privilege checks
@@ -741,7 +743,7 @@ userFeature templates usersState pool
     serveUserPut dpath = do
       guardAuthorised_ [InGroup adminGroup]
       username <- userNameInPath dpath
-      muid     <- updateState usersState $ Acid.AddUserDisabled username
+      muid     <- liftIO $ dbModifyUsers pool (Acid.addUserDisabled username)
       case muid of
         Left  Acid.ErrUserNameClash ->
           errBadRequest "Username already exists"
@@ -756,7 +758,7 @@ userFeature templates usersState pool
     serveUserDelete dpath = do
       guardAuthorised_ [InGroup adminGroup]
       uid  <- lookupUserName =<< userNameInPath dpath
-      merr <- updateState usersState $ Acid.DeleteUser uid
+      merr <- liftIO $ dbModifyUsers_ pool (Acid.deleteUser uid)
       case merr of
         Nothing -> noContent $ toResponse ()
         --TODO: need to be able to delete user by name to fix this race condition
@@ -776,7 +778,7 @@ userFeature templates usersState pool
       guardAuthorised_ [InGroup adminGroup]
       uid  <- lookupUserName =<< userNameInPath dpath
       EnabledResource enabled <- expectAesonContent
-      merr <- updateState usersState (Acid.SetUserEnabledStatus uid enabled)
+      merr <- liftIO $ dbModifyUsers_ pool (Acid.setUserEnabledStatus uid enabled)
       case merr of
         Nothing -> noContent $ toResponse ()
         Just (Left Acid.ErrNoSuchUserId) ->
@@ -820,7 +822,7 @@ userFeature templates usersState pool
           template <- getTemplate templates "token-created.html"
           origTok  <- liftIO generateOriginalToken
           let storeTok = convertToken origTok
-          res <- updateState usersState (Acid.AddAuthToken uid storeTok desc)
+          res <- liftIO $ dbModifyUsers_ pool (Acid.addAuthToken uid storeTok desc)
           case res of
             Nothing ->
               ok $ toResponse $
@@ -839,7 +841,7 @@ userFeature templates usersState pool
                           [MText "The auth token provided is malformed: "
                           ,MText err]
             Right authToken -> do
-              res <- updateState usersState (Acid.RevokeAuthToken uid authToken)
+              res <- liftIO $ dbModifyUsers_ pool (Acid.revokeAuthToken uid authToken)
               case res of
                 Nothing ->
                   ok $ toResponse $
@@ -864,7 +866,7 @@ userFeature templates usersState pool
 
     lookupUserNameFull :: UserName -> ServerPartE (UserId, UserInfo)
     lookupUserNameFull uname = do
-        users <- queryState usersState Acid.GetUserDb
+        users <- liftIO (dbGetUserDb pool)
         case Acid.lookupUserName uname users of
           Just u  -> return u
           Nothing -> userLost "Could not find user: not presently registered"
@@ -875,7 +877,7 @@ userFeature templates usersState pool
 
     lookupUserInfo :: UserId -> ServerPartE UserInfo
     lookupUserInfo uid = do
-        users <- queryState usersState Acid.GetUserDb
+        users <- liftIO (dbGetUserDb pool)
         case Acid.lookupUserId uid users of
           Just uinfo -> return uinfo
           Nothing    -> errInternalError [MText "user id does not exist"]
@@ -903,7 +905,7 @@ userFeature templates usersState pool
         Nothing -> errBadRequest "Error registering user" [MText "Not a valid user name!"]
         Just uname -> do
           let auth = newUserAuth uname password
-          muid <- updateState usersState $ Acid.AddUserEnabled uname auth
+          muid <- liftIO $ dbModifyUsers pool (Acid.addUserEnabled uname auth)
           case muid of
             Left Acid.ErrUserNameClash -> errForbidden "Error registering user" [MText "A user account with that user name already exists."]
             Right _                     -> return uname
@@ -926,7 +928,7 @@ userFeature templates usersState pool
           forbidChange "Copies of new password do not match or is an invalid password (ex: blank)"
         let passwd = PasswdPlain passwd1
             auth   = newUserAuth username passwd
-        res <- updateState usersState (Acid.SetUserAuth uid auth)
+        res <- liftIO $ dbModifyUsers_ pool (Acid.setUserAuth uid auth)
         case res of
           Nothing -> return ()
           Just (Left  Acid.ErrNoSuchUserId) -> errInternalError [MText "user id lookup failure"]
@@ -951,7 +953,7 @@ userFeature templates usersState pool
     groupAddUser :: UserGroup -> DynamicPath -> ServerPartE ()
     groupAddUser group _ = do
         actorUid <- guardAuthorised (map InGroup (groupsAllowedToAdd group))
-        users <- queryState usersState Acid.GetUserDb
+        users <- liftIO (dbGetUserDb pool)
         muser <- optional $ look "user"
         reason <- optional $ look "reason"
         case muser of
