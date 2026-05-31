@@ -76,14 +76,11 @@ initMirrorFeature :: ServerEnv
                       -> UserFeature
                       -> IO MirrorFeature)
 initMirrorFeature env@ServerEnv{serverPgConn} = do
-    -- Canonical state
-    mirrorersState <- mirrorersStateComponent serverPgConn
-
     return $ \core user@UserFeature{..} -> do
       -- Tie the knot with a do-rec
       rec let (feature, mirrorersGroupDesc)
-                = mirrorFeature env core user
-                                mirrorersState mirrorersG mirrorR
+                = mirrorFeature env serverPgConn core user
+                                mirrorersG mirrorR
 
           (mirrorersG, mirrorR) <- groupResourceAt "/packages/mirrorers" mirrorersGroupDesc
 
@@ -140,34 +137,37 @@ chunksOf n xs = let (h, t) = splitAt n xs in h : chunksOf n t
 
 ------------------------------------------------------------------------
 
-mirrorersStateComponent :: PgConnection -> IO (StateComponent AcidState MirrorClients)
-mirrorersStateComponent serverPgConn = do
-  -- Load state
-  st <- runPgTx serverPgConn loadMirrorClients
+-- | Query current mirror clients from the database
+dbGetMirrorClients :: PgConnection -> IO Group.UserIdSet
+dbGetMirrorClients pool = do
+  rows <- runBeamPg pool $
+    runSelectReturningList $ select $ all_ mirrorClientsTable
+  return $ Group.fromList [ UserId (fromIntegral uid) | MirrorClientRow uid <- rows ]
 
-  pgSt <- mkAcidState serverPgConn st saveMirrorClients
-  return StateComponent {
-      stateDesc    = "Mirror clients"
-    , stateHandle  = pgSt
-    , getState     = queryPg pgSt (runQueryEvent GetMirrorClients)
-    , putState     = \s -> do
-        runPgTx serverPgConn (saveMirrorClients s)
-        _ <- swapMVar (pgMVar pgSt) s
-        return ()
-    , backupState  = \_ (MirrorClients clients) -> [csvToBackup ["clients.csv"] $ groupToCSV clients]
-    , restoreState = MirrorClients <$> groupBackup ["clients.csv"]
-    , resetState   = \_ -> mirrorersStateComponent serverPgConn
-    }
+-- | Add a mirror client
+dbAddMirrorClient :: PgConnection -> UserId -> IO ()
+dbAddMirrorClient pool (UserId uid) =
+  runBeamPg pool $
+    runInsert $ insert mirrorClientsTable $ insertValues
+      [MirrorClientRow (fromIntegral uid)]
+
+-- | Remove a mirror client
+dbRemoveMirrorClient :: PgConnection -> UserId -> IO ()
+dbRemoveMirrorClient pool (UserId uid) =
+  runBeamPg pool $
+    runDelete $ delete mirrorClientsTable
+      (\r -> _mcUserId r ==. val_ (fromIntegral uid))
 
 mirrorFeature :: ServerEnv
+              -> PgConnection
               -> CoreFeature
               -> UserFeature
-              -> StateComponent AcidState MirrorClients
               -> UserGroup
               -> GroupResource
               -> (MirrorFeature, UserGroup)
 
 mirrorFeature ServerEnv{serverBlobStore = store}
+              pool
               CoreFeature{ coreResource = coreResource@CoreResource{
                              packageInPath
                            , packageTarballInPath
@@ -179,7 +179,7 @@ mirrorFeature ServerEnv{serverBlobStore = store}
                          , updateSetPackageUploader
                          }
               UserFeature{..}
-              mirrorersState mirrorGroup mirrorGroupResource
+              mirrorGroup mirrorGroupResource
   = (MirrorFeature{..}, mirrorersGroupDesc)
   where
     mirrorFeatureInterface = (emptyHackageFeature "mirror") {
@@ -194,7 +194,7 @@ mirrorFeature ServerEnv{serverBlobStore = store}
             [ groupResource     mirrorGroupResource
             , groupUserResource mirrorGroupResource
             ]
-      , featureState = [abstractAcidStateComponent mirrorersState]
+      , featureState = []  -- no AcidState; data lives in PostgreSQL
       }
 
     mirrorResource = MirrorResource {
@@ -225,9 +225,9 @@ mirrorFeature ServerEnv{serverBlobStore = store}
 
     mirrorersGroupDesc = UserGroup {
         groupDesc             = nullDescription { groupTitle = "Mirror clients" },
-        queryUserGroup        = queryState  mirrorersState   GetMirrorClientsList,
-        addUserToGroup        = updateState mirrorersState . AddMirrorClient,
-        removeUserFromGroup   = updateState mirrorersState . RemoveMirrorClient,
+        queryUserGroup        = dbGetMirrorClients pool,
+        addUserToGroup        = dbAddMirrorClient pool,
+        removeUserFromGroup   = dbRemoveMirrorClient pool,
         groupsAllowedToDelete = [adminGroup],
         groupsAllowedToAdd    = [adminGroup]
     }

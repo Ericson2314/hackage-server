@@ -149,30 +149,5 @@ $(deriveSafeCopy 0 'base ''MirrorClients)
 instance MemSize MirrorClients where
     memSize (MirrorClients a) = memSize1 a
 
-getMirrorClients :: Query MirrorClients MirrorClients
-getMirrorClients = ask
-
-getMirrorClientsList :: Query MirrorClients UserIdSet
-getMirrorClientsList = asks mirrorClients
-
-modifyMirrorClients :: (UserIdSet -> UserIdSet) -> Update MirrorClients ()
-modifyMirrorClients func = State.modify (\users -> users { mirrorClients = func (mirrorClients users) })
-
-addMirrorClient :: UserId -> Update MirrorClients ()
-addMirrorClient uid = modifyMirrorClients (Group.insert uid)
-
-removeMirrorClient :: UserId -> Update MirrorClients ()
-removeMirrorClient uid = modifyMirrorClients (Group.delete uid)
-
-replaceMirrorClients :: UserIdSet -> Update MirrorClients ()
-replaceMirrorClients ulist = modifyMirrorClients (const ulist)
-
 initialMirrorClients :: MirrorClients
 initialMirrorClients = MirrorClients Group.empty
-
-$(makeAcidic ''MirrorClients
-                    ['getMirrorClients
-                    ,'getMirrorClientsList
-                    ,'addMirrorClient
-                    ,'removeMirrorClient
-                    ,'replaceMirrorClients])
