@@ -10,7 +10,7 @@
 
 module Distribution.Server.Features.Vouch (VouchFeature(..), initVouchFeature, judgeVouch) where
 
-import qualified Distribution.Server.Features.Vouch.State as Acid
+import qualified Distribution.Server.Features.Vouch.State as State
 import Distribution.Server.Features.Vouch.Types
 import Control.Monad (when, join)
 import Control.Monad.Except (runExceptT, throwError)
@@ -23,14 +23,13 @@ import Data.Time (UTCTime(..), addUTCTime, getCurrentTime, nominalDay, secondsTo
 import Data.Time.Format.ISO8601 (formatShow, iso8601Format)
 import Text.XHtml.Strict (prettyHtmlFragment, stringToHtml, li)
 
-import Distribution.Server.Framework ((</>), AcidState, PgConnection, DynamicPath, HackageFeature, IsHackageFeature, IsHackageFeature(..))
-import Distribution.Server.Framework (MessageSpan(MText), Method(..), Response, ServerEnv(..), ServerPartE, StateComponent(..))
-import Distribution.Server.Framework (abstractAcidStateComponent, emptyHackageFeature, errBadRequest, mkAcidState, pgMVar)
+import Distribution.Server.Framework ((</>), PgConnection, DynamicPath, HackageFeature, IsHackageFeature, IsHackageFeature(..))
+import Distribution.Server.Framework (MessageSpan(MText), Method(..), Response, ServerEnv(..), ServerPartE)
+import Distribution.Server.Framework (emptyHackageFeature, errBadRequest, runBeamPg, runPgTx)
 import Distribution.Server.Framework (featureDesc, featureReloadFiles, featureResources, featureState)
-import Distribution.Server.Framework (liftIO, queryPg, runBeamPg, runPgTx, runQueryEvent, queryState, resourceAt, resourceDesc, resourceGet)
+import Distribution.Server.Framework (liftIO, resourceAt, resourceDesc, resourceGet)
 import Distribution.Server.Framework.PgTx (PgTx, beamTx)
-import Distribution.Server.Framework (resourcePost, toResponse, updateState)
-import Distribution.Server.Framework.BackupRestore (RestoreBackup(..))
+import Distribution.Server.Framework (resourcePost, toResponse)
 import Distribution.Server.Framework.Templating (($=), TemplateAttr, getTemplate, loadTemplates, reloadTemplates, templateUnescaped)
 import qualified Distribution.Server.Users.Group as Group
 import Distribution.Server.Users.Types (UserId(..), UserInfo, UserName(..), userName)
@@ -42,8 +41,6 @@ import GHC.Generics (Generic)
 import Data.Int (Int32)
 import Database.Beam
 import Database.Beam.Postgres
-import Control.Concurrent.MVar (swapMVar)
-import qualified Database.PostgreSQL.Simple as PG
 
 ------------------------------------------------------------------------
 -- Beam tables for Vouch state
@@ -99,26 +96,49 @@ vouchesTable = _vouchVouches vouchDb
 notNotifiedTable :: DatabaseEntity Postgres VouchDb (TableEntity VouchNotNotifiedT)
 notNotifiedTable = _vouchNotNotified vouchDb
 
-loadVouchData :: PgTx Acid.VouchData
-loadVouchData = do
-  vouchRows <- beamTx $
-    runSelectReturningList $ select $ all_ vouchesTable
-  nnRows <- beamTx $
-    runSelectReturningList $ select $ all_ notNotifiedTable
-  let vouches = foldl' addVouch Map.empty vouchRows
-      nn = Set.fromList [ UserId (fromIntegral uid) | VouchNotNotifiedRow uid <- nnRows ]
-  return $ Acid.VouchData vouches nn
-  where
-    addVouch acc (VouchEntryRow voucheeId voucherId vouchedAt) =
-      Map.insertWith (++) (UserId (fromIntegral voucheeId)) [(UserId (fromIntegral voucherId), vouchedAt)] acc
+------------------------------------------------------------------------
+-- Direct database operations (no MVar, no event sourcing)
+--
 
-saveVouchData :: Acid.VouchData -> PgTx ()
-saveVouchData (Acid.VouchData vouches nn) =
-  do
-    beamTx $
-      runDelete $ delete vouchesTable (\_ -> val_ True)
+-- | Get vouches for a specific user
+dbGetVouchesFor :: PgConnection -> UserId -> IO [(UserId, UTCTime)]
+dbGetVouchesFor pool (UserId uid) = do
+  rows <- runBeamPg pool $
+    runSelectReturningList $ select $
+      filter_ (\r -> _veVoucheeId r ==. val_ (fromIntegral uid)) $
+      all_ vouchesTable
+  return [ (UserId (fromIntegral vid), ts) | VouchEntryRow _ vid ts <- rows ]
+
+-- | Add a vouch
+dbPutVouch :: PgConnection -> UserId -> (UserId, UTCTime) -> IO ()
+dbPutVouch pool (UserId voucheeId) (UserId voucherId, now) =
+  runBeamPg pool $
+    runInsert $ insert vouchesTable $ insertValues
+      [VouchEntryRow (fromIntegral voucheeId) (fromIntegral voucherId) now]
+
+-- | Add a user to the not-notified set
+dbAddNotNotified :: PgConnection -> UserId -> IO ()
+dbAddNotNotified pool (UserId uid) =
+  runBeamPg pool $
+    runInsert $ insert notNotifiedTable $ insertValues
+      [VouchNotNotifiedRow (fromIntegral uid)]
+
+-- | Drain queued notifications: return users and clear the set
+dbDrainNotNotified :: PgConnection -> IO [UserId]
+dbDrainNotNotified pool =
+  runPgTx pool $ do
+    rows <- beamTx $
+      runSelectReturningList $ select $ all_ notNotifiedTable
     beamTx $
       runDelete $ delete notNotifiedTable (\_ -> val_ True)
+    return [ UserId (fromIntegral uid) | VouchNotNotifiedRow uid <- rows ]
+
+-- | Write full state to DB (for backup restore)
+dbPutAllVouchData :: PgConnection -> State.VouchData -> IO ()
+dbPutAllVouchData pool (State.VouchData vouches nn) =
+  runPgTx pool $ do
+    beamTx $ runDelete $ delete vouchesTable (\_ -> val_ True)
+    beamTx $ runDelete $ delete notNotifiedTable (\_ -> val_ True)
     let vouchRows = [ VouchEntryRow (fromIntegral voucheeId) (fromIntegral voucherId) vouchedAt
                     | (UserId voucheeId, vs) <- Map.toList vouches
                     , (UserId voucherId, vouchedAt) <- vs ]
@@ -131,33 +151,6 @@ saveVouchData (Acid.VouchData vouches nn) =
 chunksOf :: Int -> [a] -> [[a]]
 chunksOf _ [] = []
 chunksOf n xs = let (h, t) = splitAt n xs in h : chunksOf n t
-
-------------------------------------------------------------------------
-
-vouchStateComponent :: PgConnection -> IO (StateComponent AcidState Acid.VouchData)
-vouchStateComponent serverPgConn = do
-  st <- runPgTx serverPgConn loadVouchData
-
-  let initialVouchData = Acid.VouchData mempty mempty
-      restore =
-        RestoreBackup
-          { restoreEntry = error "Unexpected backup entry"
-          , restoreFinalize = return initialVouchData
-          }
-
-  pgSt <- mkAcidState serverPgConn st saveVouchData
-  pure StateComponent
-    { stateDesc = "Keeps track of vouches"
-    , stateHandle = pgSt
-    , getState = queryPg pgSt (runQueryEvent Acid.GetVouchesData)
-    , putState = \s -> do
-        runPgTx serverPgConn (saveVouchData s)
-        _ <- swapMVar (pgMVar pgSt) s
-        return ()
-    , backupState = \_ _ -> []
-    , restoreState = restore
-    , resetState = \_ -> vouchStateComponent serverPgConn
-    }
 
 data VouchFeature =
   VouchFeature
@@ -224,7 +217,6 @@ renderVouchers lookupUserInfo (uid, timestamp) = do
 
 initVouchFeature :: ServerEnv -> IO (UserFeature -> UploadFeature -> IO VouchFeature)
 initVouchFeature ServerEnv{serverPgConn, serverTemplatesDir, serverTemplatesMode} = do
-  vouchState <- vouchStateComponent serverPgConn
   templates <- loadTemplates serverTemplatesMode [ serverTemplatesDir, serverTemplatesDir </> "Html"]
                                                  ["vouch.html"]
   vouchTemplate <- getTemplate templates "vouch.html"
@@ -234,7 +226,7 @@ initVouchFeature ServerEnv{serverPgConn, serverTemplatesDir, serverTemplatesMode
       handleGetVouches :: DynamicPath -> ServerPartE Response
       handleGetVouches dpath = do
         uid <- lookupUserName =<< userNameInPath dpath
-        vouches <- queryState vouchState $ Acid.GetVouchesFor uid
+        vouches <- liftIO $ dbGetVouchesFor serverPgConn uid
         param <- renderToLBS lookupUserInfo vouches
         pure . toResponse $ vouchTemplate
           [ "msg" $= ""
@@ -247,8 +239,8 @@ initVouchFeature ServerEnv{serverPgConn, serverTemplatesDir, serverTemplatesMode
         ugroup <- liftIO $ Group.queryUserGroup uploadersGroup
         now <- liftIO getCurrentTime
         vouchee <- lookupUserName =<< userNameInPath dpath
-        vouchersForVoucher <- queryState vouchState $ Acid.GetVouchesFor voucher
-        existingVouchers <- queryState vouchState $ Acid.GetVouchesFor vouchee
+        vouchersForVoucher <- liftIO $ dbGetVouchesFor serverPgConn voucher
+        existingVouchers <- liftIO $ dbGetVouchesFor serverPgConn vouchee
         case judgeVouch ugroup now vouchee vouchersForVoucher existingVouchers voucher of
           Left NotAnUploader ->
             errBadRequest "Not an uploader" [MText "You must be an uploader yourself to endorse other users."]
@@ -261,16 +253,13 @@ initVouchFeature ServerEnv{serverPgConn, serverTemplatesDir, serverTemplatesMode
           Left YouAlreadyVouched ->
             errBadRequest "Already endorsed" [MText "You have already endorsed this user."]
           Right result -> do
-            updateState vouchState $ Acid.PutVouch vouchee (voucher, now)
+            liftIO $ dbPutVouch serverPgConn vouchee (voucher, now)
             param <- renderToLBS lookupUserInfo $ existingVouchers ++ [(voucher, now)]
             case result of
               AddVouchComplete -> do
                 -- enqueue vouching completed notification
                 -- which will be read using drainQueuedNotifications
-                Acid.VouchData vouches notNotified <-
-                  queryState vouchState Acid.GetVouchesData
-                let newState = Acid.VouchData vouches (Set.insert vouchee notNotified)
-                updateState vouchState $ Acid.ReplaceVouchesData newState
+                liftIO $ dbAddNotNotified serverPgConn vouchee
 
                 liftIO $ Group.addUserToGroup uploadersGroup vouchee
                 pure . toResponse $ vouchTemplate
@@ -300,13 +289,8 @@ initVouchFeature ServerEnv{serverPgConn, serverTemplatesDir, serverTemplatesMode
               , resourcePost = [("html", handlePostVouch)]
               }
             ]
-          , featureState = [ abstractAcidStateComponent vouchState ]
+          , featureState = []  -- no AcidState; data lives in PostgreSQL
           , featureReloadFiles = reloadTemplates templates
           },
-      drainQueuedNotifications = do
-        Acid.VouchData vouches notNotified <-
-          queryState vouchState Acid.GetVouchesData
-        let newState = Acid.VouchData vouches mempty
-        updateState vouchState $ Acid.ReplaceVouchesData newState
-        pure $ Set.toList notNotified
+      drainQueuedNotifications = liftIO $ dbDrainNotNotified serverPgConn
     }

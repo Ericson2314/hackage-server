@@ -1,20 +1,15 @@
-{-# LANGUAGE OverloadedStrings, MultiParamTypeClasses, FlexibleInstances, DeriveAnyClass, DeriveGeneric, DerivingStrategies, TemplateHaskell #-}
-{-# LANGUAGE TypeFamilies #-}
+{-# LANGUAGE DerivingStrategies #-}
+{-# LANGUAGE TemplateHaskell #-}
 
 module Distribution.Server.Features.Vouch.State where
 
-import Control.Monad.Reader (ask)
-import Control.Monad.State (get, put)
 import qualified Data.Map.Strict as Map
 import qualified Data.Set as Set
-import Data.Maybe (fromMaybe)
-import Data.Time (UTCTime(..))
+import Data.Time (UTCTime)
 
-import Distribution.Server.Framework.EventSourcing (Query, Update, makeAcidic)
-import Distribution.Server.Framework.BeamInstances ()
 import Distribution.Server.Framework (MemSize(..), memSize2)
 import Data.SafeCopy (base, deriveSafeCopy)
-import Distribution.Server.Users.Types (UserId(..))
+import Distribution.Server.Users.Types (UserId)
 
 data VouchData =
   VouchData
@@ -26,29 +21,4 @@ data VouchData =
 instance MemSize VouchData where
   memSize (VouchData vouches notified) = memSize2 vouches notified
 
-putVouch :: UserId -> (UserId, UTCTime) -> Update VouchData ()
-putVouch vouchee (voucher, now) = do
-  VouchData tbl notNotified <- get
-  let oldMap = fromMaybe [] (Map.lookup vouchee tbl)
-      newMap = (voucher, now) : oldMap
-  put $ VouchData (Map.insert vouchee newMap tbl) notNotified
-
-getVouchesFor :: UserId -> Query VouchData [(UserId, UTCTime)]
-getVouchesFor needle = do
-  VouchData tbl _notNotified <- ask
-  pure . fromMaybe [] $ Map.lookup needle tbl
-
-getVouchesData :: Query VouchData VouchData
-getVouchesData = ask
-
-replaceVouchesData :: VouchData -> Update VouchData ()
-replaceVouchesData = put
-
 $(deriveSafeCopy 0 'base ''VouchData)
-
-$(makeAcidic ''VouchData
-  [ 'putVouch
-  , 'getVouchesFor
-  , 'getVouchesData
-  , 'replaceVouchesData
-  ])
