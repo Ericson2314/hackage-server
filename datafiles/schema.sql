@@ -552,9 +552,6 @@ CREATE TABLE IF NOT EXISTS tag_alias_add_tag_alias (id BIGSERIAL PRIMARY KEY, ar
 CREATE TABLE IF NOT EXISTS documentation_insert_documentation (id BIGSERIAL PRIMARY KEY, arg0 TEXT NOT NULL, arg1 TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS documentation_remove_documentation (id BIGSERIAL PRIMARY KEY, arg0 TEXT NOT NULL);
 
--- Votes events
-CREATE TABLE IF NOT EXISTS votes_state_add_vote (id BIGSERIAL PRIMARY KEY, arg0 TEXT NOT NULL, arg1 TEXT NOT NULL, arg2 TEXT NOT NULL);
-CREATE TABLE IF NOT EXISTS votes_state_remove_vote (id BIGSERIAL PRIMARY KEY, arg0 TEXT NOT NULL, arg1 TEXT NOT NULL);
 
 -- Platform events
 CREATE TABLE IF NOT EXISTS platform_packages_set_platform_package (id BIGSERIAL PRIMARY KEY, arg0 TEXT NOT NULL, arg1 TEXT NOT NULL);

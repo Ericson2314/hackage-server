@@ -7,7 +7,6 @@
 {-# LANGUAGE TypeFamilies #-}
 module Distribution.Server.Features.Votes.Acid
   ( acidStore
-  , votesStateComponent
   ) where
 
 import Distribution.Server.Features.Votes.Store
@@ -17,6 +16,9 @@ import Distribution.Server.Framework
 import Distribution.Server.Users.Types (UserId(..))
 
 import Distribution.Text
+import Distribution.Package (PackageName)
+import Distribution.Server.Features.Votes.Types (Score)
+import Control.Monad (when)
 
 import qualified Data.Map as Map
 import qualified Data.Text as T
@@ -24,24 +26,24 @@ import qualified Data.Text as T
 import GHC.Generics (Generic)
 import Database.Beam
 import Database.Beam.Postgres
-import Control.Concurrent.MVar (swapMVar)
 import Data.List (foldl')
 import Data.Int (Int32)
 
 acidStore :: PgConnection -> IO Backend
-acidStore pgConn = do
-  votesState <- votesStateComponent pgConn
+acidStore pool =
   return Backend {
     backendStore = Store {
-        getAllPackageVoteScores = Map.map votesScore <$> queryState votesState Acid.GetAllPackageVoteSets
-      , addVote               = \pkgname uid score -> updateState votesState (Acid.AddVote pkgname uid score)
-      , removeVote            = \pkgname uid -> updateState votesState (Acid.RemoveVote pkgname uid)
-      , getPackageVoteCount   = \pkgname -> queryState votesState (Acid.GetPackageVoteCount pkgname)
-      , getPackageVoteScore   = \pkgname -> queryState votesState (Acid.GetPackageVoteScore pkgname)
-      , getPackageUserVoted   = \pkgname uid -> queryState votesState (Acid.GetPackageUserVoted pkgname uid)
-      , getPackageUserVote    = \pkgname uid -> queryState votesState (Acid.GetPackageUserVote pkgname uid)
+        getAllPackageVoteScores = liftIO $ Map.map votesScore <$> dbGetAllVotes pool
+      , addVote               = \pkgname uid score -> liftIO $ do
+          dbAddVote pool pkgname uid score
+          dbPkgScore pool pkgname
+      , removeVote            = \pkgname uid -> liftIO $ dbRemoveVote pool pkgname uid
+      , getPackageVoteCount   = \pkgname -> liftIO $ dbPkgNumVotes pool pkgname
+      , getPackageVoteScore   = \pkgname -> liftIO $ dbPkgScore pool pkgname
+      , getPackageUserVoted   = \pkgname uid -> liftIO $ dbDidUserVote pool pkgname uid
+      , getPackageUserVote    = \pkgname uid -> liftIO $ dbPkgUserVote pool pkgname uid
       }
-    , backendState = [abstractAcidStateComponent votesState]
+    , backendState = []  -- no AcidState; data lives in PostgreSQL
     }
 
 ------------------------------------------------------------------------
@@ -78,54 +80,103 @@ votesDb = defaultDbSettings `withDbModification`
 votesTable :: DatabaseEntity Postgres VotesDb (TableEntity VoteRowT)
 votesTable = _votesRows votesDb
 
-loadVotesState :: PgTx Acid.VotesState
-loadVotesState = do
-  rows <- beamTx $
-    runSelectReturningList $ select $ all_ votesTable
-  let addRow m (VoteRow name uid score) =
-        case simpleParse (T.unpack name) of
-          Just pkgName ->
-            Map.insertWith Map.union pkgName
-              (Map.singleton (UserId (fromIntegral uid)) (fromIntegral score)) m
-          Nothing -> m
-  return $ Acid.VotesState $ foldl' addRow Map.empty rows
+------------------------------------------------------------------------
+-- Direct database operations (no MVar, no event sourcing)
+--
 
-saveVotesState :: Acid.VotesState -> PgTx ()
-saveVotesState (Acid.VotesState votes) =
-  do
-    beamTx $
-      runDelete $ delete votesTable (\_ -> val_ True)
-    let rows = [ VoteRow (T.pack $ display pkgName) (fromIntegral uid) (fromIntegral score)
-               | (pkgName, userMap) <- Map.toList votes
-               , (UserId uid, score) <- Map.toList userMap ]
-    mapM_ (insertVoteChunk) (chunksOf 1000 rows)
+-- | Get all votes as a map (for backup or bulk queries)
+dbGetAllVotes :: PgConnection -> IO (Map.Map PackageName (Map.Map UserId Score))
+dbGetAllVotes pool = runBeamPg pool $ do
+  rows <- runSelectReturningList $ select $ all_ votesTable
+  return $ foldl' addRow Map.empty rows
+  where
+    addRow m (VoteRow name uid score) =
+      case simpleParse (T.unpack name) of
+        Just pkgName ->
+          Map.insertWith Map.union pkgName
+            (Map.singleton (UserId (fromIntegral uid)) (fromIntegral score)) m
+        Nothing -> m
 
-insertVoteChunk :: [VoteRowT Identity] -> PgTx ()
-insertVoteChunk chunk =
-  beamTx $
-    runInsert $ insert votesTable $ insertValues chunk
+-- | Add or update a vote
+dbAddVote :: PgConnection -> PackageName -> UserId -> Score -> IO ()
+dbAddVote pool pkgname (UserId uid) score =
+    runPgTx pool $ do
+      -- Delete existing vote if any, then insert
+      beamTx $ runDelete $ delete votesTable
+        (\v -> _vrPkgName v ==. val_ (T.pack $ display pkgname)
+           &&. _vrUserId v  ==. val_ (fromIntegral uid))
+      beamTx $ runInsert $ insert votesTable $ insertValues
+        [VoteRow (T.pack $ display pkgname) (fromIntegral uid) (fromIntegral score)]
+
+-- | Remove a vote, returns True if it existed
+dbRemoveVote :: PgConnection -> PackageName -> UserId -> IO Bool
+dbRemoveVote pool pkgname uid = do
+    existed <- dbDidUserVote pool pkgname uid
+    when existed $
+      runBeamPg pool $
+        runDelete $ delete votesTable
+          (\v -> _vrPkgName v ==. val_ (T.pack $ display pkgname)
+             &&. _vrUserId v  ==. val_ (let UserId u = uid in fromIntegral u))
+    return existed
+
+-- | Check if a user voted for a package
+dbDidUserVote :: PgConnection -> PackageName -> UserId -> IO Bool
+dbDidUserVote pool pkgname (UserId uid) = do
+    rows <- runBeamPg pool $
+      runSelectReturningList $ select $
+        filter_ (\v -> _vrPkgName v ==. val_ (T.pack $ display pkgname)
+                   &&. _vrUserId v  ==. val_ (fromIntegral uid)) $
+        all_ votesTable
+    return (not (null rows))
+
+-- | Get number of votes for a package
+dbPkgNumVotes :: PgConnection -> PackageName -> IO Int
+dbPkgNumVotes pool pkgname = do
+    rows <- runBeamPg pool $
+      runSelectReturningList $ select $
+        filter_ (\v -> _vrPkgName v ==. val_ (T.pack $ display pkgname)) $
+        all_ votesTable
+    return (length rows)
+
+-- | Get score for a package
+dbPkgScore :: PgConnection -> PackageName -> IO Float
+dbPkgScore pool pkgname = do
+    rows <- runBeamPg pool $
+      runSelectReturningList $ select $
+        filter_ (\v -> _vrPkgName v ==. val_ (T.pack $ display pkgname)) $
+        all_ votesTable
+    let userScores = Map.fromList
+          [ (UserId (fromIntegral uid), fromIntegral score)
+          | VoteRow _ uid score <- rows ]
+    return $ if Map.null userScores then 0 else votesScore userScores
+
+-- | Get a user's vote for a package
+dbPkgUserVote :: PgConnection -> PackageName -> UserId -> IO (Maybe Score)
+dbPkgUserVote pool pkgname (UserId uid) = do
+    rows <- runBeamPg pool $
+      runSelectReturningList $ select $
+        filter_ (\v -> _vrPkgName v ==. val_ (T.pack $ display pkgname)
+                   &&. _vrUserId v  ==. val_ (fromIntegral uid)) $
+        all_ votesTable
+    return $ case rows of
+      (VoteRow _ _ score : _) -> Just (fromIntegral score)
+      [] -> Nothing
+
+-- | Write full state to DB (for backup restore)
+dbPutAllVotes :: PgConnection -> Acid.VotesState -> IO ()
+dbPutAllVotes pool (Acid.VotesState votes) =
+    runPgTx pool $ do
+      beamTx $ runDelete $ delete votesTable (\_ -> val_ True)
+      let rows = [ VoteRow (T.pack $ display pkgName) (fromIntegral uid) (fromIntegral score)
+                 | (pkgName, userMap) <- Map.toList votes
+                 , (UserId uid, score) <- Map.toList userMap ]
+      mapM_ insertChunk (chunksOf 1000 rows)
+  where
+    insertChunk chunk = beamTx $
+      runInsert $ insert votesTable $ insertValues chunk
 
 chunksOf :: Int -> [a] -> [[a]]
 chunksOf _ [] = []
 chunksOf n xs = let (h, t) = splitAt n xs in h : chunksOf n t
 
 ------------------------------------------------------------------------
-
--- | Define the backing store (i.e. database component)
-votesStateComponent :: PgConnection -> IO (StateComponent AcidState Acid.VotesState)
-votesStateComponent serverPgConn = do
-  -- Load state
-  loaded <- runPgTx serverPgConn loadVotesState
-
-  pgSt <- mkAcidState serverPgConn loaded saveVotesState
-  return StateComponent {
-      stateDesc    = "Backing store for Map PackageName -> Users who voted for it"
-    , stateHandle  = pgSt
-    , getState     = queryPg pgSt (runQueryEvent Acid.GetVotesState)
-    , putState     = \s -> do
-        runPgTx serverPgConn (saveVotesState s)
-        _ <- swapMVar (pgMVar pgSt) s
-        return ()
-    }
-
-
