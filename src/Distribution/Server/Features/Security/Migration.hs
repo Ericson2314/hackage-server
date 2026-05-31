@@ -25,6 +25,7 @@ import Distribution.Package (PackageId)
 
 -- hackage
 import Distribution.Server.Features.Core.State
+import Distribution.Server.Features.PackageCandidates.Db (dbGetCandidatePackages, dbModifyCandidates')
 import Distribution.Server.Features.PackageCandidates.State
 import Distribution.Server.Features.PackageCandidates.Types
 import Distribution.Server.Features.Security.Layout
@@ -69,13 +70,13 @@ migratePkgTarball_v1_to_v2 env@ServerEnv{ serverVerbosity = verbosity }
 
 -- | Similar migration for candidates
 migrateCandidatePkgTarball_v1_to_v2 :: ServerEnv
-                                    -> StateComponent AcidState CandidatePackages
+                                    -> PgConnection
                                     -> IO ()
 migrateCandidatePkgTarball_v1_to_v2 env@ServerEnv{ serverVerbosity = verbosity }
-                                    candidatesState
+                                    pool
                                     = do
     precomputedHashes <- readPrecomputedHashes env
-    CandidatePackages{candidateList} <- queryState candidatesState GetCandidatePackages
+    CandidatePackages{candidateList} <- dbGetCandidatePackages pool
     let allCandidates = PackageIndex.allPackages candidateList
         partitionSz   = PackageIndex.numPackageVersions candidateList `div` 10
         partitioned   = partition partitionSz allCandidates
@@ -87,8 +88,10 @@ migrateCandidatePkgTarball_v1_to_v2 env@ServerEnv{ serverVerbosity = verbosity }
   where
     updatePackage :: PackageId -> PkgInfo -> IO ()
     updatePackage pkgId pkgInfo = do
-      _didUpdate <- updateState candidatesState $
-                      UpdateCandidatePkgInfo pkgId pkgInfo
+      _didUpdate <- dbModifyCandidates' pool $ \st@CandidatePackages{candidateList} ->
+        case PackageIndex.lookupPackageId candidateList pkgId of
+          Nothing   -> (False, st)
+          Just cand -> (True, st { candidateList = PackageIndex.insert (cand { candPkgInfo = pkgInfo }) candidateList })
       return ()
 
     partitionLogMsg :: Int -> Int -> String

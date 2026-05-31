@@ -478,7 +478,3 @@ CREATE TABLE IF NOT EXISTS build_reports__reset_fail_count (id BIGSERIAL PRIMARY
 CREATE TABLE IF NOT EXISTS build_reports__set_test_log (id BIGSERIAL PRIMARY KEY, arg0 TEXT NOT NULL, arg1 TEXT NOT NULL, arg2 TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS build_reports__set_run_tests (id BIGSERIAL PRIMARY KEY, arg0 TEXT NOT NULL, arg1 TEXT NOT NULL);
 
--- PackageCandidates events
-CREATE TABLE IF NOT EXISTS candidate_packages__add_candidate (id BIGSERIAL PRIMARY KEY, arg0 TEXT NOT NULL);
-CREATE TABLE IF NOT EXISTS candidate_packages__delete_candidate (id BIGSERIAL PRIMARY KEY, arg0 TEXT NOT NULL);
-CREATE TABLE IF NOT EXISTS candidate_packages__delete_candidates (id BIGSERIAL PRIMARY KEY, arg0 TEXT NOT NULL);

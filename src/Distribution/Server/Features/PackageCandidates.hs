@@ -16,6 +16,7 @@ module Distribution.Server.Features.PackageCandidates (
 
     CandidateRender(..),
     CandPkgInfo(..),
+
   ) where
 
 import Distribution.Server.Framework
@@ -58,8 +59,6 @@ import           Data.Time.Clock (UTCTime)
 import           Data.Int (Int32, Int64)
 import Database.Beam
 import Database.Beam.Postgres
-import qualified Database.PostgreSQL.Simple as PG
-import Control.Concurrent.MVar (swapMVar)
 import qualified Data.ByteString as StrictBS
 import qualified Data.Text.Encoding as T
 import Distribution.Server.Users.Types (UserId(..))
@@ -167,50 +166,29 @@ initPackageCandidatesFeature :: ServerEnv
                                  -> TarIndexCacheFeature
                                  -> IO PackageCandidatesFeature)
 initPackageCandidatesFeature env@ServerEnv{serverPgConn} = do
-    candidatesState <- candidatesStateComponent False serverPgConn
-
     return $ \user core upload@UploadFeature{..} tarIndexCache -> do
       -- one-off migration
       CandidatePackages{candidateMigratedPkgTarball = migratedPkgTarball} <-
-        queryState candidatesState GetCandidatePackages
+        dbGetCandidatePackages serverPgConn
       unless migratedPkgTarball $ do
-        migrateCandidatePkgTarball_v1_to_v2 env candidatesState
-        updateState candidatesState SetMigratedPkgTarball
+        migrateCandidatePkgTarball_v1_to_v2 env serverPgConn
+        dbModifyCandidates serverPgConn $ \st -> st { candidateMigratedPkgTarball = True }
 
-      registerHook packageUploaded $ updateState candidatesState . DeleteCandidate
+      registerHook packageUploaded $ \pkgid ->
+        dbModifyCandidates serverPgConn $ \candidates ->
+          candidates { candidateList = PackageIndex.deletePackageId pkgid (candidateList candidates) }
 
       let feature = candidatesFeature env
                                       user core upload tarIndexCache
-                                      candidatesState
+                                      serverPgConn
       return feature
-
-------------------------------------------------------------------------
-
-candidatesStateComponent :: Bool -> PgConnection -> IO (StateComponent AcidState CandidatePackages)
-candidatesStateComponent freshDB serverPgConn = do
-  -- Load state
-  st <- runPgTx serverPgConn loadCandidatePackages
-
-  pgSt <- mkAcidState serverPgConn st saveCandidatePackages
-  return StateComponent {
-      stateDesc    = "Candidate packages"
-    , stateHandle  = pgSt
-    , getState     = queryPg pgSt (runQueryEvent GetCandidatePackages)
-    , putState     = \s -> do
-        runPgTx serverPgConn (saveCandidatePackages s)
-        _ <- swapMVar (pgMVar pgSt) s
-        return ()
-    , resetState   = \_ -> candidatesStateComponent True serverPgConn
-    , backupState  = \_ -> backupCandidates
-    , restoreState = restoreCandidates
-  }
 
 candidatesFeature :: ServerEnv
                   -> UserFeature
                   -> CoreFeature
                   -> UploadFeature
                   -> TarIndexCacheFeature
-                  -> StateComponent AcidState CandidatePackages
+                  -> PgConnection
                   -> PackageCandidatesFeature
 candidatesFeature ServerEnv{serverBlobStore = store}
                   UserFeature{..}
@@ -220,7 +198,7 @@ candidatesFeature ServerEnv{serverBlobStore = store}
                              }
                   UploadFeature{..}
                   TarIndexCacheFeature{packageTarball, findToplevelFile}
-                  candidatesState
+                  pool
   = PackageCandidatesFeature{..}
   where
     candidatesFeatureInterface = (emptyHackageFeature "candidates") {
@@ -238,11 +216,11 @@ candidatesFeature ServerEnv{serverBlobStore = store}
             , candidateContents
             , candidateChangeLog
             ]
-      , featureState = [abstractAcidStateComponent candidatesState]
+      , featureState = []  -- no AcidState; data lives in PostgreSQL
       }
 
     queryGetCandidateIndex :: MonadIO m => m (PackageIndex CandPkgInfo)
-    queryGetCandidateIndex = return . candidateList =<< queryState candidatesState GetCandidatePackages
+    queryGetCandidateIndex = return . candidateList =<< liftIO (dbGetCandidatePackages pool)
 
     candidatesCoreResource = fix $ \r -> CoreResource {
 -- TODO: There is significant overlap between this definition and the one in Core
@@ -389,14 +367,16 @@ candidatesFeature ServerEnv{serverBlobStore = store}
     doDeleteCandidate dpath = do
       candidate <- packageInPath dpath >>= lookupCandidateId
       guardAuthorisedAsMaintainerOrTrustee (packageName candidate)
-      void $ updateState candidatesState $ DeleteCandidate (packageId candidate)
+      void $ liftIO $ dbModifyCandidates pool $ \cs ->
+                cs { candidateList = PackageIndex.deletePackageId (packageId candidate) (candidateList cs) }
       seeOther (packageCandidatesUri candidatesResource "" $ packageName candidate) $ toResponse ()
 
     doDeleteCandidates :: DynamicPath -> ServerPartE Response
     doDeleteCandidates dpath = do
       pkgname <- packageInPath dpath
       guardAuthorisedAsMaintainerOrTrustee pkgname
-      void $ updateState candidatesState $ DeleteCandidates pkgname
+      liftIO $ dbModifyCandidates pool $ \cs ->
+        cs { candidateList = PackageIndex.deletePackageName pkgname (candidateList cs) }
       seeOther (packageCandidatesUri candidatesResource "" pkgname) $ toResponse ()
 
     serveCandidateTarball :: DynamicPath -> ServerPartE Response
@@ -446,7 +426,8 @@ candidatesFeature ServerEnv{serverBlobStore = store}
         checkCandidate "Upload failed" uid regularIndex candidate >>= \case
             Just failed -> throwError failed
             Nothing -> do
-                void $ updateState candidatesState $ AddCandidate candidate
+                liftIO $ dbModifyCandidates pool $ \cs ->
+                  cs { candidateList = PackageIndex.insert candidate (candidateList cs) }
                 let group = maintainersGroup (packageName pkgid)
                 liftIO $ Group.addUserToGroup group uid
                 return candidate
@@ -507,7 +488,8 @@ candidatesFeature ServerEnv{serverBlobStore = store}
             then do
               -- delete when requested: "moving" the resource
               -- should this be required? (see notes in PackageCandidatesResource)
-              when doDelete $ updateState candidatesState $ DeleteCandidate (packageId candidate)
+              when doDelete $ liftIO $ dbModifyCandidates pool $ \cs ->
+                cs { candidateList = PackageIndex.deletePackageId (packageId candidate) (candidateList cs) }
               return uresult
             else errForbidden "Upload failed" [MText "Package already exists."]
 
@@ -586,7 +568,7 @@ candidatesFeature ServerEnv{serverBlobStore = store}
     lookupCandidateName :: PackageName -> ServerPartE [CandPkgInfo]
     lookupCandidateName pkgname = do
       guardValidPackageName core pkgname
-      state <- queryState candidatesState GetCandidatePackages
+      state <- liftIO (dbGetCandidatePackages pool)
       return $ PackageIndex.lookupPackageName (candidateList state) pkgname
 
     -- TODO: Unlike the corresponding function in core, we don't return the
@@ -595,7 +577,7 @@ candidatesFeature ServerEnv{serverBlobStore = store}
     lookupCandidateId :: PackageId -> ServerPartE CandPkgInfo
     lookupCandidateId pkgid = do
       guard (pkgVersion pkgid /= nullVersion)
-      state <- queryState candidatesState GetCandidatePackages
+      state <- liftIO (dbGetCandidatePackages pool)
       case PackageIndex.lookupPackageId (candidateList state) pkgid of
         Just pkg -> return pkg
         _ -> errNotFound "Candidate not found" [MText $ "No such candidate version for " ++ display (packageName pkgid)]

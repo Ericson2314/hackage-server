@@ -7,19 +7,30 @@
 {-# LANGUAGE StandaloneDeriving #-}
 {-# LANGUAGE TypeFamilies #-}
 
--- | Beam tables and PostgreSQL load\/save for PackageCandidates.
--- Separated from the feature module so that modules like
--- @Security.Migration@ can import it without creating circular
--- dependencies.
+-- | Beam tables and direct PostgreSQL operations for package candidates.
+-- Separated from the feature module to avoid circular imports with
+-- Security.Migration.
 module Distribution.Server.Features.PackageCandidates.Db (
-    -- * Load\/Save
+    -- * Direct DB operations
+    dbGetCandidatePackages,
+    dbPutCandidatePackages,
+    dbModifyCandidates,
+    dbModifyCandidates',
+
+    -- * Lower-level (used by feature module)
     loadCandidatePackages,
     saveCandidatePackages,
+
+    -- * Beam tables (re-exported for schema)
+    CandCabalRevisionT(..),
+    CandTarballT(..),
+    CandMetaT(..),
   ) where
 
 import Distribution.Server.Features.PackageCandidates.State
 import Distribution.Server.Features.PackageCandidates.Types
 import Distribution.Server.Packages.Types
+import Distribution.Server.Framework (PgConnection, runPgTx, runBeamPg)
 import Distribution.Server.Framework.PgTx (PgTx, beamTx)
 import Distribution.Server.Framework.BlobStorage (BlobId, blobMd5, readBlobId)
 import Distribution.Server.Features.Security.SHA256 (SHA256Digest)
@@ -294,3 +305,29 @@ saveCandidatePackages (CandidatePackages candIdx migrated) =
               , _cmMigratedPkgTarball = migrated
               }
           ]
+
+------------------------------------------------------------------------
+-- Direct database operations
+--
+
+-- | Get candidate packages from PostgreSQL
+dbGetCandidatePackages :: PgConnection -> IO CandidatePackages
+dbGetCandidatePackages pool = runPgTx pool loadCandidatePackages
+
+-- | Write full candidate packages to PostgreSQL
+dbPutCandidatePackages :: PgConnection -> CandidatePackages -> IO ()
+dbPutCandidatePackages pool st = runPgTx pool (saveCandidatePackages st)
+
+-- | Read-modify-write helper
+dbModifyCandidates :: PgConnection -> (CandidatePackages -> CandidatePackages) -> IO ()
+dbModifyCandidates pool f = do
+  st <- dbGetCandidatePackages pool
+  dbPutCandidatePackages pool (f st)
+
+-- | Read-modify-write helper that returns a value
+dbModifyCandidates' :: PgConnection -> (CandidatePackages -> (a, CandidatePackages)) -> IO a
+dbModifyCandidates' pool f = do
+  st <- dbGetCandidatePackages pool
+  let (result, st') = f st
+  dbPutCandidatePackages pool st'
+  return result
