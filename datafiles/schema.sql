@@ -516,16 +516,6 @@ CREATE TABLE IF NOT EXISTS tar_index_cache (
 -- to direct state storage, its event tables can be dropped.
 ------------------------------------------------------------------------
 
--- Users events
-CREATE TABLE IF NOT EXISTS users_add_user_enabled (id BIGSERIAL PRIMARY KEY, arg0 TEXT NOT NULL, arg1 TEXT NOT NULL);
-CREATE TABLE IF NOT EXISTS users_add_user_disabled (id BIGSERIAL PRIMARY KEY, arg0 TEXT NOT NULL);
-CREATE TABLE IF NOT EXISTS users_set_user_enabled_status (id BIGSERIAL PRIMARY KEY, arg0 TEXT NOT NULL, arg1 TEXT NOT NULL);
-CREATE TABLE IF NOT EXISTS users_set_user_auth (id BIGSERIAL PRIMARY KEY, arg0 TEXT NOT NULL, arg1 TEXT NOT NULL);
-CREATE TABLE IF NOT EXISTS users_set_user_name (id BIGSERIAL PRIMARY KEY, arg0 TEXT NOT NULL, arg1 TEXT NOT NULL);
-CREATE TABLE IF NOT EXISTS users_delete_user (id BIGSERIAL PRIMARY KEY, arg0 TEXT NOT NULL);
-CREATE TABLE IF NOT EXISTS users_add_auth_token (id BIGSERIAL PRIMARY KEY, arg0 TEXT NOT NULL, arg1 TEXT NOT NULL, arg2 TEXT NOT NULL);
-CREATE TABLE IF NOT EXISTS users_revoke_auth_token (id BIGSERIAL PRIMARY KEY, arg0 TEXT NOT NULL, arg1 TEXT NOT NULL);
-
 
 
 

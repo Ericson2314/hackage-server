@@ -7,8 +7,7 @@
 {-# LANGUAGE StandaloneDeriving #-}
 {-# LANGUAGE TypeFamilies #-}
 module Distribution.Server.Features.Users.Acid
-  ( usersStateComponent
-  , acidStore
+  ( acidStore
   ) where
 
 import qualified Distribution.Server.Features.Users.Store as Store
@@ -22,7 +21,6 @@ import Distribution.Server.Users.Types
 
 import Distribution.Simple.Utils (lowercase)
 
-import Control.Concurrent.MVar (swapMVar)
 import Data.Int (Int32)
 import Data.List (foldl', isInfixOf)
 import qualified Data.IntMap as IntMap
@@ -34,12 +32,11 @@ import GHC.Generics (Generic)
 
 acidStore :: PgConnection -> IO Store.Backend
 acidStore serverPgConn = do
-  usersState <- usersStateComponent serverPgConn
   let withUsers :: MonadIO m => (Acid.Users -> a) -> m a
-      withUsers f = f <$> queryState usersState Acid.GetUserDb
+      withUsers f = liftIO $ f <$> dbGetUserDb serverPgConn
   pure Store.Backend {
       Store.backendStore = Store.Store {
-          Store.getUsers = queryState usersState Acid.GetUserDb
+          Store.getUsers = liftIO $ dbGetUserDb serverPgConn
         , Store.lookupUserId = \uid -> withUsers (Acid.lookupUserId uid)
         , Store.lookupUserName = \uname -> withUsers (Acid.lookupUserName uname)
         , Store.lookupUserIds = \uids -> withUsers $ \users ->
@@ -53,20 +50,18 @@ acidStore serverPgConn = do
                   let UserName uname = userName uinfo
                   in any (`isInfixOf` lowercase uname) lowerTerms
             in withUsers (filter matches . Acid.enumerateAllUsers)
-        , Store.addUser = \uname auth -> updateState usersState (Acid.AddUserEnabled uname auth)
-        , Store.addDisabledUser = \uname -> updateState usersState (Acid.AddUserDisabled uname)
-        , Store.setUserEnabledStatus = \uid enabled -> updateState usersState (Acid.SetUserEnabledStatus uid enabled)
-        , Store.deleteUser = \uid -> updateState usersState (Acid.DeleteUser uid)
-        , Store.setUserAuth = \uid auth -> updateState usersState (Acid.SetUserAuth uid auth)
-        , Store.addAuthToken = \uid token description -> updateState usersState (Acid.AddAuthToken uid token description)
-        , Store.revokeAuthToken = \uid token -> updateState usersState (Acid.RevokeAuthToken uid token)
+        , Store.addUser = \uname auth -> liftIO $ dbModifyUsers serverPgConn (Acid.addUserEnabled uname auth)
+        , Store.addDisabledUser = \uname -> liftIO $ dbModifyUsers serverPgConn (Acid.addUserDisabled uname)
+        , Store.setUserEnabledStatus = \uid enabled -> liftIO $ dbModifyUsers_ serverPgConn (Acid.setUserEnabledStatus uid enabled)
+        , Store.deleteUser = \uid -> liftIO $ dbModifyUsers_ serverPgConn (Acid.deleteUser uid)
+        , Store.setUserAuth = \uid auth -> liftIO $ dbModifyUsers_ serverPgConn (Acid.setUserAuth uid auth)
+        , Store.addAuthToken = \uid token description -> liftIO $ dbModifyUsers_ serverPgConn (Acid.addAuthToken uid token description)
+        , Store.revokeAuthToken = \uid token -> liftIO $ dbModifyUsers_ serverPgConn (Acid.revokeAuthToken uid token)
         , Store.getAdminList = liftIO $ dbGetAdminList serverPgConn
         , Store.addAdmin = liftIO . dbAddHackageAdmin serverPgConn
         , Store.removeAdmin = liftIO . dbRemoveHackageAdmin serverPgConn
         }
-    , Store.backendState = [ abstractAcidStateComponent usersState
-                             -- HackageAdmins lives directly in PostgreSQL, no AcidState
-                           ]
+    , Store.backendState = []  -- no AcidState; data lives in PostgreSQL
     }
 
 ------------------------------------------------------------------------
@@ -230,20 +225,6 @@ chunksOf n xs = let (h, t) = splitAt n xs in h : chunksOf n t
 
 ------------------------------------------------------------------------
 
-usersStateComponent :: PgConnection -> IO (StateComponent AcidState Acid.Users)
-usersStateComponent serverPgConn = do
-  st <- runPgTx serverPgConn loadUsers
-
-  pgSt <- mkAcidState serverPgConn st saveUsers
-  return StateComponent {
-      stateDesc    = "List of users"
-    , stateHandle  = pgSt
-    , getState     = queryPg pgSt (runQueryEvent Acid.GetUserDb)
-    , putState     = \s -> do
-        runPgTx serverPgConn (saveUsers s)
-        _ <- swapMVar (pgMVar pgSt) s
-        return ()
-    }
 
 
 -- | Get admin user IDs directly from PostgreSQL
@@ -264,3 +245,28 @@ dbRemoveHackageAdmin pool (UserId uid) =
   runBeamPg pool $ runDelete $ delete adminsTable
     (\r -> _adUserId r ==. val_ (fromIntegral uid))
 
+-- | Get user database from PostgreSQL
+dbGetUserDb :: PgConnection -> IO Acid.Users
+dbGetUserDb pool = runPgTx pool loadUsers
+
+-- | Write full user database to PostgreSQL
+dbPutUserDb :: PgConnection -> Acid.Users -> IO ()
+dbPutUserDb pool st = runPgTx pool (saveUsers st)
+
+-- | Read-modify-write helper that returns a value
+dbModifyUsers :: PgConnection -> (Acid.Users -> Either err (Acid.Users, a)) -> IO (Either err a)
+dbModifyUsers pool f = do
+  users <- dbGetUserDb pool
+  case f users of
+    Left err         -> return (Left err)
+    Right (users',a) -> do dbPutUserDb pool users'
+                           return (Right a)
+
+-- | Read-modify-write helper for simpler updates
+dbModifyUsers_ :: PgConnection -> (Acid.Users -> Either err Acid.Users) -> IO (Maybe err)
+dbModifyUsers_ pool f = do
+  users <- dbGetUserDb pool
+  case f users of
+    Left err     -> return (Just err)
+    Right users' -> do dbPutUserDb pool users'
+                       return Nothing
