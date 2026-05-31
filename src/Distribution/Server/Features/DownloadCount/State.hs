@@ -1,6 +1,13 @@
-{-# LANGUAGE OverloadedStrings, DeriveAnyClass, DeriveGeneric, DerivingStrategies, TemplateHaskell, StandaloneDeriving, GeneralizedNewtypeDeriving,
-             DeriveDataTypeable, TypeFamilies, FlexibleInstances,
-             MultiParamTypeClasses, BangPatterns #-}
+{-# LANGUAGE BangPatterns #-}
+{-# LANGUAGE DeriveAnyClass #-}
+{-# LANGUAGE DeriveGeneric #-}
+{-# LANGUAGE DerivingStrategies #-}
+{-# LANGUAGE FlexibleInstances #-}
+{-# LANGUAGE GeneralizedNewtypeDeriving #-}
+{-# LANGUAGE MultiParamTypeClasses #-}
+{-# LANGUAGE StandaloneDeriving #-}
+{-# LANGUAGE TemplateHaskell #-}
+{-# LANGUAGE TypeFamilies #-}
 module Distribution.Server.Features.DownloadCount.State where
 
 import Data.Time.Calendar (Day(..))
@@ -9,8 +16,6 @@ import Control.Arrow (first)
 import Control.Monad (liftM)
 import Data.List (foldl', groupBy)
 import Data.Function (on)
-import Control.Monad.Reader (ask, asks)
-import Control.Monad.State (get, put)
 import qualified Data.Map.Lazy as Map
 import System.FilePath ((</>))
 import System.Directory (
@@ -23,8 +28,6 @@ import System.IO.Unsafe (unsafeInterleaveIO)
 import Text.CSV (printCSV)
 import Control.Exception (evaluate)
 
-import Distribution.Server.Framework.EventSourcing (Query, Update, makeAcidic)
-import Distribution.Server.Framework.BeamInstances ()
 import Data.SafeCopy (base, deriveSafeCopy, safeGet, safePut)
 import Data.Serialize.Get (runGetLazy)
 import Data.Serialize.Put (runPutLazy)
@@ -244,25 +247,9 @@ reconstructLog stateDir onDisk =
   writeFile (stateDir </> "log") $ printCSV (cmToCSV onDisk)
 
 {------------------------------------------------------------------------------
-  ACID stuff
+  Pure operations (used by direct DB layer)
 ------------------------------------------------------------------------------}
 
-getInMemStats :: Query InMemStats InMemStats
-getInMemStats = ask
-
-replaceInMemStats :: InMemStats -> Update InMemStats ()
-replaceInMemStats = put
-
-recordedToday :: Query InMemStats Day
-recordedToday = asks inMemToday
-
-registerDownload :: PackageId -> Update InMemStats ()
-registerDownload pkgId = do
-  InMemStats day counts <- get
-  put $ InMemStats day (cmInsert pkgId 1 counts)
-
-makeAcidic ''InMemStats [ 'getInMemStats
-                        , 'replaceInMemStats
-                        , 'recordedToday
-                        , 'registerDownload
-                        ]
+registerDownloadPure :: PackageId -> InMemStats -> InMemStats
+registerDownloadPure pkgId (InMemStats day counts) =
+  InMemStats day (cmInsert pkgId 1 counts)

@@ -495,8 +495,6 @@ CREATE TABLE IF NOT EXISTS distros__remove_distro_maintainer (id BIGSERIAL PRIMA
 CREATE TABLE IF NOT EXISTS distros__put_distro_package_list (id BIGSERIAL PRIMARY KEY, arg0 TEXT NOT NULL, arg1 TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS distros__drop_package (id BIGSERIAL PRIMARY KEY, arg0 TEXT NOT NULL, arg1 TEXT NOT NULL);
 
--- DownloadCount events
-CREATE TABLE IF NOT EXISTS in_mem_stats__register_download (id BIGSERIAL PRIMARY KEY, arg0 TEXT NOT NULL);
 
 -- BuildReports events
 CREATE TABLE IF NOT EXISTS build_reports__add_report (id BIGSERIAL PRIMARY KEY, arg0 TEXT NOT NULL, arg1 TEXT NOT NULL);

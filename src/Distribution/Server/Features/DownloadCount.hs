@@ -36,6 +36,7 @@ module Distribution.Server.Features.DownloadCount (
   ) where
 
 import Distribution.Server.Framework
+import Distribution.Server.Framework.PgTx (beamTx)
 import Distribution.Server.Framework.BackupRestore
 
 import Distribution.Server.Features.DownloadCount.State
@@ -60,9 +61,8 @@ import Data.Function (on)
 import qualified Data.Text as T
 
 import Database.Beam
+import Database.Beam.Backend.SQL.BeamExtensions (insertOnConflict, conflictingFields, onConflictUpdateSet)
 import Database.Beam.Postgres
-import qualified Database.PostgreSQL.Simple as PG
-import Control.Concurrent.MVar (swapMVar)
 
 data DownloadFeature = DownloadFeature {
     downloadFeatureInterface :: HackageFeature
@@ -89,7 +89,16 @@ data PackageDownloads = PackageDownloads {
 initDownloadFeature :: ServerEnv
                     -> IO (CoreFeature -> UserFeature -> IO DownloadFeature)
 initDownloadFeature serverEnv@ServerEnv{serverStateDir, serverPgConn} = do
-    inMemState     <- inMemStateComponent  serverPgConn
+    -- Seed meta if empty
+    metaRows <- runBeamPg serverPgConn $
+      runSelectReturningList $ select $ all_ dlMetaTable
+    case metaRows of
+      [] -> do
+        initSt <- initInMemStats <$> getToday
+        runBeamPg serverPgConn $
+          runInsert $ insert dlMetaTable $ insertValues [DlMetaRow (inMemToday initSt)]
+      _ -> return ()
+
     let onDiskState = onDiskStateComponent serverStateDir
     (recentDownloads,
      totalDownloads) <- computeRecentAndTotalDownloads =<< getState onDiskState
@@ -98,7 +107,7 @@ initDownloadFeature serverEnv@ServerEnv{serverStateDir, serverPgConn} = do
     downChan       <- newChan
 
     return $ \core users -> do
-      let feature = downloadFeature core users serverEnv inMemState
+      let feature = downloadFeature core users serverEnv serverPgConn
                       onDiskState totalsCache recentCache downChan
 
       registerHook (packageDownloadHook core) (writeChan downChan)
@@ -159,8 +168,13 @@ dlCountsTable = _dlCounts dlDb
 dlMetaTable :: DatabaseEntity Postgres DlDb (TableEntity DlMetaT)
 dlMetaTable = _dlMeta dlDb
 
-loadInMemStats :: PgTx InMemStats
-loadInMemStats = do
+------------------------------------------------------------------------
+-- Direct database operations (no MVar, no event sourcing)
+--
+
+-- | Get the current in-mem stats from PostgreSQL
+dbGetInMemStats :: PgConnection -> IO InMemStats
+dbGetInMemStats pool = runPgTx pool $ do
   metaRows <- beamTx $
     runSelectReturningList $ select $ all_ dlMetaTable
   countRows <- beamTx $
@@ -177,9 +191,10 @@ loadInMemStats = do
                        cmEmpty countRows
   return $ InMemStats today counts
 
-saveInMemStats :: InMemStats -> PgTx ()
-saveInMemStats (InMemStats today counts) =
-  do
+-- | Write the full in-mem stats to PostgreSQL
+dbPutInMemStats :: PgConnection -> InMemStats -> IO ()
+dbPutInMemStats pool (InMemStats today counts) =
+  runPgTx pool $ do
     beamTx $ do
       runDelete $ delete dlCountsTable (\_ -> val_ True)
       runDelete $ delete dlMetaTable (\_ -> val_ True)
@@ -193,39 +208,31 @@ saveInMemStats (InMemStats today counts) =
     beamTx $
       runInsert $ insert dlMetaTable $ insertValues [DlMetaRow today]
 
+-- | Get which day is currently recorded
+dbRecordedToday :: PgConnection -> IO Day
+dbRecordedToday pool = do
+  metaRows <- runBeamPg pool $
+    runSelectReturningList $ select $ all_ dlMetaTable
+  return $ case metaRows of
+    (DlMetaRow d : _) -> d
+    [] -> error "download_count__meta table empty"
+
+-- | Register a download with a single INSERT ... ON CONFLICT DO UPDATE
+dbRegisterDownload :: PgConnection -> PackageId -> IO ()
+dbRegisterDownload pool pkgId =
+  runBeamPg pool $
+    runInsert $ insertOnConflict dlCountsTable
+      (insertValues [DlCountRow
+        (T.pack $ display (Distribution.Package.packageName pkgId))
+        (T.pack $ display (packageVersion pkgId))
+        1])
+      (conflictingFields primaryKey)
+      (onConflictUpdateSet (\fields oldValues ->
+        _dcCount fields <-. _dcCount oldValues + val_ 1))
+
 dlChunksOf :: Int -> [a] -> [[a]]
 dlChunksOf _ [] = []
 dlChunksOf n xs = let (h, t) = splitAt n xs in h : dlChunksOf n t
-
-------------------------------------------------------------------------
-
-inMemStateComponent :: PgConnection -> IO (StateComponent AcidState InMemStats)
-inMemStateComponent serverPgConn = do
-  -- Seed meta if empty
-  metaRows <- runBeamPg serverPgConn $
-    runSelectReturningList $ select $ all_ dlMetaTable
-  initSt <- initInMemStats <$> getToday
-  case metaRows of
-    [] -> runBeamPg serverPgConn $
-      runInsert $ insert dlMetaTable $ insertValues [DlMetaRow (inMemToday initSt)]
-    _ -> return ()
-
-  -- Load state
-  st <- runPgTx serverPgConn loadInMemStats
-
-  pgSt <- mkAcidState serverPgConn st saveInMemStats
-  return StateComponent {
-      stateDesc    = "Today's download counts"
-    , stateHandle  = pgSt
-    , getState     = queryPg pgSt (runQueryEvent GetInMemStats)
-    , putState     = \s -> do
-        runPgTx serverPgConn (saveInMemStats s)
-        _ <- swapMVar (pgMVar pgSt) s
-        return ()
-    , backupState  = \_ -> inMemBackup
-    , restoreState = inMemRestore
-    , resetState   = \_ -> inMemStateComponent serverPgConn
-    }
 
 onDiskStateComponent :: FilePath -> StateComponent OnDiskState OnDiskStats
 onDiskStateComponent stateDir = StateComponent {
@@ -245,7 +252,7 @@ onDiskStateComponent stateDir = StateComponent {
 downloadFeature :: CoreFeature
                 -> UserFeature
                 -> ServerEnv
-                -> StateComponent AcidState   InMemStats
+                -> PgConnection
                 -> StateComponent OnDiskState OnDiskStats
                 -> MemState TotalDownloads
                 -> MemState RecentDownloads
@@ -255,7 +262,7 @@ downloadFeature :: CoreFeature
 downloadFeature CoreFeature{}
                 UserFeature{..}
                 ServerEnv{serverStateDir}
-                inMemState
+                pool
                 onDiskState
                 totalDownloadsCache
                 recentDownloadsCache
@@ -267,9 +274,8 @@ downloadFeature CoreFeature{}
                            , downloadCSV
                            ]
       , featurePostInit  = void $ forkIO registerDownloads
-      , featureState     = [ abstractAcidStateComponent   inMemState
-                           , abstractOnDiskStateComponent onDiskState
-                           ]
+      , featureState     = [ abstractOnDiskStateComponent onDiskState
+                           ]  -- InMemStats lives in PostgreSQL, no AcidState
       , featureCaches    = [
             CacheComponent {
               cacheDesc       = "recent package downloads cache",
@@ -291,15 +297,13 @@ downloadFeature CoreFeature{}
     registerDownloads = forever $ do
         pkg    <- readChan downloadStream
         today  <- getToday
-        today' <- queryPg (stateHandle inMemState) (runQueryEvent RecordedToday)
+        today' <- dbRecordedToday pool
 
         --TODO: do this asyncronously rather than blocking this request
         when (today /= today') $ do
           -- For the first download each day we reset the in-memory stats and..
-          inMemStats <- getState inMemState
-          putState inMemState $ initInMemStats today
-          -- we can discard the large eventlog by writing a small checkpoint
-          createCheckpoint (stateHandle inMemState)
+          inMemStats <- dbGetInMemStats pool
+          dbPutInMemStats pool $ initInMemStats today
 
           -- Write yesterday's downloads to the log
           appendToLog (dcPath serverStateDir) inMemStats
@@ -315,7 +319,7 @@ downloadFeature CoreFeature{}
           writeMemState totalDownloadsCache totalDownloads
 
 
-        updateState inMemState $ RegisterDownload pkg
+        dbRegisterDownload pool pkg
 
 
     downloadResource = DownloadResource {
