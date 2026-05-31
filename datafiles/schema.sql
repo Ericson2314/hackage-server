@@ -572,8 +572,6 @@ CREATE TABLE IF NOT EXISTS signup_reset_table_add_signup_reset_info (id BIGSERIA
 CREATE TABLE IF NOT EXISTS signup_reset_table_delete_signup_reset_info (id BIGSERIAL PRIMARY KEY, arg0 TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS signup_reset_table_delete_all_expired (id BIGSERIAL PRIMARY KEY, arg0 TEXT NOT NULL);
 
--- AdminLog events
-CREATE TABLE IF NOT EXISTS admin_log_add_admin_log (id BIGSERIAL PRIMARY KEY, arg0 TEXT NOT NULL);
 
 -- Vouch events
 CREATE TABLE IF NOT EXISTS vouch_data_put_vouch (id BIGSERIAL PRIMARY KEY, arg0 TEXT NOT NULL, arg1 TEXT NOT NULL);

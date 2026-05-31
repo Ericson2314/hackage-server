@@ -22,19 +22,17 @@ import GHC.Generics (Generic)
 import Data.Int (Int32)
 import Database.Beam
 import Database.Beam.Postgres
-import Control.Concurrent.MVar (swapMVar)
 import qualified Data.Text as T
 import qualified Data.ByteString.Lazy.Char8 as BS
 
 acidStore :: PgConnection -> IO Backend
-acidStore serverPgConn = do
-  adminLogState <- adminLogStateComponent serverPgConn
+acidStore pool =
   pure Backend {
       backendStore = Store {
-          getAdminLog = State.adminLog <$> queryState adminLogState State.GetAdminLog
-        , addAdminLog = \entry -> updateState adminLogState (State.AddAdminLog entry)
+          getAdminLog = liftIO $ State.adminLog <$> dbGetAdminLog pool
+        , addAdminLog = \(ts, uid, action, reason) -> liftIO $ dbAddAdminLogEntry pool ts uid action reason
         }
-    , backendState = [abstractAcidStateComponent adminLogState]
+    , backendState = []  -- no AcidState; data lives in PostgreSQL
     }
 
 ------------------------------------------------------------------------
@@ -138,19 +136,22 @@ chunksOf _ [] = []
 chunksOf n xs = let (h, t) = splitAt n xs in h : chunksOf n t
 
 ------------------------------------------------------------------------
+-- Direct database operations (no MVar, no event sourcing)
+--
 
-adminLogStateComponent :: PgConnection -> IO (StateComponent AcidState State.AdminLog)
-adminLogStateComponent serverPgConn = do
-  st <- runPgTx serverPgConn loadAdminLog
+-- | Get the full admin log
+dbGetAdminLog :: PgConnection -> IO State.AdminLog
+dbGetAdminLog pool = runPgTx pool loadAdminLog
 
-  pgSt <- mkAcidState serverPgConn st saveAdminLog
-  return StateComponent {
-      stateDesc    = "AdminLog"
-    , stateHandle  = pgSt
-    , getState     = queryPg pgSt (runQueryEvent State.GetAdminLog)
-    , putState     = \s -> do
-        runPgTx serverPgConn (saveAdminLog s)
-        _ <- swapMVar (pgMVar pgSt) s
-        return ()
-    }
+-- | Add a single admin log entry
+dbAddAdminLogEntry :: PgConnection -> UTCTime -> UserId -> AdminAction -> BS.ByteString -> IO ()
+dbAddAdminLogEntry pool ts (UserId uid) action _reason = do
+  let (at, tu, gt, gd) = actionToFields action
+  runBeamPg pool $
+    runInsert $ insert adminLogEntriesTable $ insertExpressions
+      [AdminLogEntryRow default_ (val_ ts) (val_ (fromIntegral uid))
+                        (val_ at) (val_ tu) (val_ gt) (val_ gd)]
 
+-- | Write full state to DB (for backup restore)
+dbPutAdminLog :: PgConnection -> State.AdminLog -> IO ()
+dbPutAdminLog pool = runPgTx pool . saveAdminLog
