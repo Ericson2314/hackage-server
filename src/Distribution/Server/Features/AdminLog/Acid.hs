@@ -1,18 +1,14 @@
-{-# LANGUAGE OverloadedStrings, MultiParamTypeClasses, FlexibleInstances, DeriveAnyClass, DeriveGeneric, DerivingStrategies, DeriveDataTypeable, TypeFamilies, TemplateHaskell, BangPatterns,
-             GeneralizedNewtypeDeriving, NamedFieldPuns, RecordWildCards,
-             PatternGuards, RankNTypes #-}
+{-# LANGUAGE DerivingStrategies #-}
+{-# LANGUAGE GeneralizedNewtypeDeriving #-}
+{-# LANGUAGE TemplateHaskell #-}
 
 module Distribution.Server.Features.AdminLog.Acid where
 
 import Distribution.Server.Features.AdminLog.Types
 import Distribution.Server.Users.Types (UserId)
-import Distribution.Server.Framework
-import Distribution.Server.Framework.EventSourcing (Query, Update, makeAcidic)
-import Distribution.Server.Framework.BeamInstances ()
+import Distribution.Server.Framework.MemSize
 import Data.SafeCopy (base, deriveSafeCopy)
 
-import Control.Monad.Reader
-import qualified Control.Monad.State as State
 import Data.Time (UTCTime)
 import qualified Data.ByteString.Lazy.Char8 as BS
 
@@ -26,18 +22,7 @@ deriveSafeCopy 0 'base ''AdminLog
 initialAdminLog :: AdminLog
 initialAdminLog = AdminLog []
 
-getAdminLog :: Query AdminLog AdminLog
-getAdminLog = ask
-
-addAdminLog :: (UTCTime, UserId, AdminAction, BS.ByteString) -> Update AdminLog ()
-addAdminLog x = State.modify (\(AdminLog xs) -> AdminLog (x : xs))
-
 instance Eq AdminLog where
     (AdminLog (x:_)) == (AdminLog (y:_)) = x == y
     (AdminLog []) == (AdminLog []) = True
     _ == _ = False
-
-replaceAdminLog :: AdminLog -> Update AdminLog ()
-replaceAdminLog = State.put
-
-$(makeAcidic ''AdminLog ['getAdminLog, 'replaceAdminLog, 'addAdminLog])

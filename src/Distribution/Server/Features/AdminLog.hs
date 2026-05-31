@@ -12,12 +12,11 @@
 module Distribution.Server.Features.AdminLog where
 
 import qualified Distribution.Server.Features.AdminLog.Acid as Acid
-import Distribution.Server.Features.AdminLog.Backup
 import Distribution.Server.Features.AdminLog.Types
 import Distribution.Server.Users.Types (UserId(..))
+import qualified Distribution.Server.Users.Users as Users
 import Distribution.Server.Users.Group hiding (delete, insert)
 import Distribution.Server.Framework
-import Distribution.Server.Framework.BackupRestore
 
 import Distribution.Server.Pages.AdminLog
 import Distribution.Server.Features.Users
@@ -29,8 +28,6 @@ import GHC.Generics (Generic)
 import Data.Int (Int32)
 import Database.Beam
 import Database.Beam.Postgres
-import Control.Concurrent.MVar (swapMVar)
-import qualified Database.PostgreSQL.Simple as PG
 import qualified Data.Text as T
 import qualified Data.ByteString.Lazy.Char8 as BS
 
@@ -53,22 +50,21 @@ instance IsHackageFeature AdminLogFeature where
 
 initAdminLogFeature :: ServerEnv -> IO (UserFeature -> IO AdminLogFeature)
 initAdminLogFeature ServerEnv{serverPgConn} = do
-  adminLogState <- adminLogStateComponent serverPgConn
-  return $ \users@UserFeature{groupChangedHook} -> do
+  return $ \UserFeature{groupChangedHook, queryGetUserDb} -> do
 
-    let feature = adminLogFeature users adminLogState
+    let feature = adminLogFeature serverPgConn queryGetUserDb
 
     registerHook groupChangedHook $ \(gd,addOrDel,actorUid,targetUid,reason) -> do
         now <- getCurrentTime
-        updateState adminLogState $ Acid.AddAdminLog
-            (now, actorUid, mkAdminAction gd addOrDel targetUid, packUTF8 reason)
+        dbAddAdminLogEntry serverPgConn now actorUid
+            (mkAdminAction gd addOrDel targetUid) (packUTF8 reason)
 
     return feature
 
-adminLogFeature :: UserFeature
-                -> StateComponent AcidState Acid.AdminLog
+adminLogFeature :: PgConnection
+                -> (forall m. MonadIO m => m Users.Users)
                 -> AdminLogFeature
-adminLogFeature UserFeature{..} adminLogState
+adminLogFeature pool queryGetUserDb'
   = AdminLogFeature {..}
 
   where
@@ -76,7 +72,7 @@ adminLogFeature UserFeature{..} adminLogState
       (emptyHackageFeature "admin-actions-log") {
         featureDesc      = "Log of additions and removals of users from groups.",
         featureResources = [adminLogResource],
-        featureState     = [abstractAcidStateComponent adminLogState]
+        featureState     = []  -- no AcidState; data lives in PostgreSQL
       }
 
     adminLogResource :: Resource
@@ -87,11 +83,11 @@ adminLogFeature UserFeature{..} adminLogState
       }
 
     queryGetAdminLog :: MonadIO m => m Acid.AdminLog
-    queryGetAdminLog = queryState adminLogState Acid.GetAdminLog
+    queryGetAdminLog = liftIO $ dbGetAdminLog pool
 
     serveAdminLogGet _ = do
-      aLog  <- queryState adminLogState Acid.GetAdminLog
-      users <- queryGetUserDb
+      aLog  <- liftIO $ dbGetAdminLog pool
+      users <- queryGetUserDb'
       return . toResponse . adminLogPage users . map mkRow . Acid.adminLog $ aLog
 
     mkRow (time, actorId, Admin_GroupDelUser targetId group, reason) =
@@ -178,9 +174,14 @@ fieldsToAction actionType mTargetUid groupType groupData =
                    _     -> Admin_GroupDelUser
   in mkAction targetUid gd
 
-loadAdminLog :: PgTx Acid.AdminLog
-loadAdminLog = do
-  rows <- beamTx $
+------------------------------------------------------------------------
+-- Direct database operations (no MVar, no event sourcing)
+--
+
+-- | Get the full admin log
+dbGetAdminLog :: PgConnection -> IO Acid.AdminLog
+dbGetAdminLog pool = do
+  rows <- runBeamPg pool $
     runSelectReturningList $ select $
       orderBy_ (\r -> desc_ (_aleId r)) $
         all_ adminLogEntriesTable
@@ -188,40 +189,30 @@ loadAdminLog = do
                 | AdminLogEntryRow _id ts uid at mtu gt gd <- rows ]
   return $ Acid.AdminLog entries
 
-saveAdminLog :: Acid.AdminLog -> PgTx ()
-saveAdminLog (Acid.AdminLog entries) = do
+-- | Add a single admin log entry
+dbAddAdminLogEntry :: PgConnection -> UTCTime -> UserId -> AdminAction -> BS.ByteString -> IO ()
+dbAddAdminLogEntry pool ts (UserId uid) action _reason = do
+  let (at, mtu, gt, gd) = actionToFields action
+  runBeamPg pool $
+    runInsert $ insert adminLogEntriesTable $ insertExpressions
+      [AdminLogEntryRow default_ (val_ ts) (val_ (fromIntegral uid))
+                        (val_ at) (val_ mtu) (val_ gt) (val_ gd)]
+
+-- | Write full state to DB (for backup restore)
+dbPutAdminLog :: PgConnection -> Acid.AdminLog -> IO ()
+dbPutAdminLog pool (Acid.AdminLog entries) =
+  runPgTx pool $ do
     beamTx $ runDelete $ delete adminLogEntriesTable (\_ -> val_ True)
     let rows = zipWith mkRow [(1::Int32)..] (reverse entries)
     mapM_ (\chunk -> beamTx $
       runInsert $ insert adminLogEntriesTable $ insertValues chunk) (chunksOf 1000 rows)
   where
     mkRow :: Int32 -> (UTCTime, UserId, AdminAction, BS.ByteString) -> AdminLogEntryT Identity
-    mkRow idx (ts, UserId uid, action, _reason) =
+    mkRow idx (ts', UserId uid, action, _reason) =
       let (at, mtu, gt, gd) = actionToFields action
-      in AdminLogEntryRow idx ts (fromIntegral uid) at mtu gt gd
+      in AdminLogEntryRow idx ts' (fromIntegral uid) at mtu gt gd
 
 chunksOf :: Int -> [a] -> [[a]]
 chunksOf _ [] = []
 chunksOf n xs = let (h, t) = splitAt n xs in h : chunksOf n t
-
-------------------------------------------------------------------------
-
-adminLogStateComponent :: PgConnection -> IO (StateComponent AcidState Acid.AdminLog)
-adminLogStateComponent serverPgConn = do
-  st <- runPgTx serverPgConn loadAdminLog
-
-  pgSt <- mkAcidState serverPgConn st saveAdminLog
-  return StateComponent {
-      stateDesc    = "AdminLog"
-    , stateHandle  = pgSt
-    , getState     = queryPg pgSt (runQueryEvent Acid.GetAdminLog)
-    , putState     = \s -> do
-        runPgTx serverPgConn (saveAdminLog s)
-        _ <- swapMVar (pgMVar pgSt) s
-        return ()
-    , backupState  = \_ (Acid.AdminLog xs) ->
-                      [BackupByteString ["adminLog.txt"] . backupLogEntries $ xs]
-    , restoreState = restoreAdminLogBackup
-    , resetState   = \_ -> adminLogStateComponent serverPgConn
-    }
 
