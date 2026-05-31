@@ -13,13 +13,7 @@ import Distribution.Server.Prelude
 
 import Distribution.Server.Framework
 import Distribution.Server.Features.Mirror.Store
-import Distribution.Server.Users.State
-  ( MirrorClients(..)
-  , GetMirrorClients(..)
-  , GetMirrorClientsList(..)
-  , AddMirrorClient(..)
-  , RemoveMirrorClient(..)
-  )
+import Distribution.Server.Users.State (MirrorClients(..))
 import Distribution.Server.Users.Types (UserId(..))
 import qualified Distribution.Server.Users.Group as Group
 
@@ -27,18 +21,16 @@ import GHC.Generics (Generic)
 import Data.Int (Int32)
 import Database.Beam
 import Database.Beam.Postgres
-import Control.Concurrent.MVar (swapMVar)
 
 acidStore :: PgConnection -> IO Backend
-acidStore conn = do
-  mirrorersState <- mirrorersStateComponent conn
+acidStore pool =
   pure Backend {
       backendStore = Store {
-          getMirrorClientsList = queryState mirrorersState GetMirrorClientsList
-        , addMirrorClient      = \uid -> updateState mirrorersState (AddMirrorClient uid)
-        , removeMirrorClient   = \uid -> updateState mirrorersState (RemoveMirrorClient uid)
+          getMirrorClientsList = liftIO $ dbGetMirrorClients pool
+        , addMirrorClient      = liftIO . dbAddMirrorClient pool
+        , removeMirrorClient   = liftIO . dbRemoveMirrorClient pool
         }
-    , backendState = [abstractAcidStateComponent mirrorersState]
+    , backendState = []  -- no AcidState; data lives in PostgreSQL
     }
 
 ------------------------------------------------------------------------
@@ -92,18 +84,24 @@ chunksOf n xs = let (h, t) = splitAt n xs in h : chunksOf n t
 
 ------------------------------------------------------------------------
 
-mirrorersStateComponent :: PgConnection -> IO (StateComponent AcidState MirrorClients)
-mirrorersStateComponent serverPgConn = do
-  -- Load state
-  st <- runPgTx serverPgConn loadMirrorClients
+-- | Query current mirror clients from the database
+dbGetMirrorClients :: PgConnection -> IO Group.UserIdSet
+dbGetMirrorClients pool = do
+  rows <- runBeamPg pool $
+    runSelectReturningList $ select $ all_ mirrorClientsTable
+  return $ Group.fromList [ UserId (fromIntegral uid) | MirrorClientRow uid <- rows ]
 
-  pgSt <- mkAcidState serverPgConn st saveMirrorClients
-  return StateComponent {
-      stateDesc    = "Mirror clients"
-    , stateHandle  = pgSt
-    , getState     = queryPg pgSt (runQueryEvent GetMirrorClients)
-    , putState     = \s -> do
-        runPgTx serverPgConn (saveMirrorClients s)
-        _ <- swapMVar (pgMVar pgSt) s
-        return ()
-    }
+-- | Add a mirror client
+dbAddMirrorClient :: PgConnection -> UserId -> IO ()
+dbAddMirrorClient pool (UserId uid) =
+  runBeamPg pool $
+    runInsert $ insert mirrorClientsTable $ insertValues
+      [MirrorClientRow (fromIntegral uid)]
+
+-- | Remove a mirror client
+dbRemoveMirrorClient :: PgConnection -> UserId -> IO ()
+dbRemoveMirrorClient pool (UserId uid) =
+  runBeamPg pool $
+    runDelete $ delete mirrorClientsTable
+      (\r -> _mcUserId r ==. val_ (fromIntegral uid))
+

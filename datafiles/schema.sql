@@ -527,8 +527,6 @@ CREATE TABLE IF NOT EXISTS users_add_auth_token (id BIGSERIAL PRIMARY KEY, arg0 
 CREATE TABLE IF NOT EXISTS users_revoke_auth_token (id BIGSERIAL PRIMARY KEY, arg0 TEXT NOT NULL, arg1 TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS hackage_admins_add_hackage_admin (id BIGSERIAL PRIMARY KEY, arg0 TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS hackage_admins_remove_hackage_admin (id BIGSERIAL PRIMARY KEY, arg0 TEXT NOT NULL);
-CREATE TABLE IF NOT EXISTS mirror_clients_add_mirror_client (id BIGSERIAL PRIMARY KEY, arg0 TEXT NOT NULL);
-CREATE TABLE IF NOT EXISTS mirror_clients_remove_mirror_client (id BIGSERIAL PRIMARY KEY, arg0 TEXT NOT NULL);
 
 -- Upload events
 CREATE TABLE IF NOT EXISTS hackage_trustees_add_hackage_trustee (id BIGSERIAL PRIMARY KEY, arg0 TEXT NOT NULL);
