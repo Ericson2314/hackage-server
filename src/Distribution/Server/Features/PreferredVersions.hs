@@ -21,12 +21,12 @@ module Distribution.Server.Features.PreferredVersions (
     classifyVersions,
 
     PreferredRender(..),
-    preferredStateComponent,
 
     maybeBestVersion,
   ) where
 
 import Distribution.Server.Framework
+import Distribution.Server.Framework.PgTx (beamTx)
 
 import Distribution.Server.Features.PreferredVersions.State
 import Distribution.Server.Features.PreferredVersions.Backup
@@ -63,8 +63,6 @@ import qualified Data.Vector                as Vector
 import GHC.Generics (Generic)
 import Database.Beam hiding (array)
 import Database.Beam.Postgres
-import qualified Database.PostgreSQL.Simple as PG
-import Control.Concurrent.MVar (swapMVar)
 
 data VersionsFeature = VersionsFeature {
     versionsFeatureInterface :: HackageFeature,
@@ -121,15 +119,22 @@ initVersionsFeature :: ServerEnv
                         -> UserFeature
                         -> IO VersionsFeature)
 initVersionsFeature env@ServerEnv{serverPgConn} = do
-    preferredState <- preferredStateComponent False serverPgConn
+    -- Seed meta if empty
+    metaRows <- runBeamPg serverPgConn $
+      runSelectReturningList $ select $ all_ prefMetaTable
+    case metaRows of
+      [] -> runBeamPg serverPgConn $
+        runInsert $ insert prefMetaTable $ insertValues [PrefMetaRow False]
+      _ -> return ()
+
     deprecatedHook <- newHook
     updatePreferredHook <- newHook
 
     return $ \core upload tags user -> do
 
-      let feature = versionsFeature env
+      let feature = versionsFeature env serverPgConn
                                     core upload tags user
-                                    preferredState deprecatedHook
+                                    deprecatedHook
                                     updatePreferredHook
       return feature
 
@@ -208,13 +213,18 @@ prefDeprecatedPackagesTable = _prefDeprecatedPackages prefDb
 prefMetaTable :: DatabaseEntity Postgres PrefDb (TableEntity PrefMetaT)
 prefMetaTable = _prefMeta prefDb
 
-loadPreferredVersions :: PgTx PreferredVersions
-loadPreferredVersions = do
-  dvRows <- beamTx $
+------------------------------------------------------------------------
+-- Direct database operations (no MVar, no event sourcing)
+--
+
+-- | Get full preferred versions state
+dbGetPreferredVersions :: PgConnection -> IO PreferredVersions
+dbGetPreferredVersions pool = do
+  dvRows <- runBeamPg pool $
     runSelectReturningList $ select $ all_ prefDeprecatedVersionsTable
-  dpRows <- beamTx $
+  dpRows <- runBeamPg pool $
     runSelectReturningList $ select $ all_ prefDeprecatedPackagesTable
-  metaRows <- beamTx $
+  metaRows <- runBeamPg pool $
     runSelectReturningList $ select $ all_ prefMetaTable
 
   let -- Build preferredMap from deprecated versions
@@ -246,31 +256,74 @@ loadPreferredVersions = do
     , migratedEphemeralPrefs = migrated
     }
 
-savePreferredVersions :: PreferredVersions -> PgTx ()
-savePreferredVersions PreferredVersions{..} =
-  do
+-- | Get preferred info for a single package
+dbGetPreferredInfo :: PgConnection -> PackageName -> IO PreferredInfo
+dbGetPreferredInfo pool pkgname = do
+  pv <- dbGetPreferredVersions pool
+  return $ Map.findWithDefault emptyPreferredInfo pkgname (preferredMap pv)
+
+-- | Get deprecated-for info for a single package
+dbGetDeprecatedFor :: PgConnection -> PackageName -> IO (Maybe [PackageName])
+dbGetDeprecatedFor pool pkgname = do
+  pv <- dbGetPreferredVersions pool
+  return $ Map.lookup pkgname (deprecatedMap pv)
+
+-- | Set preferred info for a package, returns the new info
+dbSetPreferredInfo :: PgConnection -> PackageName -> [VersionRange] -> [Version] -> IO PreferredInfo
+dbSetPreferredInfo pool pkgname ranges versions = do
+  let prefinfo = PreferredInfo { unused_preferredRanges = ranges
+                               , deprecatedVersions = versions
+                               , unused_sumRange = Nothing }
+  -- Delete existing deprecated versions for this package
+  runBeamPg pool $
+    runDelete $ delete prefDeprecatedVersionsTable
+      (\r -> _dvPkgName r ==. val_ (Text.pack $ display pkgname))
+  -- Insert new deprecated versions
+  let dvRows = [ DeprecatedVersionRow (Text.pack $ display pkgname) (Text.pack $ display ver)
+               | ver <- versions ]
+  mapM_ (\r -> runBeamPg pool $ runInsert $ insert prefDeprecatedVersionsTable $ insertValues [r]) dvRows
+  return prefinfo
+
+-- | Set deprecated-for info for a package
+dbSetDeprecatedFor :: PgConnection -> PackageName -> Maybe [PackageName] -> IO ()
+dbSetDeprecatedFor pool pkgname mrepls = do
+  runBeamPg pool $
+    runDelete $ delete prefDeprecatedPackagesTable
+      (\r -> _dpPkgName r ==. val_ (Text.pack $ display pkgname))
+  case mrepls of
+    Nothing -> return ()
+    Just repls -> do
+      let dpRows = [ DeprecatedPackageRow (Text.pack $ display pkgname) (Text.pack $ display repl)
+                   | repl <- repls ]
+      mapM_ (\r -> runBeamPg pool $ runInsert $ insert prefDeprecatedPackagesTable $ insertValues [r]) dpRows
+
+-- | Set the migrated-ephemeral-prefs flag
+dbSetMigratedEphemeralPrefs :: PgConnection -> IO ()
+dbSetMigratedEphemeralPrefs pool =
+  runPgTx pool $ do
+    beamTx $ runDelete $ delete prefMetaTable (\_ -> val_ True)
+    beamTx $ runInsert $ insert prefMetaTable $ insertValues [PrefMetaRow True]
+
+-- | Write full state to DB (for backup restore)
+dbPutPreferredVersions :: PgConnection -> PreferredVersions -> IO ()
+dbPutPreferredVersions pool pv@PreferredVersions{..} =
+  runPgTx pool $ do
     beamTx $ do
       runDelete $ delete prefDeprecatedVersionsTable (\_ -> val_ True)
       runDelete $ delete prefDeprecatedPackagesTable (\_ -> val_ True)
       runDelete $ delete prefMetaTable (\_ -> val_ True)
-
-    -- Save deprecated versions
     let dvRows = [ DeprecatedVersionRow (Text.pack $ display pkgName) (Text.pack $ display ver)
                  | (pkgName, info) <- Map.toList preferredMap
                  , ver <- deprecatedVersions info ]
     mapM_ (\chunk -> beamTx $
       runInsert $ insert prefDeprecatedVersionsTable $ insertValues chunk)
       (prefChunksOf 1000 dvRows)
-
-    -- Save deprecated packages
     let dpRows = [ DeprecatedPackageRow (Text.pack $ display pkgName) (Text.pack $ display repl)
                  | (pkgName, repls) <- Map.toList deprecatedMap
                  , repl <- repls ]
     mapM_ (\chunk -> beamTx $
       runInsert $ insert prefDeprecatedPackagesTable $ insertValues chunk)
       (prefChunksOf 1000 dpRows)
-
-    -- Save meta
     beamTx $
       runInsert $ insert prefMetaTable $ insertValues
         [PrefMetaRow migratedEphemeralPrefs]
@@ -279,50 +332,21 @@ prefChunksOf :: Int -> [a] -> [[a]]
 prefChunksOf _ [] = []
 prefChunksOf n xs = let (h, t) = splitAt n xs in h : prefChunksOf n t
 
-------------------------------------------------------------------------
-
-preferredStateComponent :: Bool -> PgConnection -> IO (StateComponent AcidState PreferredVersions)
-preferredStateComponent freshDB serverPgConn = do
-  -- Seed meta if empty
-  metaRows <- runBeamPg serverPgConn $
-    runSelectReturningList $ select $ all_ prefMetaTable
-  case metaRows of
-    [] -> runBeamPg serverPgConn $
-      runInsert $ insert prefMetaTable $ insertValues [PrefMetaRow freshDB]
-    _ -> return ()
-
-  -- Load state
-  st <- runPgTx serverPgConn loadPreferredVersions
-
-  pgSt <- mkAcidState serverPgConn st savePreferredVersions
-  return StateComponent {
-      stateDesc    = "Preferred package versions"
-    , stateHandle  = pgSt
-    , getState     = queryPg pgSt (runQueryEvent GetPreferredVersions)
-    , putState     = \s -> do
-        runPgTx serverPgConn (savePreferredVersions s)
-        _ <- swapMVar (pgMVar pgSt) s
-        return ()
-    , resetState   = \_ -> preferredStateComponent True serverPgConn
-    , backupState  = \_ -> backupPreferredVersions
-    , restoreState = restorePreferredVersions
-    }
-
 versionsFeature :: ServerEnv
+                -> PgConnection
                 -> CoreFeature
                 -> UploadFeature
                 -> TagsFeature
                 -> UserFeature
-                -> StateComponent AcidState PreferredVersions
                 -> Hook (PackageName, Maybe [PackageName]) ()
                 -> Hook (PackageName, PreferredInfo) ()
                 -> VersionsFeature
 versionsFeature ServerEnv{ serverVerbosity = verbosity }
+                pool
                 CoreFeature{..}
                 UploadFeature{..}
                 TagsFeature{..}
                 UserFeature{ guardAuthorised_ }
-                preferredState
                 deprecatedHook
                 updatePreferredHook
   = VersionsFeature{..}
@@ -338,20 +362,20 @@ versionsFeature ServerEnv{ serverVerbosity = verbosity }
             ]
       , featurePostInit = do updateDeprecatedTags
                              ephemeralPrefsMigration
-      , featureState    = [abstractAcidStateComponent preferredState]
+      , featureState    = []  -- no AcidState; data lives in PostgreSQL
       }
 
     queryGetPreferredInfo :: MonadIO m => PackageName -> m PreferredInfo
-    queryGetPreferredInfo name = queryState preferredState (GetPreferredInfo name)
+    queryGetPreferredInfo name = liftIO (dbGetPreferredInfo pool name)
 
     queryGetDeprecatedFor :: MonadIO m => PackageName -> m (Maybe [PackageName])
-    queryGetDeprecatedFor name = queryState preferredState (GetDeprecatedFor name)
+    queryGetDeprecatedFor name = liftIO (dbGetDeprecatedFor pool name)
 
     queryGetPreferredVersions :: MonadIO m => m PreferredVersions
-    queryGetPreferredVersions = queryState preferredState GetPreferredVersions
+    queryGetPreferredVersions = liftIO (dbGetPreferredVersions pool)
 
     updateDeprecatedTags = do
-      pkgs <- deprecatedMap <$> queryState preferredState GetPreferredVersions
+      pkgs <- deprecatedMap <$> liftIO (dbGetPreferredVersions pool)
       setCalculatedTag (Tag "deprecated") (Map.keysSet pkgs)
 
     CoreResource{..} = coreResource
@@ -401,7 +425,7 @@ versionsFeature ServerEnv{ serverVerbosity = verbosity }
 
     handlePackagesDeprecatedGet :: DynamicPath -> ServerPartE Response
     handlePackagesDeprecatedGet _ = do
-      deprPkgs <- deprecatedMap <$> queryState preferredState GetPreferredVersions
+      deprPkgs <- deprecatedMap <$> liftIO (dbGetPreferredVersions pool)
       return $ toResponse $ array
           [ object
               [ ("deprecated-package", string $ display deprPkg)
@@ -414,7 +438,7 @@ versionsFeature ServerEnv{ serverVerbosity = verbosity }
     handlePackageDeprecatedGet dpath = do
       pkgname <- packageInPath dpath
       guardValidPackageName pkgname
-      mdep <- queryState preferredState (GetDeprecatedFor pkgname)
+      mdep <- liftIO (dbGetDeprecatedFor pool pkgname)
       return $ toResponse $
         object
             [ ("is-deprecated", Bool (isJust mdep))
@@ -453,7 +477,7 @@ versionsFeature ServerEnv{ serverVerbosity = verbosity }
 
     updatePackageDeprecation :: MonadIO m => PackageName -> Maybe [PackageName] -> m ()
     updatePackageDeprecation pkgname deprs = liftIO $ do
-      updateState preferredState $ SetDeprecatedFor pkgname deprs
+      liftIO $ dbSetDeprecatedFor pool pkgname deprs
       runHook_ deprecatedHook (pkgname, deprs)
       updateDeprecatedTags
 
@@ -477,7 +501,7 @@ versionsFeature ServerEnv{ serverVerbosity = verbosity }
       pkgIndex <- queryGetPackageIndex
       case PackageIndex.lookupPackageName pkgIndex (packageName pkgid) of
             []   ->  packageError [MText "No such package in package index. ", MLink "Search for related terms instead?" $ "/packages/search?terms=" ++ (display $ pkgName pkgid)]
-            pkgs  | pkgVersion pkgid == nullVersion -> queryState preferredState (GetPreferredInfo $ packageName pkgid) >>= \info -> do
+            pkgs  | pkgVersion pkgid == nullVersion -> liftIO (dbGetPreferredInfo pool $ packageName pkgid) >>= \info -> do
                 let rangeToCheck = sumRange info
                 case maybe id (\r -> filter (flip withinRange r . packageVersion)) rangeToCheck pkgs of
                     -- no preferred version available, choose latest from list ordered by version
@@ -500,7 +524,7 @@ versionsFeature ServerEnv{ serverVerbosity = verbosity }
       guardAuthorisedAsMaintainerOrTrustee pkgname
       (prefs, deprs) <- lookPrefRangeDeprecatedVersions pkgs
 
-      prefinfo <- updateState preferredState (SetPreferredInfo pkgname prefs deprs)
+      prefinfo <- liftIO $ dbSetPreferredInfo pool pkgname prefs deprs
       runHook_ updatePreferredHook (pkgname, prefinfo { deprecatedVersions = deprs }) -- It seems they are not set
       updateIndexPackagePreferredVersions pkgname prefinfo
       where
@@ -554,7 +578,7 @@ versionsFeature ServerEnv{ serverVerbosity = verbosity }
       where
         deprecatedError = errBadRequest "Deprecation failed" . return . MText
         doUpdates deprs = do
-            void $ updateState preferredState $ SetDeprecatedFor pkgname deprs
+            void $ liftIO $ dbSetDeprecatedFor pool pkgname deprs
             runHook_ deprecatedHook (pkgname, deprs)
             liftIO updateDeprecatedTags
 
@@ -568,25 +592,25 @@ versionsFeature ServerEnv{ serverVerbosity = verbosity }
     doPreferredRender :: PackageName -> ServerPartE PreferredRender
     doPreferredRender pkgname = do
       guardValidPackageName pkgname
-      pref <- queryState preferredState $ GetPreferredInfo pkgname
+      pref <- liftIO (dbGetPreferredInfo pool pkgname)
       return $ renderPrefInfo pref
 
     doDeprecatedRender :: PackageName -> ServerPartE (Maybe [PackageName])
     doDeprecatedRender pkgname = do
       guardValidPackageName pkgname
-      queryState preferredState $ GetDeprecatedFor pkgname
+      liftIO (dbGetDeprecatedFor pool pkgname)
 
     doPreferredsRender :: MonadIO m => m [(PackageName, PreferredRender)]
-    doPreferredsRender = queryState preferredState GetPreferredVersions >>=
+    doPreferredsRender = liftIO (dbGetPreferredVersions pool) >>=
         return . map (second renderPrefInfo) . Map.toList . preferredMap
 
     doDeprecatedsRender :: MonadIO m => m [(PackageName, [PackageName])]
-    doDeprecatedsRender = queryState preferredState GetPreferredVersions >>=
+    doDeprecatedsRender = liftIO (dbGetPreferredVersions pool) >>=
         return . Map.toList . deprecatedMap
 
     makeGlobalPreferredVersions :: (Functor m, MonadIO m) => m String
     makeGlobalPreferredVersions = do
-      prefs <- preferredMap <$> queryState preferredState GetPreferredVersions
+      prefs <- preferredMap <$> liftIO (dbGetPreferredVersions pool)
       return $! formatGlobalPreferredVersions (Map.toList prefs)
 
     formatSinglePreferredVersions :: PackageName -> PreferredInfo -> Maybe String
@@ -613,13 +637,13 @@ versionsFeature ServerEnv{ serverVerbosity = verbosity }
     -- One-off complex migration
     ephemeralPrefsMigration = do
       PreferredVersions {migratedEphemeralPrefs, preferredMap}
-        <- queryState preferredState GetPreferredVersions
+        <- liftIO (dbGetPreferredVersions pool)
       unless migratedEphemeralPrefs $
         logTiming verbosity "preferred-versions migration" $ do
           sequence_
             [ updateIndexPackagePreferredVersions pkgname prefinfo
             | (pkgname, prefinfo) <- Map.toList preferredMap ]
-          updateState preferredState SetMigratedEphemeralPrefs
+          liftIO $ dbSetMigratedEphemeralPrefs pool
 
 {------------------------------------------------------------------------------
   Some aeson auxiliary functions

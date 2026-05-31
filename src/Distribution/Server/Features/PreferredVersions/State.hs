@@ -1,4 +1,6 @@
-{-# LANGUAGE OverloadedStrings, MultiParamTypeClasses, FlexibleInstances, DeriveAnyClass, DeriveGeneric, DerivingStrategies, DeriveDataTypeable, TypeFamilies, TemplateHaskell #-}
+{-# LANGUAGE DeriveDataTypeable #-}
+{-# LANGUAGE TemplateHaskell #-}
+{-# LANGUAGE TypeFamilies #-}
 
 module Distribution.Server.Features.PreferredVersions.State where
 
@@ -8,11 +10,6 @@ import Distribution.Server.Framework.MemSize
 import Distribution.Package
 import Distribution.Version
 
-import Distribution.Server.Framework.EventSourcing (Query, Update, makeAcidic)
-import Distribution.Server.Framework.BeamInstances ()
-import Data.Maybe (fromMaybe)
-import Control.Monad.State (put, modify)
-import Control.Monad.Reader (ask, asks)
 import Data.Map.Strict (Map)
 import qualified Data.Map.Strict as Map
 import Data.SafeCopy (Migrate(..), base, extension, deriveSafeCopy)
@@ -96,79 +93,4 @@ initialPreferredVersions freshDB = PreferredVersions {
   , deprecatedMap          = Map.empty
   , migratedEphemeralPrefs = freshDB
   }
-
-setPreferredInfo :: PackageName -> [VersionRange] -> [Version]
-                                  -> Update PreferredVersions PreferredInfo
-setPreferredInfo name ranges versions = do
-    let prefinfo =  PreferredInfo {
-          unused_preferredRanges    = ranges,
-          deprecatedVersions = versions,
-          unused_sumRange    = Nothing
-        }
-    if null ranges && null versions
-      then modify $ \p -> p {
-             preferredMap = Map.delete name (preferredMap p)
-           }
-      else modify $ \p -> p {
-             preferredMap = Map.insert name prefinfo (preferredMap p)
-           }
-    return prefinfo
-
-getPreferredInfo :: PackageName -> Query PreferredVersions PreferredInfo
-getPreferredInfo name = asks $ Map.findWithDefault emptyPreferredInfo name . preferredMap
-
-setDeprecatedFor :: PackageName -> Maybe [PackageName] -> Update PreferredVersions ()
-setDeprecatedFor name forName = modify $ \p -> p { deprecatedMap = Map.alter (const forName) name $ deprecatedMap p }
-
-getDeprecatedFor :: PackageName -> Query PreferredVersions (Maybe [PackageName])
-getDeprecatedFor name = asks $ Map.lookup name . deprecatedMap
-
-isDeprecated :: PackageName -> Query PreferredVersions Bool
-isDeprecated name = asks $ Map.member name . deprecatedMap
-
-getPreferredVersions :: Query PreferredVersions PreferredVersions
-getPreferredVersions = ask
-
-replacePreferredVersions :: PreferredVersions -> Update PreferredVersions ()
-replacePreferredVersions = put
-
-setMigratedEphemeralPrefs :: Update PreferredVersions ()
-setMigratedEphemeralPrefs = modify $ \p -> p { migratedEphemeralPrefs = True }
-
----------------
--- old, for old acid-state logs only
---
-
-setPreferredRanges :: PackageName -> [VersionRange] -> Update PreferredVersions ()
-setPreferredRanges name ranges =
-    alterPreferredInfo name $ \p -> p { unused_preferredRanges = ranges }
-
-setDeprecatedVersions :: PackageName -> [Version] -> Update PreferredVersions ()
-setDeprecatedVersions name versions =
-    alterPreferredInfo name $ \p -> p { deprecatedVersions = versions }
-
-alterPreferredInfo :: PackageName -> (PreferredInfo -> PreferredInfo)
-                   -> Update PreferredVersions ()
-alterPreferredInfo name func =
-    modify $ \p -> p {
-      preferredMap = Map.alter (res . func . fromMaybe emptyPreferredInfo)
-                               name (preferredMap p)
-    }
-  where res (PreferredInfo [] [] _)       = Nothing -- ie delete
-        res (PreferredInfo ranges depr _) =
-          Just (PreferredInfo ranges depr Nothing)
-
-
-makeAcidic ''PreferredVersions ['setPreferredInfo
-                               ,'setPreferredRanges
-                               ,'setDeprecatedVersions
-                               ,'getPreferredInfo
-                               ,'setDeprecatedFor
-                               ,'getDeprecatedFor
-                               ,'isDeprecated
-                               ,'getPreferredVersions
-                               ,'replacePreferredVersions
-                               ,'setMigratedEphemeralPrefs
-                               ]
-
 
