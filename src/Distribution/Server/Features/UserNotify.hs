@@ -92,10 +92,9 @@ import qualified Data.Text.Lazy.Encoding as TL
 import           Data.Int (Int32)
 import GHC.Generics (Generic)
 import Database.Beam hiding (text, insert, delete, select)
+import Database.Beam.Backend.SQL.BeamExtensions (insertOnConflict, conflictingFields, onConflictUpdateAll)
 import qualified Database.Beam as Beam
 import Database.Beam.Postgres hiding (text)
-import qualified Database.PostgreSQL.Simple as PG
-import Control.Concurrent.MVar (swapMVar)
 
 
 -- A feature to manage notifications to users when package metadata, etc is updated.
@@ -327,8 +326,33 @@ notifyPrefToRow (UserId uid) Acid.NotifyPref{..} =
     , _npDependencyTriggerBounds = T.pack (show notifyDependencyTriggerBounds)
     }
 
-loadNotifyData :: PgTx Acid.NotifyData
-loadNotifyData = do
+------------------------------------------------------------------------
+-- Direct database operations (no MVar, no event sourcing)
+--
+
+-- | Lookup a user's notification preference
+dbLookupNotifyPref :: PgConnection -> UserId -> IO (Maybe Acid.NotifyPref)
+dbLookupNotifyPref pool (UserId uid) = do
+  rows <- runBeamPg pool $
+    runSelectReturningList $ Beam.select $
+      filter_ (\r -> _npUserId r ==. val_ (fromIntegral uid)) $
+      all_ notifyPrefsTable
+  return $ case rows of
+    (r : _) -> Just (snd (rowToNotifyPref r))
+    []      -> Nothing
+
+-- | Add or update a user's notification preference
+dbAddNotifyPref :: PgConnection -> UserId -> Acid.NotifyPref -> IO ()
+dbAddNotifyPref pool uid pref =
+  runBeamPg pool $
+    runInsert $ insertOnConflict notifyPrefsTable
+      (insertValues [notifyPrefToRow uid pref])
+      (conflictingFields primaryKey)
+      onConflictUpdateAll
+
+-- | Get all notify data (prefs + last notify time)
+dbGetNotifyData :: PgConnection -> IO Acid.NotifyData
+dbGetNotifyData pool = runPgTx pool $ do
   prefRows <- beamTx $
     runSelectReturningList $ Beam.select $ all_ notifyPrefsTable
   metaRows <- beamTx $
@@ -339,62 +363,31 @@ loadNotifyData = do
         [] -> error "user_notify__meta table empty"
   return $ Acid.NotifyData (prefs, lastTime)
 
-saveNotifyData :: Acid.NotifyData -> PgTx ()
-saveNotifyData (Acid.NotifyData (prefs, lastTime)) =
-  do
+-- | Set the last notification time
+dbSetNotifyTime :: PgConnection -> UTCTime -> IO ()
+dbSetNotifyTime pool t =
+  runBeamPg pool $
+    runUpdate $ Beam.update notifyMetaTable
+      (\r -> _nmLastTime r <-. val_ t)
+      (\_ -> val_ True)
+
+-- | Write full state to DB (for backup restore)
+dbPutNotifyData :: PgConnection -> Acid.NotifyData -> IO ()
+dbPutNotifyData pool (Acid.NotifyData (prefs, lastTime)) =
+  runPgTx pool $ do
     beamTx $ do
       runDelete $ Beam.delete notifyPrefsTable (\_ -> val_ True)
       runDelete $ Beam.delete notifyMetaTable (\_ -> val_ True)
     let rows = [ notifyPrefToRow uid pref | (uid, pref) <- Map.toList prefs ]
-    mapM_ insertNotifyChunk (notifyChunksOf 1000 rows)
+    mapM_ (\chunk -> beamTx $
+      runInsert $ Beam.insert notifyPrefsTable $ insertValues chunk) (notifyChunksOf 1000 rows)
     beamTx $
       runInsert $ Beam.insert notifyMetaTable $ insertValues
         [NotifyMetaRow 1 lastTime]
 
-insertNotifyChunk :: [NotifyPrefT Identity] -> PgTx ()
-insertNotifyChunk chunk =
-  beamTx $
-    runInsert $ Beam.insert notifyPrefsTable $ insertValues chunk
-
 notifyChunksOf :: Int -> [a] -> [[a]]
 notifyChunksOf _ [] = []
 notifyChunksOf n xs = let (h, t) = splitAt n xs in h : notifyChunksOf n t
-
-----------------------------
--- State Component
---
-
-notifyStateComponent :: PgConnection -> IO (StateComponent AcidState Acid.NotifyData)
-notifyStateComponent serverPgConn = do
-  -- Seed the meta table if empty
-  initData <- Acid.emptyNotifyData
-  metaRows <- runBeamPg serverPgConn $
-    runSelectReturningList $ Beam.select $ all_ notifyMetaTable
-  case metaRows of
-    [] -> do
-      let Acid.NotifyData (_, initTime) = initData
-      runBeamPg serverPgConn $
-        runInsert $ Beam.insert notifyMetaTable $ insertValues
-          [NotifyMetaRow 1 initTime]
-    _ -> return ()
-
-  -- Load state
-  st <- runPgTx serverPgConn loadNotifyData
-
-  pgSt <- mkAcidState serverPgConn st saveNotifyData
-  return StateComponent {
-      stateDesc    = "State to keep track of revision notifications"
-    , stateHandle  = pgSt
-    , getState     = queryPg pgSt (runQueryEvent Acid.GetNotifyData)
-    , putState     = \s -> do
-        runPgTx serverPgConn (saveNotifyData s)
-        _ <- swapMVar (pgMVar pgSt) s
-        return ()
-    , backupState  = \backuptype tbl ->
-        [csvToBackup ["notifydata.csv"] (notifyDataToCSV backuptype tbl)]
-    , restoreState = userNotifyBackup
-    , resetState   = \_ -> notifyStateComponent serverPgConn
-    }
 
 ----------------------------
 -- Core Feature
@@ -413,8 +406,17 @@ initUserNotifyFeature :: ServerEnv
                           -> IO UserNotifyFeature)
 initUserNotifyFeature ServerEnv{ serverPgConn, serverTemplatesDir,
                                      serverTemplatesMode } = do
-    -- Canonical state
-    notifyState <- notifyStateComponent serverPgConn
+    -- Seed the meta table if empty
+    initData <- Acid.emptyNotifyData
+    metaRows <- runBeamPg serverPgConn $
+      runSelectReturningList $ Beam.select $ all_ notifyMetaTable
+    case metaRows of
+      [] -> do
+        let Acid.NotifyData (_, initTime) = initData
+        runBeamPg serverPgConn $
+          runInsert $ Beam.insert notifyMetaTable $ insertValues
+            [NotifyMetaRow 1 initTime]
+      _ -> return ()
 
     -- Page templates
     templates <- loadTemplates serverTemplatesMode
@@ -424,7 +426,7 @@ initUserNotifyFeature ServerEnv{ serverPgConn, serverTemplatesDir,
     return $ \users core uploadfeature adminlog userdetails reports tags revers vouch -> do
       let feature = userNotifyFeature
                       users core uploadfeature adminlog userdetails reports tags
-                      revers vouch notifyState templates
+                      revers vouch serverPgConn templates
       return feature
 
 data InRange = InRange | OutOfRange
@@ -555,7 +557,7 @@ userNotifyFeature :: UserFeature
                   -> TagsFeature
                   -> ReverseFeature
                   -> VouchFeature
-                  -> StateComponent AcidState Acid.NotifyData
+                  -> PgConnection
                   -> Templates
                   -> UserNotifyFeature
 userNotifyFeature UserFeature{..}
@@ -567,7 +569,7 @@ userNotifyFeature UserFeature{..}
                   TagsFeature{..}
                   ReverseFeature{queryReverseIndex}
                   VouchFeature{drainQueuedNotifications}
-                  notifyState templates
+                  pool templates
   = UserNotifyFeature {..}
 
   where
@@ -575,7 +577,7 @@ userNotifyFeature UserFeature{..}
     userNotifyFeatureInterface = (emptyHackageFeature "user-notify") {
         featureDesc      = "Notifications to users on metadata updates."
       , featureResources = [userNotifyResource] -- TODO we can add json features here for updating prefs
-      , featureState     = [abstractAcidStateComponent notifyState]
+      , featureState     = []  -- no AcidState; data lives in PostgreSQL
       , featureCaches    = []
       , featureReloadFiles = reloadTemplates templates
       , featurePostInit  = setupNotifyCronJob
@@ -599,10 +601,10 @@ userNotifyFeature UserFeature{..}
     --
 
     queryGetUserNotifyPref  ::  MonadIO m => UserId -> m (Maybe Acid.NotifyPref)
-    queryGetUserNotifyPref uid = queryState notifyState (Acid.LookupNotifyPref uid)
+    queryGetUserNotifyPref uid = liftIO $ dbLookupNotifyPref pool uid
 
     updateSetUserNotifyPref ::  MonadIO m => UserId -> Acid.NotifyPref -> m ()
-    updateSetUserNotifyPref uid np = updateState notifyState (Acid.AddNotifyPref uid np)
+    updateSetUserNotifyPref uid np = liftIO $ dbAddNotifyPref pool uid np
 
     -- Request handlers
     --
@@ -660,7 +662,7 @@ userNotifyFeature UserFeature{..}
       }
 
     notifyCronAction = do
-        (notifyPrefs, lastNotifyTime) <- Acid.unNotifyData <$> queryState notifyState Acid.GetNotifyData
+        (notifyPrefs, lastNotifyTime) <- Acid.unNotifyData <$> liftIO (dbGetNotifyData pool)
         now <- getCurrentTime
         let trimLastTime = if diffUTCTime now lastNotifyTime > (60*60*6) -- cap at 6hr
                              then addUTCTime (negate $ (60*60*6)) now
@@ -697,7 +699,7 @@ userNotifyFeature UserFeature{..}
               ]
         mapM_ sendNotifyEmailAndDelay emails
 
-        updateState notifyState (Acid.SetNotifyTime now)
+        liftIO $ dbSetNotifyTime pool now
 
     collectRevisionsAndUploads earlier now = do
         pkgIndex <- queryGetPackageIndex
