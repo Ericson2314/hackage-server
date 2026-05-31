@@ -16,6 +16,7 @@ module Distribution.Server.Features.Distro (
   ) where
 
 import Distribution.Server.Framework
+import Distribution.Server.Framework.PgTx (beamTx)
 
 import Distribution.Server.Features.Core
 import Distribution.Server.Features.Users
@@ -23,6 +24,7 @@ import Distribution.Server.Features.Users
 import Distribution.Server.Users.Group (UserGroup(..), GroupDescription(..), nullDescription)
 import qualified Distribution.Server.Features.Distro.State as Acid
 import Distribution.Server.Features.Distro.Types
+import qualified Distribution.Server.Features.Distro.Distributions as Dist
 import Distribution.Server.Features.Distro.Distributions (Distributions(..), DistroVersions(..), DistroPackageInfo(..))
 import Distribution.Server.Features.Distro.Backup (dumpBackup, restoreBackup)
 import qualified Distribution.Server.Users.Types as Users.Types
@@ -42,8 +44,6 @@ import GHC.Generics (Generic)
 import           Data.Int (Int32)
 import Database.Beam
 import Database.Beam.Postgres
-import qualified Database.PostgreSQL.Simple as PG
-import Control.Concurrent.MVar (swapMVar)
 
 -- TODO:
 -- 1. write an HTML view for this module, and delete the text
@@ -68,8 +68,6 @@ data DistroResource = DistroResource {
 initDistroFeature :: ServerEnv
                   -> IO (UserFeature -> CoreFeature -> IO DistroFeature)
 initDistroFeature ServerEnv{serverPgConn} = do
-    distrosState <- distrosStateComponent serverPgConn
-
     return $ \user@UserFeature{adminGroup, groupResourcesAt} core@CoreFeature{coreResource} -> do
       rec
         let
@@ -77,14 +75,14 @@ initDistroFeature ServerEnv{serverPgConn} = do
           maintainersUserGroup name =
             UserGroup {
               groupDesc             = maintainerGroupDescription name,
-              queryUserGroup        = queryState  distrosState $ Acid.GetDistroMaintainers name,
-              addUserToGroup        = updateState distrosState . Acid.AddDistroMaintainer name,
-              removeUserFromGroup   = updateState distrosState . Acid.RemoveDistroMaintainer name,
+              queryUserGroup        = dbGetDistroMaintainers serverPgConn name,
+              addUserToGroup        = dbAddDistroMaintainer serverPgConn name,
+              removeUserFromGroup   = dbRemoveDistroMaintainer serverPgConn name,
               groupsAllowedToAdd    = [adminGroup],
               groupsAllowedToDelete = [adminGroup]
             }
-          feature = distroFeature user core distrosState maintainersGroupResource maintainersUserGroup
-        distroNames <- queryState distrosState Acid.EnumerateDistros
+          feature = distroFeature user core serverPgConn maintainersGroupResource maintainersUserGroup
+        distroNames <- dbEnumerateDistros serverPgConn
         (_maintainersGroup, maintainersGroupResource) <-
           groupResourcesAt "/distro/:package/maintainers"
                            maintainersUserGroup
@@ -171,13 +169,18 @@ distroMaintainersTable = _distroMaintainers distroDb
 distroVersionsTable :: DatabaseEntity Postgres DistroDb (TableEntity DistroVersionT)
 distroVersionsTable = _distroVersions distroDb
 
-loadDistros :: PgTx Acid.Distros
-loadDistros = do
-  distroRows <- beamTx $
+------------------------------------------------------------------------
+-- Direct database operations (no MVar, no event sourcing)
+--
+
+-- | Load full distro state from PostgreSQL
+dbGetDistros :: PgConnection -> IO Acid.Distros
+dbGetDistros pool = do
+  distroRows <- runBeamPg pool $
     runSelectReturningList $ select $ all_ distroDistrosTable
-  maintRows <- beamTx $
+  maintRows <- runBeamPg pool $
     runSelectReturningList $ select $ all_ distroMaintainersTable
-  verRows <- beamTx $
+  verRows <- runBeamPg pool $
     runSelectReturningList $ select $ all_ distroVersionsTable
 
   let -- Build Distributions (nameMap :: Map DistroName UserIdSet)
@@ -204,22 +207,21 @@ loadDistros = do
 
   return $ Acid.Distros dists versions
 
-saveDistros :: Acid.Distros -> PgTx ()
-saveDistros (Acid.Distros dists versions) =
-  do
+-- | Write full distro state to PostgreSQL (for backup restore)
+dbPutDistros :: PgConnection -> Acid.Distros -> IO ()
+dbPutDistros pool (Acid.Distros dists versions) =
+  runPgTx pool $ do
     beamTx $ do
       runDelete $ delete distroDistrosTable (\_ -> val_ True)
       runDelete $ delete distroMaintainersTable (\_ -> val_ True)
       runDelete $ delete distroVersionsTable (\_ -> val_ True)
 
-    -- Save distro names
     let distroRows = [ DistroDistroRow (T.pack (display dn))
                      | dn <- Map.keys (nameMap dists) ]
     mapM_ (\chunk -> beamTx $
       runInsert $ insert distroDistrosTable $ insertValues chunk)
       (distroChunksOf 1000 distroRows)
 
-    -- Save maintainers
     let maintRows = [ DistroMaintainerRow (T.pack (display dn)) (fromIntegral uid)
                     | (dn, uidSet) <- Map.toList (nameMap dists)
                     , Users.Types.UserId uid <- Group.toList uidSet ]
@@ -227,7 +229,6 @@ saveDistros (Acid.Distros dists versions) =
       runInsert $ insert distroMaintainersTable $ insertValues chunk)
       (distroChunksOf 1000 maintRows)
 
-    -- Save versions
     let verRows = [ DistroVersionRow (T.pack (display dn)) (T.pack (display pkgName))
                                      (T.pack (display (distroVersion info))) (T.pack (distroUrl info))
                   | (pkgName, distMap) <- Map.toList (packageDistroMap versions)
@@ -236,40 +237,70 @@ saveDistros (Acid.Distros dists versions) =
       runInsert $ insert distroVersionsTable $ insertValues chunk)
       (distroChunksOf 1000 verRows)
 
+-- | Read-modify-write helper for distro updates
+dbModifyDistros :: PgConnection -> (Acid.Distros -> Acid.Distros) -> IO ()
+dbModifyDistros pool f = do
+  st <- dbGetDistros pool
+  dbPutDistros pool (f st)
+
+-- | Read-modify-write helper for distro updates that return a value
+dbModifyDistros' :: PgConnection -> (Acid.Distros -> (a, Acid.Distros)) -> IO a
+dbModifyDistros' pool f = do
+  st <- dbGetDistros pool
+  let (result, st') = f st
+  dbPutDistros pool st'
+  return result
+
+-- | Enumerate distro names
+dbEnumerateDistros :: PgConnection -> IO [DistroName]
+dbEnumerateDistros pool = do
+  rows <- runBeamPg pool $ runSelectReturningList $ select $ all_ distroDistrosTable
+  return [ DistroName (T.unpack name) | DistroDistroRow name <- rows ]
+
+-- | Check if a distribution exists
+dbIsDistribution :: PgConnection -> DistroName -> IO Bool
+dbIsDistribution pool dname = do
+  rows <- runBeamPg pool $
+    runSelectReturningList $ select $
+      filter_ (\r -> _ddName r ==. val_ (T.pack (display dname))) $
+      all_ distroDistrosTable
+  return (not (null rows))
+
+-- | Get distro maintainers
+dbGetDistroMaintainers :: PgConnection -> DistroName -> IO Group.UserIdSet
+dbGetDistroMaintainers pool dname = do
+  rows <- runBeamPg pool $
+    runSelectReturningList $ select $
+      filter_ (\r -> _dmDistroName r ==. val_ (T.pack (display dname))) $
+      all_ distroMaintainersTable
+  return $ Group.fromList [ Users.Types.UserId (fromIntegral uid) | DistroMaintainerRow _ uid <- rows ]
+
+-- | Add a distro maintainer
+dbAddDistroMaintainer :: PgConnection -> DistroName -> Users.Types.UserId -> IO ()
+dbAddDistroMaintainer pool dname (Users.Types.UserId uid) =
+  runBeamPg pool $ runInsert $ insert distroMaintainersTable $ insertValues
+    [DistroMaintainerRow (T.pack (display dname)) (fromIntegral uid)]
+
+-- | Remove a distro maintainer
+dbRemoveDistroMaintainer :: PgConnection -> DistroName -> Users.Types.UserId -> IO ()
+dbRemoveDistroMaintainer pool dname (Users.Types.UserId uid) =
+  runBeamPg pool $ runDelete $ delete distroMaintainersTable
+    (\r -> _dmDistroName r ==. val_ (T.pack (display dname))
+       &&. _dmUserId r ==. val_ (fromIntegral uid))
+
 distroChunksOf :: Int -> [a] -> [[a]]
 distroChunksOf _ [] = []
 distroChunksOf n xs = let (h, t) = splitAt n xs in h : distroChunksOf n t
 
-------------------------------------------------------------------------
-
-distrosStateComponent :: PgConnection -> IO (StateComponent AcidState Acid.Distros)
-distrosStateComponent serverPgConn = do
-  -- Load state
-  st <- runPgTx serverPgConn loadDistros
-
-  pgSt <- mkAcidState serverPgConn st saveDistros
-  return StateComponent {
-      stateDesc    = ""
-    , stateHandle  = pgSt
-    , getState     = queryPg pgSt (runQueryEvent Acid.GetDistributions)
-    , putState     = \s -> do
-        runPgTx serverPgConn (saveDistros s)
-        _ <- swapMVar (pgMVar pgSt) s
-        return ()
-    , backupState  = \_ -> dumpBackup
-    , restoreState = restoreBackup
-    , resetState   = \_ -> distrosStateComponent serverPgConn
-    }
-
 distroFeature :: UserFeature
               -> CoreFeature
-              -> StateComponent AcidState Acid.Distros
+              -> PgConnection
               -> GroupResource
               -> (DistroName -> UserGroup)
               -> DistroFeature
 distroFeature UserFeature{..}
               CoreFeature{coreResource=CoreResource{packageInPath}}
-              distrosState
+              pool
               maintainersGroupResource
               distroGroup
   = DistroFeature{..}
@@ -284,11 +315,13 @@ distroFeature UserFeature{..}
             , distroPackages
             , distroPackage
             ]
-      , featureState = [abstractAcidStateComponent distrosState]
+      , featureState = []  -- no AcidState; data lives in PostgreSQL
       }
 
     queryPackageStatus :: MonadIO m => PackageName -> m [(DistroName, DistroPackageInfo)]
-    queryPackageStatus pkgname = queryState distrosState (Acid.PackageStatus pkgname)
+    queryPackageStatus pkgname = liftIO $ do
+      st <- dbGetDistros pool
+      return $ Dist.packageStatus pkgname (Acid.distVersions st)
 
     distroResource = DistroResource
           { distroIndexPage = (resourceAt "/distros/.:format") {
@@ -311,7 +344,7 @@ distroFeature UserFeature{..}
               }
           }
 
-    textEnumDistros _ = fmap (toResponse . intercalate ", " . map display) (queryState distrosState Acid.EnumerateDistros)
+    textEnumDistros _ = fmap (toResponse . intercalate ", " . map display) (liftIO $ dbEnumerateDistros pool)
     textDistroPkgs dpath = withDistroPath dpath $ \dname pkgs -> do
         let pkglines = map (\(name, info) -> display name ++ " at " ++ display (distroVersion info) ++ ": " ++ distroUrl info) pkgs
         return $ toResponse (unlines $ ("Packages for " ++ display dname):pkglines)
@@ -324,7 +357,9 @@ distroFeature UserFeature{..}
       withDistroNamePath dpath $ \distro -> do
         guardAuthorised_ [InGroup adminGroup]
         -- should also check for existence here of distro here
-        void $ updateState distrosState $ Acid.RemoveDistro distro
+        liftIO $ dbModifyDistros pool $ \st@Acid.Distros{..} ->
+          st { Acid.distDistros  = Dist.removeDistro distro distDistros
+             , Acid.distVersions = Dist.removeDistroVersions distro distVersions }
         seeOther "/distros/" (toResponse ())
 
     -- result: ok response or not-found error
@@ -334,21 +369,26 @@ distroFeature UserFeature{..}
         case info of
             Nothing -> notFound . toResponse $ "Package not found for " ++ display pkgname
             Just {} -> do
-                void $ updateState distrosState $ Acid.DropPackage dname pkgname
+                liftIO $ dbModifyDistros pool $ \st ->
+                  st { Acid.distVersions = Dist.dropPackage dname pkgname (Acid.distVersions st) }
                 ok $ toResponse "Ok!"
 
     -- result: see-other response, or an error: not authenticated or not found (todo)
     distroPackagePut dpath =
       withDistroPackagePath dpath $ \dname pkgname _ -> lookPackageInfo $ \newPkgInfo -> do
         guardAuthorised_ [InGroup $ distroGroup dname]
-        void $ updateState distrosState $ Acid.AddPackage dname pkgname newPkgInfo
+        liftIO $ dbModifyDistros pool $ \st ->
+          st { Acid.distVersions = Dist.addPackage dname pkgname newPkgInfo (Acid.distVersions st) }
         seeOther ("/distro/" ++ display dname ++ "/" ++ display pkgname) $ toResponse "Ok!"
 
     -- result: see-other response, or an error: not authentcated or bad request
     distroPostNew _ =
       lookDistroName $ \dname -> do
         guardAuthorised_ [InGroup adminGroup]
-        success <- updateState distrosState $ Acid.AddDistro dname
+        success <- liftIO $ dbModifyDistros' pool $ \st ->
+          case Dist.addDistro dname (Acid.distDistros st) of
+            Nothing      -> (False, st)
+            Just distros' -> (True, st { Acid.distDistros = distros' })
         if success
             then seeOther ("/distro/" ++ display dname) $ toResponse "Ok!"
             else badRequest $ toResponse "Selected distribution name is already in use"
@@ -356,7 +396,10 @@ distroFeature UserFeature{..}
     distroPutNew dpath =
       withDistroNamePath dpath $ \dname -> do
         guardAuthorised_ [InGroup adminGroup]
-        _success <- updateState distrosState $ Acid.AddDistro dname
+        _success <- liftIO $ dbModifyDistros' pool $ \st ->
+          case Dist.addDistro dname (Acid.distDistros st) of
+            Nothing      -> (False, st)
+            Just distros' -> (True, st { Acid.distDistros = distros' })
         -- it doesn't matter if it exists already or not
         ok $ toResponse "Ok!"
 
@@ -370,7 +413,8 @@ distroFeature UserFeature{..}
                     badRequest $ toResponse $
                       "Could not parse CSV File to a distro package list: " ++ msg
                 Right list -> do
-                    void $ updateState distrosState $ Acid.PutDistroPackageList dname list
+                    liftIO $ dbModifyDistros pool $ \st ->
+                      st { Acid.distVersions = Dist.updatePackageList dname list (Acid.distVersions st) }
                     ok $ toResponse "Ok!"
 
     withDistroNamePath :: DynamicPath -> (DistroName -> ServerPartE Response) -> ServerPartE Response
@@ -378,11 +422,12 @@ distroFeature UserFeature{..}
 
     withDistroPath :: DynamicPath -> (DistroName -> [(PackageName, DistroPackageInfo)] -> ServerPartE Response) -> ServerPartE Response
     withDistroPath dpath func = withDistroNamePath dpath $ \dname -> do
-        isDist <- queryState distrosState (Acid.IsDistribution dname)
+        isDist <- liftIO $ dbIsDistribution pool dname
         case isDist of
           False -> notFound $ toResponse "Distribution does not exist"
           True -> do
-            pkgs <- queryState distrosState (Acid.DistroStatus dname)
+            st <- liftIO $ dbGetDistros pool
+            let pkgs = Dist.distroStatus dname (Acid.distVersions st)
             func dname pkgs
 
     -- guards on the distro existing, but not the package
@@ -390,11 +435,12 @@ distroFeature UserFeature{..}
     withDistroPackagePath dpath func =
       withDistroNamePath dpath $ \dname -> do
         pkgname <- packageInPath dpath
-        isDist <- queryState distrosState (Acid.IsDistribution dname)
+        isDist <- liftIO $ dbIsDistribution pool dname
         case isDist of
           False -> notFound $ toResponse "Distribution does not exist"
           True -> do
-            pkgInfo <- queryState distrosState (Acid.DistroPackageStatus dname pkgname)
+            st <- liftIO $ dbGetDistros pool
+            let pkgInfo = Dist.distroPackageStatus dname pkgname (Acid.distVersions st)
             func dname pkgname pkgInfo
 
     lookPackageInfo :: (DistroPackageInfo -> ServerPartE Response) -> ServerPartE Response

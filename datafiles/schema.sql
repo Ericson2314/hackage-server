@@ -468,14 +468,6 @@ CREATE TABLE IF NOT EXISTS users__revoke_auth_token (id BIGSERIAL PRIMARY KEY, a
 
 
 
--- Distro events
-CREATE TABLE IF NOT EXISTS distros__add_distro (id BIGSERIAL PRIMARY KEY, arg0 TEXT NOT NULL);
-CREATE TABLE IF NOT EXISTS distros__remove_distro (id BIGSERIAL PRIMARY KEY, arg0 TEXT NOT NULL);
-CREATE TABLE IF NOT EXISTS distros__add_distro_maintainer (id BIGSERIAL PRIMARY KEY, arg0 TEXT NOT NULL, arg1 TEXT NOT NULL);
-CREATE TABLE IF NOT EXISTS distros__remove_distro_maintainer (id BIGSERIAL PRIMARY KEY, arg0 TEXT NOT NULL, arg1 TEXT NOT NULL);
-CREATE TABLE IF NOT EXISTS distros__put_distro_package_list (id BIGSERIAL PRIMARY KEY, arg0 TEXT NOT NULL, arg1 TEXT NOT NULL);
-CREATE TABLE IF NOT EXISTS distros__drop_package (id BIGSERIAL PRIMARY KEY, arg0 TEXT NOT NULL, arg1 TEXT NOT NULL);
-
 
 -- BuildReports events
 CREATE TABLE IF NOT EXISTS build_reports__add_report (id BIGSERIAL PRIMARY KEY, arg0 TEXT NOT NULL, arg1 TEXT NOT NULL);
