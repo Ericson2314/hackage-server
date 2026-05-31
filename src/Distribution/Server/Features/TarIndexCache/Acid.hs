@@ -22,20 +22,19 @@ import Data.List (foldl')
 
 import GHC.Generics (Generic)
 import Database.Beam
+import Database.Beam.Backend.SQL.BeamExtensions (insertOnConflict, conflictingFields, onConflictUpdateAll)
 import Database.Beam.Postgres
-import Control.Concurrent.MVar (swapMVar)
 
 acidStore :: PgConnection -> IO Backend
-acidStore conn = do
-  state <- tarIndexCacheStateComponent conn
+acidStore pool =
   pure Backend {
       backendStore = Store {
-          getTarIndexCache     = queryState state Acid.GetTarIndexCache
-        , replaceTarIndexCache  = updateState state . Acid.ReplaceTarIndexCache
-        , findTarIndex          = queryState state . Acid.FindTarIndex
-        , setTarIndex           = \tar index -> updateState state (Acid.SetTarIndex tar index)
+          getTarIndexCache     = dbGetTarIndexCache pool
+        , replaceTarIndexCache  = runPgTx pool . saveTarIndexCache
+        , findTarIndex          = dbFindTarIndex pool
+        , setTarIndex           = dbSetTarIndex pool
         }
-    , backendState = [abstractAcidStateComponent state]
+    , backendState = []  -- no AcidState; data lives in PostgreSQL
     }
 
 ------------------------------------------------------------------------
@@ -95,20 +94,47 @@ chunksOf :: Int -> [a] -> [[a]]
 chunksOf _ [] = []
 chunksOf n xs = let (h, t) = splitAt n xs in h : chunksOf n t
 
+
 ------------------------------------------------------------------------
+-- Direct database operations (no MVar, no event sourcing)
+--
 
-tarIndexCacheStateComponent :: PgConnection -> IO (StateComponent AcidState Acid.TarIndexCache)
-tarIndexCacheStateComponent conn = do
-  -- Load state
-  loaded <- runPgTx conn loadTarIndexCache
+-- | Find a cached tar index blob ID for a tarball blob ID
+dbFindTarIndex :: PgConnection -> BlobId -> IO (Maybe BlobId)
+dbFindTarIndex pool tarBlobId = do
+  rows <- runBeamPg pool $
+    runSelectReturningList $ select $
+      filter_ (\r -> _tiTarballBlobId r ==. val_ (T.pack $ blobMd5 tarBlobId)) $
+      all_ tarIndexTable
+  return $ case rows of
+    (TarIndexRow _ idxHex : _) ->
+      case readBlobId (T.unpack idxHex) of
+        Right idxId -> Just idxId
+        Left _      -> Nothing
+    [] -> Nothing
 
-  pgSt <- mkAcidState conn loaded saveTarIndexCache
-  return StateComponent {
-      stateDesc    = "Mapping from tarball blob IDs to tarindex blob IDs"
-    , stateHandle  = pgSt
-    , getState     = queryPg pgSt (runQueryEvent Acid.GetTarIndexCache)
-    , putState     = \s -> do
-        runPgTx conn (saveTarIndexCache s)
-        _ <- swapMVar (pgMVar pgSt) s
-        return ()
-    }
+-- | Set a cached tar index mapping
+dbSetTarIndex :: PgConnection -> BlobId -> BlobId -> IO ()
+dbSetTarIndex pool tarBlobId idxBlobId =
+  runBeamPg pool $
+    runInsert $ insertOnConflict tarIndexTable
+      (insertValues [TarIndexRow (T.pack $ blobMd5 tarBlobId) (T.pack $ blobMd5 idxBlobId)])
+      (conflictingFields primaryKey)
+      onConflictUpdateAll
+
+-- | Get all cached tar index mappings (for status display)
+dbGetTarIndexCache :: PgConnection -> IO Acid.TarIndexCache
+dbGetTarIndexCache pool = do
+  rows <- runBeamPg pool $
+    runSelectReturningList $ select $ all_ tarIndexTable
+  let addRow m (TarIndexRow tarHex idxHex) =
+        case (readBlobId (T.unpack tarHex), readBlobId (T.unpack idxHex)) of
+          (Right tarId, Right idxId) -> Map.insert tarId idxId m
+          _ -> m  -- skip unparseable rows
+  return $ Acid.TarIndexCache $ foldl' addRow Map.empty rows
+
+-- | Clear all cached tar index mappings
+dbClearTarIndexCache :: PgConnection -> IO ()
+dbClearTarIndexCache pool =
+  runBeamPg pool $
+    runDelete $ delete tarIndexTable (\_ -> val_ True)

@@ -550,8 +550,6 @@ CREATE TABLE IF NOT EXISTS tag_alias_add_tag_alias (id BIGSERIAL PRIMARY KEY, ar
 CREATE TABLE IF NOT EXISTS documentation_insert_documentation (id BIGSERIAL PRIMARY KEY, arg0 TEXT NOT NULL, arg1 TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS documentation_remove_documentation (id BIGSERIAL PRIMARY KEY, arg0 TEXT NOT NULL);
 
--- TarIndexCache events
-CREATE TABLE IF NOT EXISTS tar_index_cache_set_tar_index (id BIGSERIAL PRIMARY KEY, arg0 TEXT NOT NULL, arg1 TEXT NOT NULL);
 
 
 

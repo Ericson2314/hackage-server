@@ -1,22 +1,14 @@
-{-# LANGUAGE OverloadedStrings, MultiParamTypeClasses, FlexibleInstances, DeriveAnyClass, DeriveGeneric, DerivingStrategies, TemplateHaskell, TypeFamilies, DeriveDataTypeable, NamedFieldPuns #-}
+{-# LANGUAGE TemplateHaskell #-}
 module Distribution.Server.Features.TarIndexCache.State (
     TarIndexCache(..)
   , initialTarIndexCache
-  , GetTarIndexCache(GetTarIndexCache)
-  , ReplaceTarIndexCache(ReplaceTarIndexCache)
-  , FindTarIndex(FindTarIndex)
-  , SetTarIndex(SetTarIndex)
   ) where
 
 -- TODO: use strict map? (Can we rely on containers >= 0.5?)
 
-import Control.Monad.Reader (ask, asks)
-import Control.Monad.State (put, modify)
 import Data.Map (Map)
 import qualified Data.Map as Map
 
-import Distribution.Server.Framework.EventSourcing (Query, Update, makeAcidic)
-import Distribution.Server.Framework.BeamInstances ()
 import Data.SafeCopy (base, deriveSafeCopy)
 
 import Distribution.Server.Framework.BlobStorage
@@ -34,30 +26,3 @@ instance MemSize TarIndexCache where
 
 initialTarIndexCache :: TarIndexCache
 initialTarIndexCache = TarIndexCache Map.empty
-
-getTarIndexCache :: Query TarIndexCache TarIndexCache
-getTarIndexCache = ask
-
-replaceTarIndexCache :: TarIndexCache -> Update TarIndexCache ()
-replaceTarIndexCache = put
-
-getTarIndexCacheMap :: Query TarIndexCache (Map BlobId BlobId)
-getTarIndexCacheMap = asks tarIndexCacheMap
-
-modifyTarIndexCacheMap :: (Map BlobId BlobId -> Map BlobId BlobId)
-                       -> Update TarIndexCache ()
-modifyTarIndexCacheMap f = modify $ \st@TarIndexCache{tarIndexCacheMap} ->
-                             st { tarIndexCacheMap = f tarIndexCacheMap }
-
-findTarIndex :: BlobId -> Query TarIndexCache (Maybe BlobId)
-findTarIndex blobId = Map.lookup blobId <$> getTarIndexCacheMap
-
-setTarIndex :: BlobId -> BlobId -> Update TarIndexCache ()
-setTarIndex tar index = modifyTarIndexCacheMap (Map.insert tar index)
-
-makeAcidic ''TarIndexCache [
-    'getTarIndexCache
-  , 'replaceTarIndexCache
-  , 'findTarIndex
-  , 'setTarIndex
-  ]
