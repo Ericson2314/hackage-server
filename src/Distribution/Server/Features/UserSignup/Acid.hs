@@ -13,14 +13,11 @@ import qualified Distribution.Server.Features.UserSignup.Store as Store
 
 import Distribution.Server.Framework
 
-import Distribution.Server.Framework.EventSourcing (Query, Update, makeAcidic)
 import Distribution.Server.Framework.BeamInstances ()
 import Distribution.Server.Users.Types (UserId(..))
 import Distribution.Server.Util.Nonce
 
 import qualified Data.Map as Map
-import Control.Monad.Reader (ask)
-import Control.Monad.State (get, put, modify)
 
 import Data.Time
 
@@ -29,67 +26,20 @@ import GHC.Generics (Generic)
 import Data.Int (Int32)
 import Database.Beam
 import Database.Beam.Postgres
-import Control.Concurrent.MVar (swapMVar)
-
-------------------------------
--- State queries and updates
---
-
-getSignupResetTable :: Query SignupResetTable SignupResetTable
-getSignupResetTable = ask
-
-replaceSignupResetTable :: SignupResetTable -> Update SignupResetTable ()
-replaceSignupResetTable = put
-
-lookupSignupResetInfo :: Nonce -> Query SignupResetTable (Maybe SignupResetInfo)
-lookupSignupResetInfo nonce = do
-    SignupResetTable tbl <- ask
-    return $! Map.lookup nonce tbl
-
-addSignupResetInfo :: Nonce -> SignupResetInfo -> Update SignupResetTable Bool
-addSignupResetInfo nonce info = do
-    SignupResetTable tbl <- get
-    if not (Map.member nonce tbl)
-      then do put $! SignupResetTable (Map.insert nonce info tbl)
-              return True
-      else return False
-
-deleteSignupResetInfo :: Nonce -> Update SignupResetTable ()
-deleteSignupResetInfo nonce = do
-    SignupResetTable tbl <- get
-    put $! SignupResetTable (Map.delete nonce tbl)
-
-deleteAllExpired :: UTCTime -> Update SignupResetTable ()
-deleteAllExpired expireTime =
-    modify $ \(SignupResetTable tbl) ->
-      SignupResetTable $
-        Map.filter (\entry -> nonceTimestamp entry > expireTime) tbl
-
-$(makeAcidic ''SignupResetTable
-  [ -- queries
-    'getSignupResetTable
-  , 'lookupSignupResetInfo
-    -- updates
-  , 'replaceSignupResetTable
-  , 'addSignupResetInfo
-  , 'deleteSignupResetInfo
-  , 'deleteAllExpired
-  ])
 
 acidStore :: PgConnection -> IO Store.Backend
-acidStore pgConn = do
-  signupResetState <- signupResetStateComponent pgConn
+acidStore pool =
   pure Store.Backend {
       Store.backendStore = Store.Store {
-          Store.getSignupResetInfos =
-                queryState signupResetState GetSignupResetTable
-            >>= \(SignupResetTable tbl) -> return (Map.elems tbl)
-        , Store.lookupSignupResetInfo = \nonce -> queryState signupResetState (LookupSignupResetInfo nonce)
-        , Store.addSignupResetInfo = \nonce info -> updateState signupResetState (AddSignupResetInfo nonce info)
-        , Store.deleteSignupResetInfo = \nonce -> updateState signupResetState (DeleteSignupResetInfo nonce)
-        , Store.deleteExpiredResetInfos = \expiry -> updateState signupResetState (DeleteAllExpired expiry)
+          Store.getSignupResetInfos = liftIO $ do
+            SignupResetTable tbl <- dbGetSignupResetTable pool
+            return (Map.elems tbl)
+        , Store.lookupSignupResetInfo = liftIO . dbLookupSignupResetInfo pool
+        , Store.addSignupResetInfo = \nonce info -> liftIO $ dbAddSignupResetInfo pool nonce info
+        , Store.deleteSignupResetInfo = liftIO . dbDeleteSignupResetInfo pool
+        , Store.deleteExpiredResetInfos = liftIO . dbDeleteAllExpired pool
         }
-    , Store.backendState = [abstractAcidStateComponent signupResetState]
+    , Store.backendState = []  -- no AcidState; data lives in PostgreSQL
     }
 
 ---------------------
@@ -201,22 +151,65 @@ chunksOf :: Int -> [a] -> [[a]]
 chunksOf _ [] = []
 chunksOf n xs = let (h, t) = splitAt n xs in h : chunksOf n t
 
+
 ------------------------------------------------------------------------
+------------------------------------------------------------------------
+-- Direct database operations (no MVar, no event sourcing)
+--
 
-signupResetStateComponent :: PgConnection -> IO (StateComponent AcidState SignupResetTable)
-signupResetStateComponent serverPgConn = do
-  -- Load state
-  st <- runPgTx serverPgConn loadSignupResetTable
+-- | Get all signup/reset entries
+dbGetSignupResetTable :: PgConnection -> IO SignupResetTable
+dbGetSignupResetTable pool = do
+  rows <- runBeamPg pool $
+    runSelectReturningList $ select $ all_ signupResetEntriesTable
+  let entries = concatMap (maybe [] (:[]) . rowToSignupResetEntry) rows
+  return $ SignupResetTable (Map.fromList entries)
 
-  pgSt <- mkAcidState serverPgConn st saveSignupResetTable
-  return StateComponent {
-      stateDesc    = "State to keep track of outstanding requests for user signup and password resets"
-    , stateHandle  = pgSt
-    , getState     = queryPg pgSt (runQueryEvent GetSignupResetTable)
-    , putState     = \s -> do
-        runPgTx serverPgConn (saveSignupResetTable s)
-        _ <- swapMVar (pgMVar pgSt) s
-        return ()
-    }
+-- | Lookup a signup/reset entry by nonce
+dbLookupSignupResetInfo :: PgConnection -> Nonce -> IO (Maybe SignupResetInfo)
+dbLookupSignupResetInfo pool nonce = do
+  rows <- runBeamPg pool $
+    runSelectReturningList $ select $
+      filter_ (\r -> _sreNonce r ==. val_ (T.pack (renderNonce nonce))) $
+      all_ signupResetEntriesTable
+  return $ case rows of
+    (r : _) -> fmap snd (rowToSignupResetEntry r)
+    []      -> Nothing
 
+-- | Add a signup/reset entry. Returns True if newly inserted.
+dbAddSignupResetInfo :: PgConnection -> Nonce -> SignupResetInfo -> IO Bool
+dbAddSignupResetInfo pool nonce info =
+  runPgTx pool $ do
+    alreadyExists <- beamTx $ fmap (maybe False id) $ runSelectReturningOne $ select $ pure $
+      exists_ (filter_ (\r -> _sreNonce r ==. val_ (T.pack (renderNonce nonce))) $
+               all_ signupResetEntriesTable)
+    if alreadyExists
+      then return False
+      else do
+        beamTx $ runInsert $ insert signupResetEntriesTable $ insertValues
+          [signupResetToRow nonce info]
+        return True
+
+-- | Delete a signup/reset entry by nonce
+dbDeleteSignupResetInfo :: PgConnection -> Nonce -> IO ()
+dbDeleteSignupResetInfo pool nonce =
+  runBeamPg pool $
+    runDelete $ delete signupResetEntriesTable
+      (\r -> _sreNonce r ==. val_ (T.pack (renderNonce nonce)))
+
+-- | Delete all expired entries
+dbDeleteAllExpired :: PgConnection -> UTCTime -> IO ()
+dbDeleteAllExpired pool expireTime =
+  runBeamPg pool $
+    runDelete $ delete signupResetEntriesTable
+      (\r -> _sreTimestamp r <=. val_ expireTime)
+
+-- | Write full state to DB (for backup restore)
+dbPutSignupResetTable :: PgConnection -> SignupResetTable -> IO ()
+dbPutSignupResetTable pool (SignupResetTable tbl) =
+  runPgTx pool $ do
+    beamTx $ runDelete $ delete signupResetEntriesTable (\_ -> val_ True)
+    let rows = [ signupResetToRow nonce info | (nonce, info) <- Map.toList tbl ]
+    mapM_ (\chunk -> beamTx $
+      runInsert $ insert signupResetEntriesTable $ insertValues chunk) (chunksOf 1000 rows)
 

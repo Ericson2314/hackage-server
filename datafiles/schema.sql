@@ -556,11 +556,6 @@ CREATE TABLE IF NOT EXISTS tar_index_cache_set_tar_index (id BIGSERIAL PRIMARY K
 
 
 
--- UserSignup events
-CREATE TABLE IF NOT EXISTS signup_reset_table_add_signup_reset_info (id BIGSERIAL PRIMARY KEY, arg0 TEXT NOT NULL, arg1 TEXT NOT NULL);
-CREATE TABLE IF NOT EXISTS signup_reset_table_delete_signup_reset_info (id BIGSERIAL PRIMARY KEY, arg0 TEXT NOT NULL);
-CREATE TABLE IF NOT EXISTS signup_reset_table_delete_all_expired (id BIGSERIAL PRIMARY KEY, arg0 TEXT NOT NULL);
-
 
 -- PreferredVersions events
 CREATE TABLE IF NOT EXISTS preferred_versions_set_preferred_ranges (id BIGSERIAL PRIMARY KEY, arg0 TEXT NOT NULL, arg1 TEXT NOT NULL);
