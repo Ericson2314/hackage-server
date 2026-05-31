@@ -10,6 +10,8 @@ module Distribution.Server.Features.AnalyticsPixels.Acid
   ( acidStore
   ) where
 
+import Data.Set (Set)
+import Distribution.Package (PackageName)
 import qualified Distribution.Server.Features.AnalyticsPixels.State as Acid
 import Distribution.Server.Features.AnalyticsPixels.Store
 import Distribution.Server.Features.AnalyticsPixels.Types
@@ -23,19 +25,17 @@ import qualified Data.Text as T
 import GHC.Generics (Generic)
 import Database.Beam
 import Database.Beam.Postgres
-import Control.Concurrent.MVar (swapMVar)
 import Data.List (foldl')
 
 acidStore :: PgConnection -> IO Backend
-acidStore serverPgConn = do
-  analyticsPixelsState <- analyticsPixelsStateComponent serverPgConn
+acidStore pool =
   return Backend {
       backendStore = Store {
-        getPackageAnalyticsPixels = \name -> queryState analyticsPixelsState (Acid.AnalyticsPixelsForPackage name)
-      , addPackageAnalyticsPixel = \name pixel -> updateState analyticsPixelsState (Acid.AddPackageAnalyticsPixel name pixel)
-      , removePackageAnalyticsPixel = \name pixel -> updateState analyticsPixelsState (Acid.RemovePackageAnalyticsPixel name pixel)
+        getPackageAnalyticsPixels = liftIO . dbGetPackageAnalyticsPixels pool
+      , addPackageAnalyticsPixel = \name pixel -> liftIO $ dbAddPackageAnalyticsPixel pool name pixel
+      , removePackageAnalyticsPixel = \name pixel -> liftIO $ dbRemovePackageAnalyticsPixel pool name pixel
       }
-    , backendState = [abstractAcidStateComponent analyticsPixelsState]
+    , backendState = []  -- no AcidState; data lives in PostgreSQL
     }
 
 ------------------------------------------------------------------------
@@ -101,23 +101,47 @@ chunksOf :: Int -> [a] -> [[a]]
 chunksOf _ [] = []
 chunksOf n xs = let (h, t) = splitAt n xs in h : chunksOf n t
 
+
 ------------------------------------------------------------------------
+-- Direct database operations (no MVar, no event sourcing)
+--
 
--- | Define the backing store (i.e. database component)
-analyticsPixelsStateComponent :: PgConnection -> IO (StateComponent AcidState Acid.AnalyticsPixelsState)
-analyticsPixelsStateComponent serverPgConn = do
-  -- Load state
-  loaded <- runPgTx serverPgConn loadAnalyticsPixelsState
+-- | Get all analytics pixels for a package
+dbGetPackageAnalyticsPixels :: PgConnection -> PackageName -> IO (Set AnalyticsPixel)
+dbGetPackageAnalyticsPixels pool pkgname = do
+  rows <- runBeamPg pool $
+    runSelectReturningList $ select $
+      filter_ (\r -> _apPkgName r ==. val_ (T.pack $ display pkgname)) $
+      all_ analyticsPixelsDbTable
+  return $ Set.fromList [ AnalyticsPixel url | AnalyticsPixelRow _ url <- rows ]
 
-  pgSt <- mkAcidState serverPgConn loaded saveAnalyticsPixelsState
-  return StateComponent {
-      stateDesc    = "Backing store for AnalyticsPixels feature"
-    , stateHandle  = pgSt
-    , getState     = queryPg pgSt (runQueryEvent Acid.GetAnalyticsPixelsState)
-    , putState     = \s -> do
-        runPgTx serverPgConn (saveAnalyticsPixelsState s)
-        _ <- swapMVar (pgMVar pgSt) s
-        return ()
-    }
+-- | Add an analytics pixel. Returns True if newly inserted.
+dbAddPackageAnalyticsPixel :: PgConnection -> PackageName -> AnalyticsPixel -> IO Bool
+dbAddPackageAnalyticsPixel pool pkgname pixel = do
+  existing <- dbGetPackageAnalyticsPixels pool pkgname
+  if pixel `Set.member` existing
+    then return False
+    else do
+      runBeamPg pool $
+        runInsert $ insert analyticsPixelsDbTable $ insertValues
+          [AnalyticsPixelRow (T.pack $ display pkgname) (analyticsPixelUrl pixel)]
+      return True
 
+-- | Remove an analytics pixel
+dbRemovePackageAnalyticsPixel :: PgConnection -> PackageName -> AnalyticsPixel -> IO ()
+dbRemovePackageAnalyticsPixel pool pkgname pixel =
+  runBeamPg pool $
+    runDelete $ delete analyticsPixelsDbTable
+      (\r -> _apPkgName r ==. val_ (T.pack $ display pkgname)
+         &&. _apPixelUrl r ==. val_ (analyticsPixelUrl pixel))
 
+-- | Write full state to DB (for backup restore)
+dbPutAllAnalyticsPixels :: PgConnection -> Acid.AnalyticsPixelsState -> IO ()
+dbPutAllAnalyticsPixels pool (Acid.AnalyticsPixelsState pixels) =
+  runPgTx pool $ do
+    beamTx $ runDelete $ delete analyticsPixelsDbTable (\_ -> val_ True)
+    let rows = [ AnalyticsPixelRow (T.pack $ display pkgName) (analyticsPixelUrl pixel)
+               | (pkgName, pixelSet) <- Map.toList pixels
+               , pixel <- Set.toList pixelSet ]
+    mapM_ (\chunk -> beamTx $
+      runInsert $ insert analyticsPixelsDbTable $ insertValues chunk) (chunksOf 1000 rows)

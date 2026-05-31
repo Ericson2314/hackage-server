@@ -553,9 +553,6 @@ CREATE TABLE IF NOT EXISTS documentation_remove_documentation (id BIGSERIAL PRIM
 -- TarIndexCache events
 CREATE TABLE IF NOT EXISTS tar_index_cache_set_tar_index (id BIGSERIAL PRIMARY KEY, arg0 TEXT NOT NULL, arg1 TEXT NOT NULL);
 
--- AnalyticsPixels events
-CREATE TABLE IF NOT EXISTS analytics_pixels_state_add_package_analytics_pixel (id BIGSERIAL PRIMARY KEY, arg0 TEXT NOT NULL, arg1 TEXT NOT NULL);
-CREATE TABLE IF NOT EXISTS analytics_pixels_state_remove_package_analytics_pixel (id BIGSERIAL PRIMARY KEY, arg0 TEXT NOT NULL, arg1 TEXT NOT NULL);
 
 -- UserDetails events
 CREATE TABLE IF NOT EXISTS user_details_table_set_user_details (id BIGSERIAL PRIMARY KEY, arg0 TEXT NOT NULL, arg1 TEXT NOT NULL);
