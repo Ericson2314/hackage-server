@@ -13,9 +13,11 @@ module Distribution.Server.Features.HaskellPlatform.Acid
 
 import Distribution.Server.Framework
 
-import qualified Distribution.Server.Features.HaskellPlatform.State as Acid
+import qualified Distribution.Server.Features.HaskellPlatform.State as State
 import Distribution.Server.Features.HaskellPlatform.Store
 
+import Distribution.Package (PackageName)
+import Distribution.Version (Version)
 import Distribution.Text
 
 import Data.List (foldl')
@@ -26,23 +28,23 @@ import GHC.Generics (Generic)
 
 import Database.Beam
 import Database.Beam.Postgres
-import Control.Concurrent.MVar (swapMVar)
 
 acidStore :: PgConnection -> IO Backend
-acidStore conn = do
-  platformState <- platformStateComponent conn
+acidStore pool =
   pure Backend
     { backendStore = Store
-        { platformVersions = \pkgname -> fmap Set.toList $ queryState platformState $ Acid.GetPlatformPackage pkgname
-        , platformPackageLatest = fmap (Map.toList . Map.map Set.findMax . Acid.blessedPackages) $ queryState platformState Acid.GetPlatformPackages
-        , setPlatform = \pkgname versions -> updateState platformState $ Acid.SetPlatformPackage pkgname (Set.fromList versions)
-        , removePlatform = \pkgname -> updateState platformState $ Acid.SetPlatformPackage pkgname Set.empty
+        { platformVersions = \pkgname -> liftIO $ dbGetPlatformVersions pool pkgname
+        , platformPackageLatest = liftIO $ do
+            State.PlatformPackages pkgs <- dbGetAllPlatformPackages pool
+            return $ Map.toList $ Map.map Set.findMax pkgs
+        , setPlatform = \pkgname versions -> liftIO $ dbSetPlatformPackage pool pkgname (Set.fromList versions)
+        , removePlatform = \pkgname -> liftIO $ dbSetPlatformPackage pool pkgname Set.empty
         }
-    , backendState = [abstractAcidStateComponent platformState]
+    , backendState = []  -- no AcidState; data lives in PostgreSQL
     }
 
 ------------------------------------------------------------------------
--- Beam table: platform package versions (checkpoint/state table)
+-- Beam table: platform package versions
 --
 -- Stores the current state: which packages are in the platform and
 -- at which versions.
@@ -60,34 +62,6 @@ instance Table PlatformPkgT where
 
 deriving instance Show (PlatformPkgT Identity)
 
--- TODO: event tables for SetPlatformPackage
--- For now we just write the full state (checkpoint only, no event log)
-
-------------------------------------------------------------------------
-
-loadPlatformPackages :: PgTx Acid.PlatformPackages
-loadPlatformPackages = do
-  rows <- beamTx $ runSelectReturningList $ select $ all_ platformPkgsTable
-  return $ rowsToPlatformPackages rows
-
-platformStateComponent :: PgConnection -> IO (StateComponent AcidState Acid.PlatformPackages)
-platformStateComponent conn = do
-  st <- runPgTx conn loadPlatformPackages
-
-  pgSt <- mkAcidState conn st savePlatformPackages
-  return StateComponent {
-      stateDesc    = "Platform packages"
-    , stateHandle  = pgSt
-    , getState     = queryPg pgSt (runQueryEvent Acid.GetPlatformPackages)
-    , putState     = \s -> do
-        runPgTx conn (savePlatformPackages s)
-        _ <- swapMVar (pgMVar pgSt) s
-        return ()
-    }
-
-platformPkgsTable :: DatabaseEntity Postgres PlatformDb (TableEntity PlatformPkgT)
-platformPkgsTable = _platformPkgs platformDb
-
 data PlatformDb f = PlatformDb
   { _platformPkgs :: f (TableEntity PlatformPkgT)
   } deriving (Generic, Database Postgres)
@@ -100,9 +74,18 @@ platformDb = defaultDbSettings `withDbModification`
                 , _ppVersion = "version"
                 })
 
-rowsToPlatformPackages :: [PlatformPkgT Identity] -> Acid.PlatformPackages
-rowsToPlatformPackages rows = Acid.PlatformPackages $
-    foldl' addRow Map.empty rows
+platformPkgsTable :: DatabaseEntity Postgres PlatformDb (TableEntity PlatformPkgT)
+platformPkgsTable = _platformPkgs platformDb
+
+------------------------------------------------------------------------
+-- Direct database operations (no MVar, no event sourcing)
+--
+
+-- | Get all platform packages (for backup or bulk queries)
+dbGetAllPlatformPackages :: PgConnection -> IO State.PlatformPackages
+dbGetAllPlatformPackages pool = do
+  rows <- runBeamPg pool $ runSelectReturningList $ select $ all_ platformPkgsTable
+  return $ State.PlatformPackages $ foldl' addRow Map.empty rows
   where
     addRow m (PlatformPkgRow name ver) =
       case (simpleParse (T.unpack name), simpleParse (T.unpack ver)) of
@@ -110,18 +93,39 @@ rowsToPlatformPackages rows = Acid.PlatformPackages $
           Map.insertWith Set.union pkgName (Set.singleton version) m
         _ -> m  -- skip unparseable rows
 
-savePlatformPackages :: Acid.PlatformPackages -> PgTx ()
-savePlatformPackages (Acid.PlatformPackages pkgs) = do
+-- | Get versions for a single package
+dbGetPlatformVersions :: PgConnection -> PackageName -> IO [Version]
+dbGetPlatformVersions pool pkgname = do
+  rows <- runBeamPg pool $
+    runSelectReturningList $ select $
+      filter_ (\r -> _ppPkgName r ==. val_ (T.pack $ display pkgname)) $
+      all_ platformPkgsTable
+  return [ ver | PlatformPkgRow _ verTxt <- rows
+               , Just ver <- [simpleParse (T.unpack verTxt)] ]
+
+-- | Set versions for a package (empty set = remove)
+dbSetPlatformPackage :: PgConnection -> PackageName -> Set.Set Version -> IO ()
+dbSetPlatformPackage pool pkgname versions =
+  runPgTx pool $ do
+    beamTx $ runDelete $ delete platformPkgsTable
+      (\r -> _ppPkgName r ==. val_ (T.pack $ display pkgname))
+    let rows = [ PlatformPkgRow (T.pack $ display pkgname) (T.pack $ display ver)
+               | ver <- Set.toList versions ]
+    mapM_ (\chunk -> beamTx $
+      runInsert $ insert platformPkgsTable $ insertValues chunk) (chunksOf 1000 rows)
+
+-- | Write full state to DB (for backup restore)
+dbPutAllPlatformPackages :: PgConnection -> State.PlatformPackages -> IO ()
+dbPutAllPlatformPackages pool (State.PlatformPackages pkgs) =
+  runPgTx pool $ do
     beamTx $ runDelete $ delete platformPkgsTable (\_ -> val_ True)
     let rows = [ PlatformPkgRow (T.pack $ display name) (T.pack $ display ver)
                | (name, vers) <- Map.toList pkgs
                , ver <- Set.toList vers ]
-    mapM_ insertChunk (chunksOf 1000 rows)
-
-insertChunk :: [PlatformPkgT Identity] -> PgTx ()
-insertChunk chunk =
-    beamTx $ runInsert $ insert platformPkgsTable $ insertValues chunk
+    mapM_ (\chunk -> beamTx $
+      runInsert $ insert platformPkgsTable $ insertValues chunk) (chunksOf 1000 rows)
 
 chunksOf :: Int -> [a] -> [[a]]
 chunksOf _ [] = []
 chunksOf n xs = let (h, t) = splitAt n xs in h : chunksOf n t
+
