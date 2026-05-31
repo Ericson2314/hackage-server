@@ -26,8 +26,6 @@ import           Data.Int (Int32, Int64)
 import Database.Beam
 import Database.Beam.Backend.SQL.BeamExtensions (insertOnConflict, conflictingFields, onConflictUpdateAll)
 import Database.Beam.Postgres
-import qualified Database.PostgreSQL.Simple as PG
-import Control.Concurrent.MVar (swapMVar)
 import Data.SafeCopy (safeGet, safePut)
 import Data.Serialize.Get (runGetLazy)
 import Data.Serialize.Put (runPutLazy)
@@ -59,12 +57,11 @@ instance IsHackageFeature SecurityFeature where
 
 initSecurityFeature :: ServerEnv -> IO (CoreFeature -> IO SecurityFeature)
 initSecurityFeature env = do
-    securityState <- securityStateComponent env (serverPgConn env)
     return $ \coreFeature -> do
 
        -- Update the security state whenever the main package index changes
        registerHook (indexUpdatedHook coreFeature) $ \_ ->
-         updateIndexFileInfo coreFeature securityState
+         updateIndexFileInfo coreFeature (serverPgConn env)
 
        -- Add package metadata whenever a package is added/changed
        --
@@ -101,7 +98,7 @@ initSecurityFeature env = do
          loginfo maxBound (mconcat ["TUF preIndexUpdateHook invoked (", msg, ", n = ", show (length ents), ")"])
          return ents
 
-       return $ securityFeature env securityState
+       return $ securityFeature env (serverPgConn env)
   where
     indexEntriesFor :: PkgInfo -> [TarIndexEntry]
     indexEntriesFor pkgInfo =
@@ -121,17 +118,17 @@ initSecurityFeature env = do
 -- Note that even once we have author signing, per-package targets.json file
 -- do not get their own resource, but are instead recorded in the tarball.
 securityFeature :: ServerEnv
-                -> StateComponent AcidState SecurityState
+                -> PgConnection
                 -> SecurityFeature
-securityFeature env securityState =
+securityFeature env pool =
     SecurityFeature{..}
   where
     securityFeatureInterface = (emptyHackageFeature "security") {
         featureDesc        = "TUF Security"
-      , featureState       = [abstractAcidStateComponent securityState]
-      , featureReloadFiles = updateRootMirrorsAndKeys env securityState
-      , featurePostInit    = updateRootMirrorsAndKeys env securityState
-                          >> setupResignCronJob env securityState
+      , featureState       = []  -- no AcidState; data lives in PostgreSQL
+      , featureReloadFiles = updateRootMirrorsAndKeys env pool
+      , featurePostInit    = updateRootMirrorsAndKeys env pool
+                          >> setupResignCronJob env pool
       , featureResources   = [
             resourceTimestamp
           , resourceSnapshot
@@ -162,7 +159,7 @@ securityFeature env securityState =
                    -> DynamicPath
                    -> ServerPartE Response
     serveFromState file _ = do
-      msfiles <- queryState securityState GetSecurityFiles
+      msfiles <- liftIO $ securityStateFiles <$> dbGetSecurityState pool
       case msfiles of
         Nothing -> errNotFound "Security files not available"
                      [MText $ "The repository is not currently using TUF "
@@ -332,50 +329,42 @@ saveSecurityState SecurityState{..} =
 
 ------------------------------------------------------------------------
 
-securityStateComponent :: ServerEnv
-                       -> PgConnection
-                       -> IO (StateComponent AcidState SecurityState)
-securityStateComponent env serverPgConn = do
-    -- Load state
-    st <- logTiming (serverVerbosity env) "Loaded SecurityState" $
-            runPgTx serverPgConn loadSecurityState
+-- | Get security state from PostgreSQL
+dbGetSecurityState :: PgConnection -> IO SecurityState
+dbGetSecurityState pool' = runPgTx pool' loadSecurityState
 
-    pgSt <- mkAcidState serverPgConn st saveSecurityState
-    return StateComponent {
-        stateDesc    = "TUF specific state"
-      , stateHandle  = pgSt
-      , getState     = queryPg pgSt (runQueryEvent GetSecurityState)
-      , putState     = \s -> do
-          runPgTx serverPgConn (saveSecurityState s)
-          _ <- swapMVar (pgMVar pgSt) s
-          return ()
-      , resetState   = \_ -> securityStateComponent env serverPgConn
-      , backupState  = \_ -> securityBackup
-      , restoreState = securityRestore
-      }
+-- | Write full security state to PostgreSQL
+dbPutSecurityState :: PgConnection -> SecurityState -> IO ()
+dbPutSecurityState pool' st = runPgTx pool' (saveSecurityState st)
+
+-- | Read-modify-write, no return value
+dbModifySecurityState :: PgConnection -> (SecurityState -> SecurityState) -> IO ()
+dbModifySecurityState pool' f = do
+  st <- dbGetSecurityState pool'
+  dbPutSecurityState pool' (f st)
 
 updateIndexFileInfo :: CoreFeature
-                    -> StateComponent AcidState SecurityState
+                    -> PgConnection
                     -> IO ()
-updateIndexFileInfo coreFeature securityState = do
+updateIndexFileInfo coreFeature pool' = do
     IndexTarballInfo{..}  <- queryGetIndexTarballInfo coreFeature
     let !tarGzFileInfo = fileInfo indexTarballIncremGz
         !tarFileInfo   = fileInfo indexTarballIncremUn
     now <- getCurrentTime
-    updateState securityState (SetTarGzFileInfo tarGzFileInfo tarFileInfo now)
+    dbModifySecurityState pool' (setTarGzFileInfo tarGzFileInfo tarFileInfo now)
 
 updateRootMirrorsAndKeys :: ServerEnv
-                         -> StateComponent AcidState SecurityState
+                         -> PgConnection
                          -> IO ()
-updateRootMirrorsAndKeys env securityState = do
+updateRootMirrorsAndKeys env pool' = do
     mbRootMirrorsAndKeys <- loadRootMirrorsAndKeys env
-    st <- queryState securityState GetSecurityState
+    st <- dbGetSecurityState pool'
     case mbRootMirrorsAndKeys of
       Just (root, mirrors, snapshotKey, timestampKey)
         | anyChange st root mirrors snapshotKey timestampKey
         -> do loginfo (serverVerbosity env) "Security files changed, updating"
               now <- getCurrentTime
-              updateState securityState (SetRootMirrorsAndKeys
+              dbModifySecurityState pool' (setRootMirrorsAndKeys
                                            root mirrors
                                            snapshotKey timestampKey
                                            now)
@@ -408,16 +397,16 @@ loadRootMirrorsAndKeys env = do
         return (Just (root, mirrors, snapshotKey, timestampKey))
 
 setupResignCronJob :: ServerEnv
-                   -> StateComponent AcidState SecurityState
+                   -> PgConnection
                    -> IO ()
-setupResignCronJob env securityState =
+setupResignCronJob env pool' =
     addCronJob (serverCron env) CronJob {
         cronJobName      = "Resign TUF data"
       , cronJobFrequency = DailyJobFrequency
       , cronJobOneShot   = False
       , cronJobAction    = do
           now <- getCurrentTime
-          updateState securityState (ResignSnapshotAndTimestamp maxAge now)
+          dbModifySecurityState pool' (resignSnapshotAndTimestamp maxAge now)
       }
   where
     maxAge = 60 * 60 * 23 -- Don't resign if unchanged and younger than ~1 day
