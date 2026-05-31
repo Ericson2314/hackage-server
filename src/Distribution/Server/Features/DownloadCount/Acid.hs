@@ -14,7 +14,7 @@ module Distribution.Server.Features.DownloadCount.Acid
   ) where
 
 import qualified Distribution.Server.Features.DownloadCount.State as State
-import Distribution.Server.Features.DownloadCount.State (InMemStats(..), OnDiskStats, GetInMemStats(..))
+import Distribution.Server.Features.DownloadCount.State (InMemStats(..), OnDiskStats)
 import qualified Distribution.Server.Features.DownloadCount.Store as Store
 import Distribution.Server.Framework
 
@@ -26,26 +26,35 @@ import Data.Time.Calendar (Day)
 import Data.Time.Clock (getCurrentTime, utctDay)
 import Data.Int (Int32)
 import Data.List (foldl')
+import Control.Monad (forM_)
 import qualified Data.Text as T
 import GHC.Generics (Generic)
 
 import Database.Beam
 import Database.Beam.Backend.SQL.BeamExtensions (insertOnConflict, conflictingFields, onConflictUpdateSet)
 import Database.Beam.Postgres
-import Control.Concurrent.MVar (swapMVar)
 
 acidStore :: PgConnection -> IO Store.Backend
-acidStore conn = do
-  inMemState <- inMemStateComponent conn
+acidStore pool = do
+  -- Seed meta if empty
+  metaRows <- runBeamPg pool $
+    runSelectReturningList $ select $ all_ dlMetaTable
+  initSt <- State.initInMemStats . utctDay <$> getCurrentTime
+  case metaRows of
+    [] -> runBeamPg pool $
+      runInsert $ insert dlMetaTable $ insertValues [DlMetaRow 1 (inMemToday initSt)]
+    _ -> return ()
+
   pure Store.Backend {
       Store.backendStore = Store.Store {
-          Store.recordedToday = queryState inMemState State.RecordedToday
-        , Store.getInMemStats = queryState inMemState State.GetInMemStats
-        , Store.replaceInMemStats = \stats -> updateState inMemState (State.ReplaceInMemStats stats)
-        , Store.registerDownloads = \pkgs -> updateState inMemState (State.RegisterDownloads pkgs)
-        , Store.checkpointInMemStats = liftIO (createCheckpoint (stateHandle inMemState))
+          Store.recordedToday = liftIO $ dbRecordedToday pool
+        , Store.getInMemStats = liftIO $ dbGetInMemStats pool
+        , Store.replaceInMemStats = liftIO . dbPutInMemStats pool
+        , Store.registerDownloads = liftIO . dbRegisterDownloads pool
+          -- each update is already durable
+        , Store.checkpointInMemStats = return ()
         }
-    , Store.backendState = [abstractAcidStateComponent inMemState]
+    , Store.backendState = []  -- no AcidState; data lives in PostgreSQL
     }
 
 ------------------------------------------------------------------------
@@ -203,30 +212,6 @@ dbUpdateHistory pool (InMemStats day perPkg) = do
 
 ------------------------------------------------------------------------
 
-inMemStateComponent :: PgConnection -> IO (StateComponent AcidState InMemStats)
-inMemStateComponent serverPgConn = do
-  -- Seed meta if empty
-  metaRows <- runBeamPg serverPgConn $
-    runSelectReturningList $ select $ all_ dlMetaTable
-  initSt <- State.initInMemStats . utctDay <$> getCurrentTime
-  case metaRows of
-    [] -> runBeamPg serverPgConn $
-      runInsert $ insert dlMetaTable $ insertValues [DlMetaRow 1 (inMemToday initSt)]
-    _ -> return ()
-
-  -- Load state
-  st <- runPgTx serverPgConn loadInMemStats
-
-  pgSt <- mkAcidState serverPgConn st saveInMemStats
-  return StateComponent {
-      stateDesc    = "Today's download counts"
-    , stateHandle  = pgSt
-    , getState     = queryPg pgSt (runQueryEvent GetInMemStats)
-    , putState     = \s -> do
-        runPgTx serverPgConn (saveInMemStats s)
-        _ <- swapMVar (pgMVar pgSt) s
-        return ()
-    }
 
 -- | Read/write on-disk (historical) stats directly from PostgreSQL.
 -- This doesn't use the StateComponent/AcidState wrapper since historical
@@ -249,3 +234,39 @@ onDiskPutState pool onDiskStats = do
       runInsert $ insert dlHistoryTable $ insertValues chunk)
       (dlChunksOf 1000 rows)
 
+
+------------------------------------------------------------------------
+-- Direct database operations (no MVar, no event sourcing)
+--
+
+-- | Get the current in-mem stats from PostgreSQL
+dbGetInMemStats :: PgConnection -> IO InMemStats
+dbGetInMemStats pool = runPgTx pool loadInMemStats
+
+-- | Write the full in-mem stats to PostgreSQL
+dbPutInMemStats :: PgConnection -> InMemStats -> IO ()
+dbPutInMemStats pool = runPgTx pool . saveInMemStats
+
+-- | Get which day is currently recorded
+dbRecordedToday :: PgConnection -> IO Day
+dbRecordedToday pool = do
+  metaRows <- runBeamPg pool $
+    runSelectReturningList $ select $ all_ dlMetaTable
+  return $ case metaRows of
+    (DlMetaRow _ d : _) -> d
+    [] -> error "download_meta table empty"
+
+-- | Register downloads, one @INSERT ... ON CONFLICT DO UPDATE@ per package
+-- version, so each is a single atomic statement instead of reading and
+-- rewriting all counts.
+dbRegisterDownloads :: PgConnection -> [(PackageId, Int)] -> IO ()
+dbRegisterDownloads pool pkgs =
+  runPgTx pool $ forM_ pkgs $ \(pkgId, n) -> beamTx $
+    runInsert $ insertOnConflict dlCountsTable
+      (insertValues [DlCountRow
+        (T.pack $ display (Distribution.Package.packageName pkgId))
+        (T.pack $ display (packageVersion pkgId))
+        (fromIntegral n)])
+      (conflictingFields primaryKey)
+      (onConflictUpdateSet (\fields oldValues ->
+        _dcCount fields <-. _dcCount oldValues + val_ (fromIntegral n)))

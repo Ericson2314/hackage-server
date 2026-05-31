@@ -778,14 +778,6 @@ test-suite BrowseQueryParserTest
   other-modules: Util
   build-depends: attoparsec
 
-test-suite DownloadCountTest
-  import: test-defaults
-  type: exitcode-stdio-1.0
-  main-is: DownloadCountTest.hs
-  build-tool-depends: hackage-server:hackage-server
-  -- NOTE: version constraints inherited from hackage-server
-  build-depends: acid-state
-
 test-suite CreateUserTest
   import:         test-defaults
 

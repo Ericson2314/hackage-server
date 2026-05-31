@@ -1,6 +1,13 @@
-{-# LANGUAGE OverloadedStrings, DeriveAnyClass, DeriveGeneric, DerivingStrategies, TemplateHaskell, StandaloneDeriving, GeneralizedNewtypeDeriving,
-             DeriveDataTypeable, TypeFamilies, FlexibleInstances,
-             MultiParamTypeClasses, BangPatterns #-}
+{-# LANGUAGE BangPatterns #-}
+{-# LANGUAGE DeriveAnyClass #-}
+{-# LANGUAGE DeriveGeneric #-}
+{-# LANGUAGE DerivingStrategies #-}
+{-# LANGUAGE FlexibleInstances #-}
+{-# LANGUAGE GeneralizedNewtypeDeriving #-}
+{-# LANGUAGE MultiParamTypeClasses #-}
+{-# LANGUAGE StandaloneDeriving #-}
+{-# LANGUAGE TemplateHaskell #-}
+{-# LANGUAGE TypeFamilies #-}
 module Distribution.Server.Features.DownloadCount.State where
 
 import Data.Time.Calendar (Day(..))
@@ -8,12 +15,8 @@ import Control.Arrow (first)
 import Control.Monad (liftM, unless)
 import Data.List (foldl', groupBy)
 import Data.Function (on)
-import Control.Monad.Reader (ask, asks)
-import Control.Monad.State (get, put)
 import qualified Data.Map.Lazy as Map
 
-import Distribution.Server.Framework.EventSourcing (Query, Update, makeAcidic)
-import Distribution.Server.Framework.BeamInstances ()
 import Data.SafeCopy (base, deriveSafeCopy)
 
 import Distribution.Version (Version)
@@ -190,39 +193,9 @@ deriveSafeCopy 0 'base ''InMemStats
 deriveSafeCopy 0 'base ''OnDiskPerPkg
 
 {------------------------------------------------------------------------------
-  ACID stuff
+  Pure operations (used by direct DB layer)
 ------------------------------------------------------------------------------}
 
-getInMemStats :: Query InMemStats InMemStats
-getInMemStats = ask
-
-replaceInMemStats :: InMemStats -> Update InMemStats ()
-replaceInMemStats = put
-
-recordedToday :: Query InMemStats Day
-recordedToday = asks inMemToday
-
--- | Record a single download.
---
--- Superseded by 'registerDownloads', which coalesces many downloads into a
--- single event. This is retained only so that existing acid-state event logs
--- (which may contain 'RegisterDownload' events) can still be replayed.
---
--- This should be dropped at some point
-registerDownload :: PackageId -> Update InMemStats ()
-registerDownload pkgId = registerDownloads [(pkgId, 1)]
-
--- | Record a batch of downloads: @(package, number of downloads)@ pairs.
-registerDownloads :: [(PackageId, Int)] -> Update InMemStats ()
-registerDownloads pkgs = unless (null pkgs) $ do
-  InMemStats day counts <- get
-  put $! InMemStats day (foldl' insert counts pkgs)
-  where
-    insert counts (pkgId, n) = cmInsert pkgId n counts
-
-makeAcidic ''InMemStats [ 'getInMemStats
-                        , 'replaceInMemStats
-                        , 'recordedToday
-                        , 'registerDownload
-                        , 'registerDownloads
-                        ]
+registerDownloadPure :: PackageId -> InMemStats -> InMemStats
+registerDownloadPure pkgId (InMemStats day counts) =
+  InMemStats day (cmInsert pkgId 1 counts)
