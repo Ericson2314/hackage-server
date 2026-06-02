@@ -12,17 +12,17 @@ import Data.Map.Strict (Map)
 import qualified Data.Map.Strict as Map
 import Data.Maybe (fromMaybe)
 import Data.Typeable (Typeable)
-import Text.CSV (CSV, Record)
 
 import Data.SafeCopy (SafeCopy(..), safeGet, safePut, contain)
 
 import Distribution.Parsec (Parsec(..))
 import Distribution.Pretty (Pretty(..))
 import Distribution.Text (display)
+import qualified Data.ByteString.Char8 as BS8
 
 import Distribution.Server.Framework.Instances ()
 import Distribution.Server.Framework.MemSize
-import Distribution.Server.Framework.BackupRestore (parseRead, parseText)
+import Distribution.Server.Framework.BackupRestore (CSV, Record, parseRead, parseText)
 
 {------------------------------------------------------------------------------
   We define some generic machinery to give us functions for arbitrarily
@@ -73,7 +73,7 @@ instance (Ord k, Typeable k, Parsec k, Pretty k) => CountingMap k (SimpleCountin
   cmToCSV (SCM (NCM _ m)) = map aux (Map.toList m)
     where
       aux :: (k, Int) -> Record
-      aux (k, n) = [display k, show n]
+      aux (k, n) = [BS8.pack (display k), BS8.pack (show n)]
 
   cmInsertRecord [k, n] m = do
      key   <- parseText "key"   k
@@ -103,7 +103,7 @@ instance (Typeable k, Parsec k, Pretty k, Ord k, Eq l, CountingMap l a) => Count
   cmToCSV (NCM _ m) = concatMap aux (Map.toList m)
     where
       aux :: (k, a) -> CSV
-      aux (k, m') = map (display k:) (cmToCSV m')
+      aux (k, m') = map (BS8.pack (display k):) (cmToCSV m')
 
   cmInsertRecord (k : record) (NCM total m) = do
     key <- parseText "key" k

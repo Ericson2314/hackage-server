@@ -39,7 +39,7 @@ import qualified Data.Aeson as Aeson (Value, encode)
 import Data.Time.Clock (UTCTime)
 import qualified Data.Time.Format as Time (formatTime)
 import Data.Time.Format (defaultTimeLocale)
-import Text.CSV (printCSV, CSV)
+import qualified Data.Csv as Csv
 import Control.DeepSeq
 
 -- | The index tarball
@@ -223,11 +223,11 @@ instance ToMessage ExportTarball where
         = noContentLength $ mkResponse bs
           [("Content-Type",  "application/gzip")]
 
-newtype CSVFile = CSVFile CSV
+newtype CSVFile a = CSVFile [a]
 
-instance ToMessage CSVFile where
+instance Csv.ToRecord a => ToMessage (CSVFile a) where
     toContentType _ = "text/csv"
-    toMessage (CSVFile csv) = packUTF8 (printCSV csv)
+    toMessage (CSVFile rows) = Csv.encode rows
 
 newtype XMLResponse = XMLResponse BS.Lazy.ByteString
   deriving (MemSize, NFData)

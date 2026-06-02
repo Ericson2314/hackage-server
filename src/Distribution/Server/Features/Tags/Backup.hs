@@ -1,3 +1,4 @@
+{-# LANGUAGE OverloadedStrings #-}
 module Distribution.Server.Features.Tags.Backup (
     tagsBackup,
     aliasBackup,
@@ -14,8 +15,8 @@ import Distribution.Server.Framework.BackupRestore
 
 import Distribution.Package
 import Distribution.Text (display)
+import qualified Data.ByteString.Char8 as BS8
 
-import Text.CSV (CSV, Record)
 import qualified Data.Map as Map
 import qualified Data.Set as Set
 
@@ -51,48 +52,19 @@ updateAlias tagAliases = RestoreBackup {
   , restoreFinalize = return tagAliases
   }
 
+-- One row per (package, tag). Tags are accumulated per package.
 updateFromCSV :: CSV -> PackageTags -> Restore PackageTags
 updateFromCSV = concatM . map fromRecord
   where
     fromRecord :: Record -> PackageTags -> Restore PackageTags
-    fromRecord (packageField:tagFields) tagsState | not (null tagFields) = do
+    fromRecord [packageField, tagField] tagsState = do
       pkgname <- parseText "package name" packageField
-      tags <- mapM (parseText "tag") tagFields
-      return (setTags pkgname (Set.fromList tags) tagsState)
+      tag <- parseText "tag" tagField
+      let existing = Map.findWithDefault Set.empty pkgname (packageTags tagsState)
+      return (setTags pkgname (Set.insert tag existing) tagsState)
     fromRecord x _ = fail $ "Invalid tags record: " ++ show x
 
-updateFromCSVA :: CSV -> TagAlias -> Restore TagAlias
-updateFromCSVA = concatM . map fromRecord
-  where
-    fromRecord :: Record -> TagAlias -> Restore TagAlias
-    fromRecord (canonical:aliases) tagsAlias | not (null aliases) = do
-      tag <- parseText "tag" canonical
-      alias <- mapM (parseText "tag") aliases
-      return (setAliases tag (Set.fromList alias) tagsAlias)
-    fromRecord x _ = fail $ "Invalid tags record: " ++ show x
-
-------------------------------------------------------------------------------
-tagsToCSV :: PackageTags -> CSV
-tagsToCSV = map (\(p, t) -> tagsToRecord p $ Set.toList t)
-          . Map.toList . packageTags
-
-aliasToCSV :: TagAlias -> CSV
-aliasToCSV (TagAlias ta) = map (\(t, a) -> aliasToRecord t $ Set.toList a) . Map.toList $ ta
-
-tagsToRecord :: PackageName -> [Tag] -> Record -- [String]
-tagsToRecord pkgname tags = display pkgname:map display tags
-
-aliasToRecord :: Tag -> [Tag] -> Record -- [String]
-aliasToRecord canonical aliases = display canonical:map display aliases
-
--- | One row per (package, tag, is_addition).
-reviewTagsToCSV :: PackageTags -> CSV
-reviewTagsToCSV = concatMap reviewToRecords . Map.toList . reviewTags
-  where
-    reviewToRecords (pkgname, (additions, deletions)) =
-      [ [display pkgname, display tag, "True"]  | tag <- Set.toList additions ] ++
-      [ [display pkgname, display tag, "False"] | tag <- Set.toList deletions ]
-
+-- One row per (package, tag, is_addition).
 updateFromReviewCSV :: CSV -> PackageTags -> Restore PackageTags
 updateFromReviewCSV = concatM . map fromRecord
   where
@@ -101,9 +73,45 @@ updateFromReviewCSV = concatM . map fromRecord
       pkgname <- parseText "package name" packageField
       tag <- parseText "tag" tagField
       isAdd <- parseRead "is_addition" isAddField
-      let reviews' = if isAdd
+      let (adds, dels) = Map.findWithDefault (Set.empty, Set.empty) pkgname (reviewTags tagsState)
+          reviews' = if isAdd
             then Map.insert pkgname (Set.insert tag adds, dels) (reviewTags tagsState)
             else Map.insert pkgname (adds, Set.insert tag dels) (reviewTags tagsState)
-          (adds, dels) = Map.findWithDefault (Set.empty, Set.empty) pkgname (reviewTags tagsState)
       return tagsState { reviewTags = reviews' }
     fromRecord x _ = fail $ "Invalid review tags record: " ++ show x
+
+-- One row per (canonical, alias).
+updateFromCSVA :: CSV -> TagAlias -> Restore TagAlias
+updateFromCSVA = concatM . map fromRecord
+  where
+    fromRecord :: Record -> TagAlias -> Restore TagAlias
+    fromRecord [canonical, alias] tagsAlias = do
+      tag      <- parseText "tag" canonical
+      aliasTag <- parseText "tag" alias
+      return (setAliases tag (Set.singleton aliasTag) tagsAlias)
+    fromRecord x _ = fail $ "Invalid tag alias record: " ++ show x
+
+------------------------------------------------------------------------------
+-- | One row per (package, tag) — normalized for PostgreSQL COPY.
+tagsToCSV :: PackageTags -> CSV
+tagsToCSV = concatMap (\(p, t) -> map (tagsToRecord p) (Set.toList t))
+          . Map.toList . packageTags
+
+-- | One row per (canonical, alias) — normalized for PostgreSQL COPY.
+aliasToCSV :: TagAlias -> CSV
+aliasToCSV (TagAlias ta) = concatMap (\(t, a) -> map (aliasToRecord t) (Set.toList a)) . Map.toList $ ta
+
+tagsToRecord :: PackageName -> Tag -> Record
+tagsToRecord pkgname tag = [BS8.pack (display pkgname), BS8.pack (display tag)]
+
+aliasToRecord :: Tag -> Tag -> Record
+aliasToRecord canonical alias = [BS8.pack (display canonical), BS8.pack (display alias)]
+
+-- | One row per (package, tag, is_addition).
+-- Additions have is_addition=True, deletions have is_addition=False.
+reviewTagsToCSV :: PackageTags -> CSV
+reviewTagsToCSV = concatMap reviewToRecords . Map.toList . reviewTags
+  where
+    reviewToRecords (pkgname, (additions, deletions)) =
+      [ [BS8.pack (display pkgname), BS8.pack (display tag), "True"]  | tag <- Set.toList additions ] ++
+      [ [BS8.pack (display pkgname), BS8.pack (display tag), "False"] | tag <- Set.toList deletions ]

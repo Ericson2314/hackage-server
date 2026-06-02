@@ -13,13 +13,12 @@ module Distribution.Server.Framework.BackupDump (
     testBlobsExist
   ) where
 
-import Text.CSV hiding (csv)
+import qualified Data.Csv as Csv
 
 import Distribution.Server.Framework.BackupRestore (BackupEntry(..))
 import qualified Distribution.Server.Framework.BlobStorage as Blob
 import Distribution.Server.Framework.BlobStorage (BlobStorage, BlobId)
 import Distribution.Server.Framework.Logging
-import Distribution.Server.Util.Parse (packUTF8)
 
 import qualified Data.ByteString.Lazy as BS
 import qualified Codec.Compression.GZip as GZip (compress)
@@ -186,8 +185,8 @@ exportError err = fail $ "Error in export: " ++ err
 mkTarPath :: FilePath -> String -> [FilePath] -> FilePath
 mkTarPath tarfileName featureName ps = joinPath (tarfileName : featureName : ps)
 
-csvToBackup :: [String] -> CSV -> BackupEntry
-csvToBackup fpath csv = BackupByteString fpath $ packUTF8 (printCSV csv)
+csvToBackup :: Csv.ToRecord a => [String] -> [a] -> BackupEntry
+csvToBackup fpath rows = BackupByteString fpath $ Csv.encode rows
 
 blobToBackup :: [String] -> BlobId -> BackupEntry
 blobToBackup = BackupBlob

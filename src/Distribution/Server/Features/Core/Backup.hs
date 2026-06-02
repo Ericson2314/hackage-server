@@ -1,5 +1,6 @@
-{-# LANGUAGE PatternGuards   #-}
-{-# LANGUAGE RecordWildCards #-}
+{-# LANGUAGE OverloadedStrings #-}
+{-# LANGUAGE PatternGuards     #-}
+{-# LANGUAGE RecordWildCards   #-}
 module Distribution.Server.Features.Core.Backup (
     packagesBackup,
     indexToAllVersions,
@@ -28,7 +29,6 @@ import Distribution.PackageDescription.Parsec (parseGenericPackageDescription, r
 import Distribution.Parsec (showPError)
 import Distribution.Text
 import Data.Version (Version(..), showVersion)
-import Text.CSV
 
 import Control.Arrow (first)
 import Data.Map (Map)
@@ -42,6 +42,7 @@ import Data.List.NonEmpty (toList)
 import Data.Ord (comparing)
 import Control.Monad
 import qualified Distribution.Server.Util.GZip as GZip
+import qualified Data.ByteString.Char8 as BS8
 import qualified Data.ByteString.Lazy as BS
 import qualified Data.ByteString.Lazy.Char8 as BSC
 import System.FilePath ((</>))
@@ -78,12 +79,14 @@ data TarballInfo = TarballInfo {
   }
 
 pkgTarballToInfo :: PkgTarball -> TarballInfo
-pkgTarballToInfo tarball = TarballInfo {
-    infoTarGzMD5    = blobInfoId         . pkgTarballGz   $ tarball
-  , infoTarGzLength = blobInfoLength     . pkgTarballGz   $ tarball
-  , infoTarGzSHA256 = blobInfoHashSHA256 . pkgTarballGz   $ tarball
-  , infoTarMD5      =                      pkgTarballNoGz $ tarball
+pkgTarballToInfo PkgTarball{..} = TarballInfo {
+    infoTarGzMD5    = blobInfoId         pkgTarballGz
+  , infoTarGzLength = blobInfoLength     pkgTarballGz
+  , infoTarGzSHA256 = blobInfoHashSHA256 pkgTarballGz
+  , infoTarMD5      =                    pkgTarballNoGz
   }
+pkgTarballToInfo (PkgTarball_v2_v1 _) =
+  error "pkgTarballToInfo: unmigrated PkgTarball_v2_v1 — run the server to complete migration before backup"
 
 doPackageImport :: PartialIndex -> BackupEntry -> Restore PartialIndex
 doPackageImport (PartialIndex packages updatelog) entry = case entry of
@@ -327,7 +330,7 @@ cabalListToExport pkgId cabalInfos =
 
     cabalMetadata :: CSV
     cabalMetadata =
-          [showVersion versionCSVVer]
+          [BS8.pack (showVersion versionCSVVer)]
         : versionCSVKey
         : map metadataEntry (zip [0..] infos)
       where
@@ -336,9 +339,9 @@ cabalListToExport pkgId cabalInfos =
 
     metadataEntry :: (Int, UploadInfo) -> Record
     metadataEntry (index, (time, user)) = [
-        show (index :: Int)
+        BS8.pack (show (index :: Int))
       , formatUTCTime time
-      , display user
+      , BS8.pack (display user)
       ]
 
 tarballListToExport :: PackageId -> [(PkgTarball, UploadInfo)] -> [BackupEntry]
@@ -355,7 +358,7 @@ tarballListToExport pkgId tarballInfos =
 
     tarballMetadata :: CSV
     tarballMetadata =
-          [showVersion versionCSVVer]
+          [BS8.pack (showVersion versionCSVVer)]
         : versionCSVKey
         : map metadataEntry (zip [0..] (map (first pkgTarballToInfo) tarballInfos))
       where
@@ -374,13 +377,13 @@ tarballListToExport pkgId tarballInfos =
 
     metadataEntry :: (Int, (TarballInfo, UploadInfo)) -> Record
     metadataEntry (index, (TarballInfo{..}, (time, user))) = [
-        show (index :: Int)
+        BS8.pack (show (index :: Int))
       , formatUTCTime time
-      , display user
-      , blobMd5 infoTarGzMD5
-      , show    infoTarGzLength
-      , show    infoTarGzSHA256
-      , blobMd5 infoTarMD5
+      , BS8.pack (display user)
+      , BS8.pack ("\\x" ++ blobMd5 infoTarGzMD5)
+      , BS8.pack (show    infoTarGzLength)
+      , BS8.pack ("\\x" ++ show infoTarGzSHA256)
+      , BS8.pack ("\\x" ++ blobMd5 infoTarMD5)
       ]
 
 pkgPath :: PackageId -> String -> [String]
@@ -393,56 +396,67 @@ packageUpdateLogToExport :: Seq TarIndexEntry -> BackupEntry
 packageUpdateLogToExport = csvToBackup ["updatelog.csv"]
                          . packageUpdateLogToCSV
 
+-- | Export update log as fixed-width CSV matching the @package_update_log@ schema:
+-- @entry_type, pkg_name, pkg_version, revision, timestamp, user_id, user_name, file_path, file_data@
 packageUpdateLogToCSV :: Seq TarIndexEntry -> CSV
 packageUpdateLogToCSV updlog =
-    [showVersion versionCSVVer] : map entryToCSV (Foldable.toList updlog)
+    [BS8.pack (showVersion versionCSVVer)]
+  : [ "entry_type", "pkg_name", "pkg_version", "revision"
+    , "timestamp", "user_id", "user_name", "file_path", "file_data"
+    ]
+  : map entryToCSV (Foldable.toList updlog)
   where
-    versionCSVVer = Version [0,1] []
+    versionCSVVer = Version [0,2] []
+    n = "\\N"
     entryToCSV (CabalFileEntry pkgid revno time uid username) =
       [ "cabal"
-      , display pkgid
-      , show revno
+      , BS8.pack (display (packageName pkgid))
+      , BS8.pack (display (packageVersion pkgid))
+      , BS8.pack (show revno)
       , formatUTCTime time
-      , display uid
-      , display username
+      , BS8.pack (display uid)
+      , BS8.pack (display username)
+      , n, n
       ]
-    -- TODO: Currently ExtraEntry is used only for preferred-versions, so this
-    -- way to back them up is probably okay. If these files get more complicated
-    -- we should probably store them as separate files instead.
     entryToCSV (ExtraEntry extrapath content time) =
       [ "extra"
-      , extrapath
+      , n, n, n
       , formatUTCTime time
-      , BSC.unpack content
+      , n, n
+      , BS8.pack extrapath
+      , BS.toStrict content
       ]
     entryToCSV (MetadataEntry pkgid revno time) =
       [ "metadata"
-      , display pkgid
-      , show revno
+      , BS8.pack (display (packageName pkgid))
+      , BS8.pack (display (packageVersion pkgid))
+      , BS8.pack (show revno)
       , formatUTCTime time
+      , n, n, n, n
       ]
 
 importTarIndexEntries :: CSV -> Restore (Seq TarIndexEntry)
-importTarIndexEntries = fmap Seq.fromList . mapM fromRecord . drop 1
+importTarIndexEntries = fmap Seq.fromList . mapM fromRecord . drop 2
   where
     fromRecord :: Record -> Restore TarIndexEntry
-    fromRecord ["cabal", strPkgid, strRevno, strTime, strUid, username] = do
-       pkgid    <- parseText    "pkgid"     strPkgid
+    -- New fixed-width format (v0.2): entry_type, pkg_name, pkg_version, revision, timestamp, user_id, user_name, file_path, file_data
+    fromRecord ["cabal", strName, strVer, strRevno, strTime, strUid, username, _, _] = do
+       pkgName  <- parseText    "pkg_name"  strName
+       pkgVer   <- parseText    "pkg_ver"   strVer
        revno    <- parseRead    "revno"     strRevno
        utcTime  <- parseUTCTime "time"      strTime
        uid      <- parseText    "uid"       strUid
-       -- We don't use parseText for the username because this would throw
-       -- an error if the username is empty
-       return $ CabalFileEntry pkgid revno utcTime uid (UserName username)
+       return $ CabalFileEntry (PackageIdentifier pkgName pkgVer) revno utcTime uid (UserName (BS8.unpack username))
 
-    fromRecord ["extra", extrapath, strTime, extracontent] = do
+    fromRecord ["extra", _, _, _, strTime, _, _, extrapath, extracontent] = do
        utcTime <- parseUTCTime "time" strTime
-       return $ ExtraEntry extrapath (BSC.pack extracontent) utcTime
+       return $ ExtraEntry (BS8.unpack extrapath) (BS.fromStrict extracontent) utcTime
 
-    fromRecord ["metadata", strPkgid, strRevno, strTime] = do
-       pkgid    <- parseText    "pkgid"     strPkgid
+    fromRecord ["metadata", strName, strVer, strRevno, strTime, _, _, _, _] = do
+       pkgName  <- parseText    "pkg_name"  strName
+       pkgVer   <- parseText    "pkg_ver"   strVer
        revno    <- parseRead    "revno"     strRevno
        utcTime  <- parseUTCTime "time"      strTime
-       return $ MetadataEntry pkgid revno utcTime
+       return $ MetadataEntry (PackageIdentifier pkgName pkgVer) revno utcTime
 
     fromRecord x = fail $ "Error index entries list: " ++ show x

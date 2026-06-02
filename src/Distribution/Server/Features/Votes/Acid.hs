@@ -4,6 +4,7 @@ module Distribution.Server.Features.Votes.Acid
   ) where
 
 import Distribution.Server.Features.Votes.Store
+import Distribution.Server.Features.Votes.Backup (votesBackup, votesRestore)
 import qualified Distribution.Server.Features.Votes.State as Acid
 
 import Distribution.Server.Framework
@@ -37,9 +38,6 @@ votesStateComponent stateDir = do
     , getState     = query st Acid.GetVotesState
     , putState     = update st . Acid.ReplaceVotesState
     , resetState   = votesStateComponent
-    , backupState  = \_ _ -> []
-    , restoreState = RestoreBackup {
-                         restoreEntry    = error "Unexpected backup entry"
-                       , restoreFinalize = return $ Acid.VotesState Map.empty
-                       }
+    , backupState  = \_ st -> votesBackup st
+    , restoreState = votesRestore
    }

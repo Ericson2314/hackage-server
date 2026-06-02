@@ -1,5 +1,6 @@
 {-# LANGUAGE RecordWildCards #-}
 {-# LANGUAGE NamedFieldPuns  #-}
+{-# LANGUAGE OverloadedStrings  #-}
 module Distribution.Server.Features.Security.Backup (
     securityBackup
   , securityRestore
@@ -9,7 +10,7 @@ module Distribution.Server.Features.Security.Backup (
 import Control.Monad.State (StateT, execStateT, modify)
 import Data.Time
 import Data.Version (Version(..), showVersion)
-import Text.CSV hiding (csv)
+import qualified Data.ByteString.Char8 as BS8
 import qualified Data.ByteString.Lazy as BS.Lazy
 
 -- hackage
@@ -70,9 +71,9 @@ securityBackup st =
 -- > "snapshot"  , <snapshot version>
 exportSecurityState :: SecurityState -> CSV
 exportSecurityState SecurityState{..} = [
-      [showVersion versionCSVVer]
-    , ["version", "timestamp", show securityTimestampVersion]
-    , ["version", "snapshot",  show securitySnapshotVersion]
+      [BS8.pack (showVersion versionCSVVer)]
+    , ["version", "timestamp", BS8.pack (show securityTimestampVersion)]
+    , ["version", "snapshot",  BS8.pack (show securitySnapshotVersion)]
     ] ++ case securityStateFiles of
            Nothing -> []
            Just SecurityStateFiles{..} -> [
@@ -84,8 +85,8 @@ exportSecurityState SecurityState{..} = [
     versionCSVVer = Version [0,2] []
 
     fileInfoCSV file FileInfo{..} =
-      ["update", "info", file, show fileInfoLength, show fileInfoSHA256] ++
-      [ show x | Just x <- [fileInfoMD5] ]
+      ["update", "info", file, BS8.pack (show fileInfoLength), BS8.pack ("\\x" ++ show fileInfoSHA256)] ++
+      [ BS8.pack ("\\x" ++ show x) | Just x <- [fileInfoMD5] ]
 
 {-------------------------------------------------------------------------------
   Restore

@@ -22,14 +22,14 @@ import Distribution.Version
 import Distribution.Text
          ( display, simpleParse )
 
-import Text.CSV
-         ( CSV )
 import Network.URI
          ( URI, parseURI )
 import Data.Either
          ( partitionEithers )
 
 import Prelude hiding (read)
+
+type CSV = [[String]]
 
 data Entry = Entry PackageName Version (Maybe URI)
   deriving (Eq, Show)

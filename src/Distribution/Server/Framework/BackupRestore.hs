@@ -14,6 +14,7 @@ module Distribution.Server.Framework.BackupRestore (
     importBlank,
 
     importCSV,
+    CSV, Record,
     parseText,
     parseRead,
     parseUTCTime, formatUTCTime,
@@ -21,6 +22,8 @@ module Distribution.Server.Framework.BackupRestore (
     parseBlobId,
     parseSHA,
     parseMD5,
+    toPgArray,
+    parsePgArray,
 
     equalTarBall,
 
@@ -61,13 +64,14 @@ import Data.Typeable (typeOf)
 
 import Distribution.Parsec (Parsec(..))
 import Distribution.Server.Util.Merge
-import Distribution.Server.Util.Parse (unpackUTF8)
 import Data.ByteString.Lazy (ByteString)
 import qualified Data.ByteString.Lazy as BS (readFile)
+import qualified Data.ByteString.Char8 as BS8
+import qualified Data.Csv as Csv
+import qualified Data.Vector as Vector
 import qualified Data.Map as Map
 import System.FilePath ((</>), takeDirectory, splitDirectories)
 import System.Directory (doesFileExist, doesDirectoryExist)
-import Text.CSV hiding (csv)
 import Distribution.Text
 import Data.Map (Map)
 import Data.Version (Version)
@@ -146,68 +150,116 @@ instance Semigroup AbstractRestoreBackup where
 concatM :: (Monad m) => [a -> m a] -> (a -> m a)
 concatM fs = foldr (>=>) return fs
 
-importCSV :: (Monad m, MonadFail m) => FilePath -> ByteString -> m CSV
-importCSV filename inp = case parseCSV filename (unpackUTF8 inp) of
-    Left err  -> fail (show err)
-    Right csv -> return (chopLastRecord csv)
-  where
-    -- | Chops off the last entry if it's null.
-    -- I'm not sure why parseCSV does this, but it's
-    -- irritating.
-    chopLastRecord [] = []
-    chopLastRecord ([""]:[]) = []
-    chopLastRecord (x:xs) = x : chopLastRecord xs
+-- | Transitional type aliases. Callers should migrate to typed
+-- cassava records ('Csv.ToRecord' / 'Csv.FromRecord').
+type CSV    = [[BS8.ByteString]]
+type Record = [BS8.ByteString]
 
-parseRead :: forall a m. (Read a, Monad m, MonadFail m, Typeable a) => String -> String -> m a
-parseRead label str = case readConsume reads str of
+-- | Parse CSV using cassava, returning rows as @[[ByteString]]@.
+-- This is a transitional function; callers should migrate to typed
+-- cassava decoding.
+importCSV :: (Monad m, MonadFail m) => FilePath -> ByteString -> m [[BS8.ByteString]]
+importCSV filename inp =
+    case Csv.decode Csv.NoHeader inp :: Either String (Vector.Vector (Vector.Vector BS8.ByteString)) of
+      Left err  -> fail $ "Error parsing CSV " ++ filename ++ ": " ++ err
+      Right rows -> return
+        [ Vector.toList row
+        | row <- Vector.toList rows
+        , not (isBlankRow row)
+        ]
+  where
+    isBlankRow row = Vector.length row == 1 && Vector.head row == BS8.empty
+
+parseRead :: forall a m. (Read a, Monad m, MonadFail m, Typeable a) => String -> BS8.ByteString -> m a
+parseRead label bs = case readConsume reads (BS8.unpack bs) of
     [value] -> return value
     _       -> fail $ "Unable to 'read' " ++ label ++ " "
-                   ++ show str
+                   ++ show bs
                    ++ " as type " ++ show (typeOf (undefined :: a))
 
-parseUTCTime :: (Monad m, MonadFail m, MonadError String m) => String -> String -> m UTCTime
-parseUTCTime label str =
-    case parseTimeMaybe timeFormatSpec str of
-      Nothing -> throwError $ "Unable to parse UTC timestamp " ++ label ++ ": " ++ str
+parseUTCTime :: (Monad m, MonadFail m, MonadError String m) => String -> BS8.ByteString -> m UTCTime
+parseUTCTime label bs =
+    case parseTimeMaybe timeFormatSpec (BS8.unpack bs) of
+      Nothing -> throwError $ "Unable to parse UTC timestamp " ++ label ++ ": " ++ show bs
       Just x  -> return x
 
-formatUTCTime :: UTCTime -> String
-formatUTCTime = Time.formatTime defaultTimeLocale timeFormatSpec
+formatUTCTime :: UTCTime -> BS8.ByteString
+formatUTCTime = BS8.pack . Time.formatTime defaultTimeLocale timeFormatSpec
 
 timeFormatSpec :: String
 timeFormatSpec = "%Y-%m-%d %H:%M:%S%Q %z"
 
--- Parse a string, throw an error if it's bad
-parseText :: forall a m. (Parsec a, Monad m, MonadFail m, Typeable a) => String -> String -> m a
-parseText label text = case simpleParse text of
+parseText :: forall a m. (Parsec a, Monad m, MonadFail m, Typeable a) => String -> BS8.ByteString -> m a
+parseText label bs = case simpleParse (BS8.unpack bs) of
     Nothing -> fail $ "Unable to 'simpleParse' " ++ label ++ " "
-                   ++ show text
+                   ++ show bs
                    ++ " as type " ++ show (typeOf (undefined :: a))
     Just a -> return a
 
-parseVersion :: (Monad m, MonadFail m) => String -> String -> m Version
-parseVersion label str = case readConsume (readP_to_S Version.parseVersion) str of
+parseVersion :: (Monad m, MonadFail m) => String -> BS8.ByteString -> m Version
+parseVersion label bs = case readConsume (readP_to_S Version.parseVersion) (BS8.unpack bs) of
     [value] -> return value
-    _       -> fail $ "Unable to parse " ++ label ++ " " ++ show str
+    _       -> fail $ "Unable to parse " ++ label ++ " " ++ show bs
 
-parseBlobId :: (Monad m, MonadFail m) => String -> String -> m BlobId
-parseBlobId label str = case Blob.readBlobId str of
+parseBlobId :: (Monad m, MonadFail m) => String -> BS8.ByteString -> m BlobId
+parseBlobId label bs = case Blob.readBlobId (stripByteaHex (BS8.unpack bs)) of
     Right blobId -> return blobId
-    Left  err    -> fail $ "Unable to parse " ++ label ++ show str ++ ": " ++ err
+    Left  err    -> fail $ "Unable to parse " ++ label ++ show bs ++ ": " ++ err
 
-parseSHA :: (Monad m, MonadFail m) => String -> String -> m SHA256Digest
-parseSHA label str = case readDigest str of
+parseSHA :: (Monad m, MonadFail m) => String -> BS8.ByteString -> m SHA256Digest
+parseSHA label bs = case readDigest (stripByteaHex (BS8.unpack bs)) of
     Right digest -> return digest
-    Left  err    -> fail $ "Unable to parse " ++ label ++ show str ++ ": " ++ err
+    Left  err    -> fail $ "Unable to parse " ++ label ++ show bs ++ ": " ++ err
 
-parseMD5 :: (Monad m, MonadFail m) => String -> String -> m MD5Digest
-parseMD5 label str = case readDigest str of
+parseMD5 :: (Monad m, MonadFail m) => String -> BS8.ByteString -> m MD5Digest
+parseMD5 label bs = case readDigest (stripByteaHex (BS8.unpack bs)) of
     Right digest -> return digest
-    Left  err    -> fail $ "Unable to parse " ++ label ++ show str ++ ": " ++ err
+    Left  err    -> fail $ "Unable to parse " ++ label ++ show bs ++ ": " ++ err
+
+-- | Strip the @\\x@ prefix used by PostgreSQL BYTEA hex format.
+stripByteaHex :: String -> String
+stripByteaHex ('\\':'x':rest) = rest
+stripByteaHex s               = s
 
 -- | Variation on 'read' that only returns matches that consume entire input.
 readConsume :: ReadS a -> String -> [a]
 readConsume p = map fst . filter (null . snd) . p
+
+-- | Serialize a list of 'ByteString's as a PostgreSQL array literal,
+-- e.g. @{foo,"bar,baz"}@. Elements containing special characters are
+-- double-quoted with backslash escaping.
+toPgArray :: [BS8.ByteString] -> BS8.ByteString
+toPgArray xs = BS8.concat
+  [ BS8.singleton '{'
+  , BS8.intercalate (BS8.singleton ',') (map pgQuote xs)
+  , BS8.singleton '}'
+  ]
+  where
+    pgQuote s
+      | BS8.any (\c -> c == ',' || c == '{' || c == '}' || c == '"' || c == '\\') s
+        = BS8.concat [BS8.singleton '"', BS8.concatMap esc s, BS8.singleton '"']
+      | BS8.null s = BS8.pack "\"\""
+      | otherwise  = s
+    esc '"'  = BS8.pack "\\\""
+    esc '\\' = BS8.pack "\\\\"
+    esc c    = BS8.singleton c
+
+-- | Parse a PostgreSQL array literal back to a list of 'ByteString's.
+parsePgArray :: BS8.ByteString -> [BS8.ByteString]
+parsePgArray bs = case BS8.unpack bs of
+    "{}" -> []
+    '{':rest -> go rest
+    _ -> []
+  where
+    go ('"':xs) = let (el, after) = parseQuoted xs in BS8.pack el : cont after
+    go xs       = let (el, after) = break (\c -> c == ',' || c == '}') xs
+                   in BS8.pack el : cont after
+    cont (',':xs) = go xs
+    cont _        = []
+    parseQuoted ('\\':c:cs) = let (r, a) = parseQuoted cs in (c:r, a)
+    parseQuoted ('"':cs)    = ([], cs)
+    parseQuoted (c:cs)      = let (r, a) = parseQuoted cs in (c:r, a)
+    parseQuoted []          = ([], [])
 
 {-------------------------------------------------------------------------------
   Restore Monad

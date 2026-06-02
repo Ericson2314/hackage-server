@@ -5,7 +5,7 @@ module Distribution.Server.Features.Vouch.Acid
 import qualified Distribution.Server.Features.Vouch.State as Acid
 import qualified Distribution.Server.Features.Vouch.Store as Store
 import Distribution.Server.Framework
-import Distribution.Server.Framework.BackupRestore (RestoreBackup(..))
+import Distribution.Server.Features.Vouch.Backup (vouchBackup, vouchRestore)
 
 import qualified Data.Set as Set
 
@@ -30,18 +30,12 @@ acidStore stateDir = do
 vouchStateComponent :: FilePath -> IO (StateComponent AcidState Acid.VouchData)
 vouchStateComponent stateDir = do
   st <- openLocalStateFrom (stateDir </> "db" </> "Vouch") (Acid.VouchData mempty mempty)
-  let initialVouchData = Acid.VouchData mempty mempty
-      restore =
-        RestoreBackup
-          { restoreEntry = error "Unexpected backup entry"
-          , restoreFinalize = return initialVouchData
-          }
   pure StateComponent
     { stateDesc = "Keeps track of vouches"
     , stateHandle = st
     , getState = query st Acid.GetVouchesData
     , putState = update st . Acid.ReplaceVouchesData
-    , backupState = \_ _ -> []
-    , restoreState = restore
+    , backupState = \_ st -> vouchBackup st
+    , restoreState = vouchRestore
     , resetState = vouchStateComponent
     }

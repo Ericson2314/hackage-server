@@ -1,3 +1,4 @@
+{-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE RecordWildCards #-}
 
 module Distribution.Server.Features.UserSignup.Backup where
@@ -10,11 +11,11 @@ import Distribution.Server.Framework.BackupRestore
 
 import Distribution.Server.Util.Nonce
 
+import qualified Data.ByteString.Char8 as BS8
 import qualified Data.Map as Map
 import qualified Data.Text as T
 
 import Distribution.Text (display)
-import Text.CSV (CSV, Record)
 
 ----------------------------
 -- Data backup and restore
@@ -49,11 +50,11 @@ importSignupInfo = mapM fromRecord . drop 2
     fromRecord :: Record -> Restore (Nonce, SignupResetInfo)
     fromRecord [nonceStr, usernameStr, realnameStr, emailStr, timestampStr] = do
         timestamp <- parseUTCTime "timestamp" timestampStr
-        nonce <- parseNonceM nonceStr
+        nonce <- parseNonceM (BS8.unpack nonceStr)
         let signupinfo = SignupInfo {
-              signupUserName     = T.pack usernameStr,
-              signupRealName     = T.pack realnameStr,
-              signupContactEmail = T.pack emailStr,
+              signupUserName     = T.pack (BS8.unpack usernameStr),
+              signupRealName     = T.pack (BS8.unpack realnameStr),
+              signupContactEmail = T.pack (BS8.unpack emailStr),
               nonceTimestamp     = timestamp
             }
         return (nonce, signupinfo)
@@ -64,12 +65,12 @@ signupInfoToCSV backuptype (State.SignupResetTable tbl)
     = ["0.1"]
     : [ "token", "username", "realname", "email", "timestamp" ]
     : [ [ if backuptype == FullBackup
-          then renderNonce nonce
+          then BS8.pack (renderNonce nonce)
           else ""
-        , T.unpack signupUserName
-        , T.unpack signupRealName
+        , BS8.pack (T.unpack signupUserName)
+        , BS8.pack (T.unpack signupRealName)
         , if backuptype == FullBackup
-          then T.unpack signupContactEmail
+          then BS8.pack (T.unpack signupContactEmail)
           else "hidden-email@nowhere.org"
         , formatUTCTime nonceTimestamp
         ]
@@ -82,7 +83,7 @@ importResetInfo = mapM fromRecord . drop 2
     fromRecord [nonceStr, useridStr, timestampStr] = do
         userid <- parseText "userid" useridStr
         timestamp <- parseUTCTime "timestamp" timestampStr
-        nonce <- parseNonceM nonceStr
+        nonce <- parseNonceM (BS8.unpack nonceStr)
         let signupinfo = ResetInfo {
               resetUserId    = userid,
               nonceTimestamp = timestamp
@@ -95,9 +96,9 @@ resetInfoToCSV backuptype (State.SignupResetTable tbl)
     = ["0.1"]
     : [ "token", "userid", "timestamp" ]
     : [ [ if backuptype == FullBackup
-          then renderNonce nonce
+          then BS8.pack (renderNonce nonce)
           else ""
-        , display resetUserId
+        , BS8.pack (display resetUserId)
         , formatUTCTime nonceTimestamp
         ]
       | (nonce, ResetInfo{..}) <- Map.toList tbl ]

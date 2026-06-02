@@ -18,8 +18,8 @@ import Distribution.Server.Framework.BackupDump
 import Distribution.Server.Framework.BackupRestore
 
 import Distribution.Text
-import Text.CSV (CSV, Record)
 
+import qualified Data.ByteString.Char8 as BS8
 import Data.Version
 import qualified Data.Map as Map
 import Data.Map (Map)
@@ -68,7 +68,7 @@ importDistro csv dists = \versions -> do
     fromRecord distro [packageStr, versionStr, uri] versions = do
         package <- parseText "package name" packageStr
         version <- parseText "version" versionStr
-        return (Distros.addPackage distro package (DistroPackageInfo version uri) versions)
+        return (Distros.addPackage distro package (DistroPackageInfo version (BS8.unpack uri)) versions)
     fromRecord _ x _ = fail $ "Invalid distribution record " ++ show x
 
 addDistribution :: DistroName -> Distributions -> Restore Distributions
@@ -81,10 +81,11 @@ importMaintainers :: CSV -> Map DistroName UserIdSet -> Restore (Map DistroName 
 importMaintainers = concatM . map fromRecord . drop 2
   where
     fromRecord :: Record -> Map DistroName UserIdSet -> Restore (Map DistroName UserIdSet)
-    fromRecord (distroStr:idStr) maintainers = do
+    fromRecord [distroStr, idStr] maintainers = do
         distro <- parseText "distribution name" distroStr
-        uids <- mapM (parseText "user id") idStr
-        return (Map.insert distro (UserIdSet.fromList uids) maintainers)
+        uid    <- parseText "user id" idStr
+        let existing = Map.findWithDefault UserIdSet.empty distro maintainers
+        return (Map.insert distro (UserIdSet.unions [existing, UserIdSet.fromList [uid]]) maintainers)
     fromRecord x _ = fail $ "Invalid distro maintainer record: " ++ show x
 
 --------------------------------------------------------------------------
@@ -96,14 +97,15 @@ distroUsersToExport distros =
                . Map.toList
                $ Distros.nameMap distros
 
+-- | One row per (distro, user_id) — normalized for PostgreSQL COPY.
 distroUsersToCSV :: [(DistroName, [UserId])] -> CSV
 distroUsersToCSV users =
-    [showVersion distrosCSVVer]
+    [BS8.pack (showVersion distrosCSVVer)]
   : distrosCSVKey
-  : map (\(name, uids) -> display name : map display uids) users
+  : [ [BS8.pack (display name), BS8.pack (display uid)] | (name, uids) <- users, uid <- uids ]
   where
-    distrosCSVKey = ["distro", "maintainers"]
-    distrosCSVVer = Version [0,1] ["unstable"]
+    distrosCSVKey = [BS8.pack "distro", BS8.pack "maintainer"]
+    distrosCSVVer = Version [0,2] ["unstable"]
 
 distrosToExport :: Distributions -> DistroVersions -> [BackupEntry]
 distrosToExport dists distInfo = map distroEntry (Distros.enumerate dists)
@@ -112,13 +114,13 @@ distrosToExport dists distInfo = map distroEntry (Distros.enumerate dists)
 distroToCSV :: DistroName -> DistroVersions -> CSV
 distroToCSV distro distInfo
     = let stats = Distros.distroStatus distro distInfo
-      in ([showVersion distrosCSVVer]:) $
-         ([display distro]:) $
+      in ([BS8.pack (showVersion distrosCSVVer)]:) $
+         ([BS8.pack (display distro)]:) $
          (distrosCSVKey:) $
          flip map stats . uncurry $
            \name (DistroPackageInfo version url) ->
-               [display name, display version, url]
+               [BS8.pack (display name), BS8.pack (display version), BS8.pack url]
   where
-    distrosCSVKey = ["package", "version", "url"]
+    distrosCSVKey = [BS8.pack "package", BS8.pack "version", BS8.pack "url"]
     distrosCSVVer = Version [0,1] ["unstable"]
 

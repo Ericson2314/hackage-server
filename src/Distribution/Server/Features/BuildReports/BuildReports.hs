@@ -22,6 +22,7 @@ module Distribution.Server.Features.BuildReports.BuildReports (
     lookupReport,
     lookupPackageReports,
     unsafeSetReport,
+    unsafeSetReportFull,
     setFailStatus,
     resetFailCount,
     lookupLatestReport,
@@ -145,9 +146,13 @@ addReport pkgid (brpt,blog,btest) buildReports =
     in (buildReports { reportsIndex = Map.insert pkgid pkgReports' (reportsIndex buildReports) }, reportId)
 
 unsafeSetReport :: PackageId -> BuildReportId -> (BuildReport, Maybe BuildLog) -> BuildReports -> BuildReports
-unsafeSetReport pkgid reportId (brpt,blog) buildReports =
+unsafeSetReport pkgid reportId (brpt,blog) =
+    unsafeSetReportFull pkgid reportId (brpt,blog,Nothing,Nothing,Nothing)
+
+unsafeSetReportFull :: PackageId -> BuildReportId -> (BuildReport, Maybe BuildLog, Maybe TestLog, Maybe BuildCovg, Maybe TestReportLog) -> BuildReports -> BuildReports
+unsafeSetReportFull pkgid reportId entry buildReports =
     let pkgReports  = Map.findWithDefault emptyPkgReports pkgid (reportsIndex buildReports)
-        pkgReports' = PkgBuildReports { reports = Map.insert reportId (brpt,blog,Nothing,Nothing,Nothing) (reports pkgReports)
+        pkgReports' = PkgBuildReports { reports = Map.insert reportId entry (reports pkgReports)
                                       , nextReportId = max (incrementReportId reportId) (nextReportId pkgReports)
                                       , buildStatus = buildStatus pkgReports
                                       , runTests = runTests pkgReports }

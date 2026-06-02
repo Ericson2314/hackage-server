@@ -20,7 +20,7 @@ import Distribution.Server.Framework.BackupDump
 import Distribution.Server.Framework.BackupRestore
 import Distribution.Text (display)
 import Data.Version
-import Text.CSV (CSV, Record)
+import qualified Data.ByteString.Char8 as BS8
 import qualified Data.Map as M
 import qualified Data.Text as T
 
@@ -53,13 +53,13 @@ importAuth = concatM . map fromRecord . drop 2
     fromRecord [idStr, nameStr, "enabled", auth] users = do
         uid   <- parseText "user id"   idStr
         uname <- parseText "user name" nameStr
-        let uauth = UserAuth (PasswdHash auth)
+        let uauth = UserAuth (PasswdHash (BS8.unpack auth))
         insertUser users uid $ UserInfo uname (AccountEnabled uauth) M.empty
     fromRecord [idStr, nameStr, "disabled", auth] users = do
         uid   <- parseText "user id"   idStr
         uname <- parseText "user name" nameStr
-        let uauth | null auth = Nothing
-                  | otherwise = Just (UserAuth (PasswdHash auth))
+        let uauth | BS8.null auth = Nothing
+                  | otherwise     = Just (UserAuth (PasswdHash (BS8.unpack auth)))
         insertUser users uid $ UserInfo uname (AccountDisabled uauth) M.empty
     fromRecord [idStr, nameStr, "deleted", ""] users = do
         uid   <- parseText "user id"   idStr
@@ -82,7 +82,7 @@ importAuthTokens = concatM . map fromRecord . drop 2
     fromRecord [idStr, tokenStr, descr] users = do
         uid   <- parseText "user id"    idStr
         token <- parseText "auth token" tokenStr
-        addAuthToken uid token (T.pack descr) users
+        addAuthToken uid token (T.pack (BS8.unpack descr)) users
     fromRecord x _ = fail $ "Error processing auth record: " ++ show x
 
     addAuthToken uid token descr users =
@@ -115,14 +115,14 @@ importGroup csv = do
     return . UserIdSet.fromList $ parsed
   where
     clean xs = if all null xs then [] else xs
-    parseUserId uid = case reads uid of
+    parseUserId uid = case reads (BS8.unpack uid) of
         [(num, "")] -> return num
         _ -> fail $ "Unable to parse user id : " ++ show uid
 
 -------------------------------------------------- Exporting
--- group.csv
+-- group.csv — one row per user ID (normalized for PostgreSQL COPY)
 groupToCSV :: UserIdSet -> CSV
-groupToCSV uidset = [map show (UserIdSet.toList uidset)]
+groupToCSV uidset = map (\uid -> [BS8.pack (show uid)]) (UserIdSet.toList uidset)
 
 
 usersBackup :: BackupType -> Users -> [BackupEntry]
@@ -140,12 +140,12 @@ usersBackup backuptype users =
  -}
 usersToCSV :: BackupType -> Users -> CSV
 usersToCSV backuptype users
-    = ([showVersion userCSVVer]:) $
+    = ([BS8.pack (showVersion userCSVVer)]:) $
       (usersCSVKey:) $
 
       flip map (Users.enumerateAllUsers users) $ \(uid, uinfo) ->
-      [ display uid
-      , display (userName uinfo)
+      [ BS8.pack (display uid)
+      , BS8.pack (display (userName uinfo))
       , infoToStatus uinfo
       , if backuptype == FullBackup
         then infoToAuth uinfo
@@ -161,29 +161,29 @@ usersToCSV backuptype users
        ]
     userCSVVer = Version [0,2] []
 
-    scrubbedAuth :: UserInfo -> String
+    scrubbedAuth :: UserInfo -> BS8.ByteString
     scrubbedAuth userInfo = case userStatus userInfo of
       AccountEnabled        (UserAuth (PasswdHash _))  -> testHash userInfo
       AccountDisabled (Just (UserAuth (PasswdHash _))) -> testHash userInfo
       _                                                -> ""
 
-    testHash :: UserInfo -> String
+    testHash :: UserInfo -> BS8.ByteString
     testHash userInfo = case Auth.newPasswdHash Auth.hackageRealm
                              (userName userInfo) (PasswdPlain "test") of
-                          PasswdHash pwd -> pwd
+                          PasswdHash pwd -> BS8.pack pwd
 
     -- one of "enabled" "disabled" or "deleted"
-    infoToStatus :: UserInfo -> String
+    infoToStatus :: UserInfo -> BS8.ByteString
     infoToStatus userInfo = case userStatus userInfo of
         AccountEnabled  _ -> "enabled"
         AccountDisabled _ -> "disabled"
         AccountDeleted    -> "deleted"
 
     -- may be null
-    infoToAuth :: UserInfo -> String
+    infoToAuth :: UserInfo -> BS8.ByteString
     infoToAuth userInfo = case userStatus userInfo of
-        AccountEnabled        (UserAuth (PasswdHash hash))  -> hash
-        AccountDisabled (Just (UserAuth (PasswdHash hash))) -> hash
+        AccountEnabled        (UserAuth (PasswdHash hash))  -> BS8.pack hash
+        AccountDisabled (Just (UserAuth (PasswdHash hash))) -> BS8.pack hash
         _                                                   -> ""
 
 -- authtokens.csv
@@ -195,15 +195,15 @@ usersToCSV backuptype users
  -}
 authTokensToCSV :: BackupType -> Users -> CSV
 authTokensToCSV backuptype users =
-    [ [showVersion (Version [0,1] [])]
+    [ [BS8.pack (showVersion (Version [0,1] []))]
     , [ "uid"
       , "token"
       , "description"
       ]
     ]
- ++ [ [ display uid
-      , display token
-      , T.unpack descr
+ ++ [ [ BS8.pack (display uid)
+      , BS8.pack (display token)
+      , BS8.pack (T.unpack descr)
       ]
     | backuptype == FullBackup
     , (uid, uinfo)   <- Users.enumerateAllUsers users

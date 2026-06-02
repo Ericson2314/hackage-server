@@ -21,7 +21,9 @@ import Distribution.Package
 
 import Data.List (intercalate)
 import qualified Data.Text as T
-import Text.CSV (parseCSV)
+import qualified Data.Csv as Csv
+import qualified Data.Vector as Vector
+import qualified Data.ByteString.Char8 as BS8
 
 -- TODO:
 -- 1. write an HTML view for this module, and delete the text
@@ -234,17 +236,15 @@ maintainerGroupDescription dname = nullDescription
   }
   where str = display dname
 
--- TODO: This calls parseCSV rather that importCSV -- not sure if that
--- matters (in particular, importCSV chops off the last, extraneous,
--- null entry that parseCSV adds)
-lookCSVFile :: (CSVFile -> ServerPartE Response) -> ServerPartE Response
+lookCSVFile :: ([[String]] -> ServerPartE Response) -> ServerPartE Response
 lookCSVFile func = do
     fileContents <- expectCSV
-    case parseCSV "PUT input" (unpackUTF8 fileContents) of
-      Left err -> badRequest $ toResponse $ "Could not parse CSV File: " ++ show err
-      Right csv -> func (CSVFile csv)
+    case Csv.decode Csv.NoHeader fileContents :: Either String (Vector.Vector (Vector.Vector BS8.ByteString)) of
+      Left err -> badRequest $ toResponse $ "Could not parse CSV File: " ++ err
+      Right rows -> func
+        [ map BS8.unpack (Vector.toList row) | row <- Vector.toList rows ]
 
-packageListToCSV :: [(PackageName, DistroPackageInfo)] -> CSVFile
+packageListToCSV :: [(PackageName, DistroPackageInfo)] -> CSVFile [String]
 packageListToCSV entries
     = CSVFile $ map (\(pn,DistroPackageInfo version url) -> [display pn, display version, url]) entries
 
@@ -252,8 +252,8 @@ isValidDistroURI :: String -> Bool
 isValidDistroURI uri =
   T.pack "https:" `T.isPrefixOf` T.pack uri
 
-csvToPackageList :: CSVFile -> Either String [(PackageName, DistroPackageInfo)]
-csvToPackageList (CSVFile records)
+csvToPackageList :: [[String]] -> Either String [(PackageName, DistroPackageInfo)]
+csvToPackageList records
     = mapM fromRecord records
  where
     fromRecord [packageStr, versionStr, uri]

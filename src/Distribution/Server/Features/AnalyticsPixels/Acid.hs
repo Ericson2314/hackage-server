@@ -4,6 +4,7 @@ module Distribution.Server.Features.AnalyticsPixels.Acid
 
 import qualified Distribution.Server.Features.AnalyticsPixels.State as Acid
 import Distribution.Server.Features.AnalyticsPixels.Store
+import Distribution.Server.Features.AnalyticsPixels.Backup (analyticsPixelsBackup, analyticsPixelsRestore)
 import Distribution.Server.Framework
 import Distribution.Server.Framework.BackupRestore
 
@@ -29,9 +30,6 @@ analyticsPixelsStateComponent stateDir = do
     , getState     = query st Acid.GetAnalyticsPixelsState
     , putState     = update st . Acid.ReplaceAnalyticsPixelsState
     , resetState   = analyticsPixelsStateComponent
-    , backupState  = \_ _ -> []
-    , restoreState = RestoreBackup {
-                         restoreEntry    = error "Unexpected backup entry"
-                       , restoreFinalize = return Acid.initialAnalyticsPixelsState
-                       }
+    , backupState  = \_ st -> analyticsPixelsBackup st
+    , restoreState = analyticsPixelsRestore
    }

@@ -1,3 +1,4 @@
+{-# LANGUAGE OverloadedStrings #-}
 module Distribution.Server.Features.PackageCandidates.Backup where
 
 import Distribution.Server.Framework.BackupRestore
@@ -7,10 +8,10 @@ import Distribution.Server.Features.PackageCandidates.Types
 import Distribution.Server.Features.Core.Backup as CoreBackup
 import qualified Distribution.Server.Packages.PackageIndex as PackageIndex
 import Distribution.Package (PackageId, packageId)
-import Text.CSV (CSV)
 import Data.Version (Version(Version), showVersion)
 import Data.Map (Map)
 import qualified Data.Map as Map
+import qualified Data.ByteString.Char8 as BS8
 
 {-------------------------------------------------------------------------------
   Restore backup
@@ -71,9 +72,9 @@ doCandidateImport candidates (BackupByteString ["package", pkgStr, "candidate.cs
   pkgId <- CoreBackup.parsePackageId pkgStr
   csv <- importCSV "candidate.csv" bs
   partial <- case csv of
-    [_version, ["public", public], "warnings" : warnings] ->
-      return PartialCandidate { partialWarnings = warnings
-                              , partialPublic   = read public
+    [_version, [public], [warningsField]] ->
+      return PartialCandidate { partialWarnings = map BS8.unpack (parsePgArray warningsField)
+                              , partialPublic   = read (BS8.unpack public)
                               }
     _ ->
       fail "candidate.csv has an invalid format"
@@ -100,9 +101,10 @@ backupCandidate candidate =
 -- | Backup the information CandPkgInfo adds on top of PkgInfo
 backupExtraInfo :: CandPkgInfo -> CSV
 backupExtraInfo candidate = [
-    [showVersion versionCSV]
-  , ["public", show (candPublic candidate)]
-  , "warnings" : candWarnings candidate
+    [BS8.pack (showVersion versionCSV)]
+  , [BS8.pack (show (candPublic candidate))]
+  , [toPgArray (map BS8.pack (candWarnings candidate))]
   ]
   where
-    versionCSV = Version [0,1] ["unstable"]
+    versionCSV = Version [0,2] ["unstable"]
+

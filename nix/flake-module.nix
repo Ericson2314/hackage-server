@@ -52,6 +52,16 @@
       HighLevelTest     = mkIntegrationCheck "HighLevelTest" {};
       FeatureTest       = mkIntegrationCheck "FeatureTest" {};
       UserTest          = mkIntegrationCheck "UserTest" {};
+      CsvToPostgresTest = mkIntegrationCheck "CsvToPostgresTest" {
+        extraInputs = [
+          pkgs.postgresql
+          pkgs.gnutar
+          pkgs.gzip
+        ];
+        extraSetup = ''
+          cp ${../datafiles/schema.sql} schema.sql
+        '';
+      };
       UserSignupTest = mkIntegrationCheck "UserSignupTest" {};
     } // lib.optionalAttrs pkgs.stdenv.isLinux {
       nixos-test = import ./test.nix {
@@ -151,6 +161,9 @@
             fontconfig
             freetype
             expat
+
+            # For running CsvToPostgresTest locally
+            postgresql
           ;
         };
         hlsCheck.enable = false;

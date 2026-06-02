@@ -248,6 +248,7 @@ library
     Distribution.Server.Framework.CacheControl
     Distribution.Server.Framework.BackupDump
     Distribution.Server.Framework.BackupRestore
+    Distribution.Server.Framework.CsvInstances
     Distribution.Server.Framework.ServerEnv
     Distribution.Server.Framework.Templating
     Distribution.Server.Framework.HappstackUtils
@@ -415,12 +416,14 @@ library
       Distribution.Server.Features.Sitemap.Functions
       Distribution.Server.Features.Votes
       Distribution.Server.Features.Votes.Acid
+      Distribution.Server.Features.Votes.Backup
       Distribution.Server.Features.Votes.Render
       Distribution.Server.Features.Votes.State
       Distribution.Server.Features.Votes.Store
       Distribution.Server.Features.Votes.Types
       Distribution.Server.Features.Vouch
       Distribution.Server.Features.Vouch.Acid
+      Distribution.Server.Features.Vouch.Backup
       Distribution.Server.Features.Vouch.State
       Distribution.Server.Features.Vouch.Store
       Distribution.Server.Features.Vouch.Types
@@ -441,6 +444,7 @@ library
       Distribution.Server.Features.Tags.Types
       Distribution.Server.Features.AnalyticsPixels
       Distribution.Server.Features.AnalyticsPixels.Acid
+      Distribution.Server.Features.AnalyticsPixels.Backup
       Distribution.Server.Features.AnalyticsPixels.State
       Distribution.Server.Features.AnalyticsPixels.Store
       Distribution.Server.Features.AnalyticsPixels.Types
@@ -496,7 +500,7 @@ library
         -- Note: 0.2.2 added footnoteSpec to gfmExtensions
     , cryptohash-md5        ^>= 0.11.100
     , cryptohash-sha256     ^>= 0.11.100
-    , csv                   ^>= 0.1
+    , cassava               ^>= 0.5
     , ed25519               ^>= 0.0.5
     , hackage-security       >= 0.6 && < 0.7
         -- N.B: hackage-security-0.6.2 uses Cabal-syntax-3.8.1.0
@@ -610,7 +614,7 @@ executable hackage-import
       -- version constraints inherited from hackage-server
     , HTTP
     , async
-    , csv
+    , cassava
 
 ----------------------------------------------------------------------------
 
@@ -651,6 +655,8 @@ library test-utils
     , xml             ^>= 1.3.14
     , io-streams      ^>= 1.5.0.1
     , http-io-streams ^>= 0.1.6.1
+    , tasty           ^>= 1.5
+    , tasty-hunit     ^>= 0.10
 
 -- Integration tests that spin up a full hackage-server process.
 -- Each test suite gets its own port and temp directory, so they
@@ -695,6 +701,16 @@ test-suite UserTest
 
   type:           exitcode-stdio-1.0
   main-is:        UserTest.hs
+
+-- Built here but run in a Nix derivation that provides PostgreSQL.
+test-suite CsvToPostgresTest
+  import:         integration-test-defaults
+
+  type:           exitcode-stdio-1.0
+  main-is:        CsvToPostgresTest.hs
+
+  build-depends:
+    , process
 
 -- Built here but run in a Nix derivation that provides a local mail server.
 test-suite UserSignupTest

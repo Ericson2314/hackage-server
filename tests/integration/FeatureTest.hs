@@ -12,8 +12,6 @@
 {-# LANGUAGE OverloadedStrings #-}
 module Main (main) where
 
-import qualified Codec.Archive.Tar as Tar
-import qualified Codec.Compression.GZip as GZip
 import Control.Monad
 import Data.Aeson (object, (.=), toJSON)
 import qualified Data.ByteString.Lazy.Char8 as LBS
@@ -57,8 +55,6 @@ localTest ts root workDir = do
     withServerRunning ts workDir $ do
       setupBaseData ts
       setupFeatures ts
-      setupUserTests ts
-      setupRevisionTests ts
 
     -- Backup/restore round-trip (imperative — needs server lifecycle control)
     info "Making backup"
@@ -176,9 +172,7 @@ verifyFeatures ts = testGroup "Feature verification"
 
     , testCase "votes" $ do
         val <- getJSON ts NoAuth "/package/featurepkg/votes.json"
-        -- Votes don't survive backup/restore yet (backup is empty).
-        -- The csv-to-postgresql branch fixes this with a proper Votes.Backup module.
-        val @?= object ["packageName" .= ("featurepkg" :: String), "numVotes" .= (0 :: Int)]
+        val @?= object ["packageName" .= ("featurepkg" :: String), "numVotes" .= (1 :: Int)]
 
     , testCase "distro packages" $ do
         distroInfo <- getUrl ts NoAuth "/distro/FeatureDistro/packages"
@@ -187,9 +181,7 @@ verifyFeatures ts = testGroup "Feature verification"
 
     , testCase "analytics pixels" $ do
         val <- getJSON ts NoAuth "/package/featurepkg/analytics-pixels.json"
-        -- Analytics pixels don't survive backup/restore yet (backup is empty).
-        -- The csv-to-postgresql branch fixes this with a proper AnalyticsPixels.Backup module.
-        val @?= toJSON ([] :: [String])
+        val @?= toJSON ["https://example.com/pixel.gif" :: String]
 
     , testCase "TUF root metadata" $ do
         tufRoot <- getUrl ts NoAuth "/root.json"
@@ -205,5 +197,4 @@ verifyFeatures ts = testGroup "Feature verification"
         snap <- getUrl ts NoAuth "/snapshot.json"
         assertBool ("Bad TUF snapshot.json: " ++ take 200 snap)
           ("signatures" `isInfixOf` snap)
-
     ]

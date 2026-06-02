@@ -1,3 +1,5 @@
+{-# LANGUAGE OverloadedStrings #-}
+
 module Distribution.Server.Features.UserDetails.Backup where
 
 import qualified Distribution.Server.Features.UserDetails.State as State
@@ -7,12 +9,12 @@ import Distribution.Server.Framework.BackupRestore
 
 import Distribution.Server.Users.Types
 
+import qualified Data.ByteString.Char8 as BS8
 import qualified Data.IntMap as IntMap
 import qualified Data.Text as T
 
 import Distribution.Text (display)
 import Data.Version
-import Text.CSV (CSV, Record)
 
 ----------------------------
 -- Data backup and restore
@@ -42,33 +44,34 @@ importUserDetails = concatM . map fromRecord . drop 2
         UserId uid <- parseText "user id" idStr
         akind      <- parseKind kindStr
         let udetails = AccountDetails {
-                        accountName         = T.pack nameStr,
-                        accountContactEmail = T.pack emailStr,
+                        accountName         = T.pack (BS8.unpack nameStr),
+                        accountContactEmail = T.pack (BS8.unpack emailStr),
                         accountKind         = akind,
-                        accountAdminNotes   = T.pack notesStr
+                        accountAdminNotes   = T.pack (BS8.unpack notesStr)
                       }
         return $! State.UserDetailsTable (IntMap.insert uid udetails tbl)
 
     fromRecord x _ = fail $ "Error processing user details record: " ++ show x
 
     parseKind ""        = return Nothing
+    parseKind "\\N"     = return Nothing
     parseKind "real"    = return (Just AccountKindRealUser)
     parseKind "special" = return (Just AccountKindSpecial)
-    parseKind sts       = fail $ "unable to parse account kind: " ++ sts
+    parseKind sts       = fail $ "unable to parse account kind: " ++ show sts
 
 userDetailsToCSV :: BackupType -> State.UserDetailsTable -> CSV
 userDetailsToCSV backuptype (State.UserDetailsTable tbl)
-    = ([showVersion userCSVVer]:) $
+    = ([BS8.pack (showVersion userCSVVer)]:) $
       (userdetailsCSVKey:) $
 
       flip map (IntMap.toList tbl) $ \(uid, udetails) ->
-      [ display (UserId uid)
-      , T.unpack (accountName udetails)  --FIXME: apparently the csv lib doesn't do unicode properly
+      [ BS8.pack (display (UserId uid))
+      , BS8.pack (T.unpack (accountName udetails))  --FIXME: apparently the csv lib doesn't do unicode properly
       , if backuptype == FullBackup
-        then T.unpack (accountContactEmail udetails)
+        then BS8.pack (T.unpack (accountContactEmail udetails))
         else "hidden-email@nowhere.org"
       , infoToAccountKind udetails
-      , T.unpack (accountAdminNotes udetails)
+      , BS8.pack (T.unpack (accountAdminNotes udetails))
       ]
 
  where
@@ -82,9 +85,9 @@ userDetailsToCSV backuptype (State.UserDetailsTable tbl)
     userCSVVer = Version [0,2] []
 
     -- one of "enabled" "disabled" or "deleted"
-    infoToAccountKind :: AccountDetails -> String
+    infoToAccountKind :: AccountDetails -> BS8.ByteString
     infoToAccountKind udetails = case accountKind udetails of
-      Nothing                  -> ""
+      Nothing                  -> "\\N"
       Just AccountKindRealUser -> "real"
       Just AccountKindSpecial  -> "special"
 

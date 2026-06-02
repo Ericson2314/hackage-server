@@ -1,3 +1,4 @@
+{-# LANGUAGE OverloadedStrings #-}
 module Distribution.Server.Features.Upload.Backup (
     maintainerBackup,
     maintToExport,
@@ -15,7 +16,7 @@ import Distribution.Server.Framework.BackupDump
 import Distribution.Package
 import Distribution.Text
 import Data.Version
-import Text.CSV (CSV, Record)
+import qualified Data.ByteString.Char8 as BS8
 
 import Data.Map (Map)
 import qualified Data.Map as Map
@@ -44,10 +45,11 @@ importMaintainers :: CSV -> Map PackageName UserIdSet -> Restore (Map PackageNam
 importMaintainers = concatM . map fromRecord . drop 2
   where
     fromRecord :: Record -> Map PackageName UserIdSet -> Restore (Map PackageName UserIdSet)
-    fromRecord (packageStr:idStr) mains = do
+    fromRecord [packageStr, idStr] mains = do
         pkgname <- parseText "package name" packageStr
-        ids <- mapM (parseText "user id") idStr
-        return (Map.insert pkgname (UserIdSet.fromList ids) mains)
+        uid     <- parseText "user id" idStr
+        let existing = Map.findWithDefault UserIdSet.empty pkgname mains
+        return (Map.insert pkgname (UserIdSet.unions [existing, UserIdSet.fromList [uid]]) mains)
     fromRecord x _ = fail $ "Invalid package maintainer record: " ++ show x
 
 maintToExport :: Map PackageName UserIdSet -> BackupEntry
@@ -55,9 +57,10 @@ maintToExport pkgmap = csvToBackup ["maintainers.csv"] (maintToCSV assocUsers)
   where assocUsers = map (\(name, uidset) -> (name, UserIdSet.toList uidset))
                    $ Map.toList pkgmap
 
+-- | One row per (package, user_id) — normalized for PostgreSQL COPY.
 maintToCSV :: [(PackageName, [UserId])] -> CSV
-maintToCSV users = [showVersion pkgCSVVer]:pkgCSVKey:
-    map (\(name, ids) -> display name:map display ids) users
+maintToCSV users = [BS8.pack (showVersion pkgCSVVer)]:pkgCSVKey:
+    [ [BS8.pack (display name), BS8.pack (display uid)] | (name, ids) <- users, uid <- ids ]
   where
-    pkgCSVKey = ["package", "maintainers"]
-    pkgCSVVer = Version [0,1] ["unstable"]
+    pkgCSVKey = ["package", "maintainer"]
+    pkgCSVVer = Version [0,2] ["unstable"]

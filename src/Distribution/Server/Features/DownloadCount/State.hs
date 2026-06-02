@@ -20,7 +20,8 @@ import System.Directory (
 import qualified Data.ByteString.Lazy as BSL
 import System.IO (withFile, IOMode (..))
 import System.IO.Unsafe (unsafeInterleaveIO)
-import Text.CSV (printCSV)
+import qualified Data.Csv as Csv
+import qualified Data.ByteString.Lazy.Char8 as LBS8
 import Control.Exception (evaluate)
 
 import Data.Acid (Update, Query, makeAcidic)
@@ -243,11 +244,11 @@ writeOnDiskStatsFor stateDir pkgNames (OnDiskStats (NCM _ onDisk)) = do
 
 appendToLog :: FilePath -> InMemStats -> IO ()
 appendToLog stateDir (InMemStats _ inMemStats) =
-  appendFile (stateDir </> "log") $ printCSV (cmToCSV inMemStats)
+  LBS8.appendFile (stateDir </> "log") $ Csv.encode (cmToCSV inMemStats)
 
 reconstructLog :: FilePath -> OnDiskStats -> IO ()
 reconstructLog stateDir onDisk =
-  writeFile (stateDir </> "log") $ printCSV (cmToCSV onDisk)
+  LBS8.writeFile (stateDir </> "log") $ Csv.encode (cmToCSV onDisk)
 
 {------------------------------------------------------------------------------
   ACID stuff

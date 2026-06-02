@@ -1,4 +1,4 @@
-{-# LANGUAGE RecordWildCards, ViewPatterns #-}
+{-# LANGUAGE RecordWildCards, ViewPatterns, OverloadedStrings #-}
 module Distribution.Server.Features.PreferredVersions.Backup
   ( restorePreferredVersions
   , backupPreferredVersions
@@ -12,8 +12,8 @@ import Distribution.Text (display, simpleParse)
 import Distribution.Package (PackageName)
 import Distribution.Parsec (Parsec(..))
 import Distribution.Version (VersionRange)
+import qualified Data.ByteString.Char8 as BS8
 import qualified Data.Map as Map
-import Text.CSV (CSV, Record)
 import Control.Monad (guard)
 
 {-------------------------------------------------------------------------------
@@ -67,15 +67,15 @@ importDeprecatedCSV st pkg [ _version
   return st { deprecatedMap = Map.insert pkg deprecatedFor (deprecatedMap st) }
 importDeprecatedCSV _ _ _ = fail "Failed to read deprecated.csv"
 
-match :: Parsec a => String -> Record -> Maybe [a]
-match header (header' : xs) = guard (header == header') >> mapM simpleParse xs
+match :: Parsec a => BS8.ByteString -> Record -> Maybe [a]
+match header (header' : xs) = guard (header == header') >> mapM (simpleParse . BS8.unpack) xs
 match _ _ = Nothing
 
 -- Outer maybe is Nothing on a parsing error; the inner maybe is because
 -- the version range is optional
 optionalSumRange :: CSV -> Maybe (Maybe VersionRange)
 optionalSumRange [] = Just Nothing
-optionalSumRange [["sumRange", simpleParse -> Just range]] = Just (Just range)
+optionalSumRange [["sumRange", simpleParse . BS8.unpack -> Just range]] = Just (Just range)
 optionalSumRange _ = Nothing
 
 parsePackageName :: String -> Restore PackageName
@@ -94,20 +94,20 @@ backupPreferredVersions (PreferredVersions preferredMap deprecatedMap _) =
 backupPreferredInfo :: (PackageName, PreferredInfo) -> BackupEntry
 backupPreferredInfo (name, prefinfo@PreferredInfo {..}) =
     csvToBackup (pkgPath name "preferred.csv") $ [
-        [showVersion versionCSV]
-      , "preferredRanges" : map display unused_preferredRanges
-      , "deprecatedVersions" : map display deprecatedVersions
+        [BS8.pack (showVersion versionCSV)]
+      , "preferredRanges" : map (BS8.pack . display) unused_preferredRanges
+      , "deprecatedVersions" : map (BS8.pack . display) deprecatedVersions
       ] ++ case sumRange prefinfo of
              Nothing           -> []
-             Just versionRange -> [["sumRange", display versionRange]]
+             Just versionRange -> [["sumRange", BS8.pack (display versionRange)]]
   where
     versionCSV = Version [0,1] ["unstable"]
 
 backupDeprecated :: (PackageName, [PackageName]) -> BackupEntry
 backupDeprecated (name, deprecatedFor) =
     csvToBackup (pkgPath name "deprecated.csv") [
-        [showVersion versionCSV]
-      , "deprecatedFor" : map display deprecatedFor
+        [BS8.pack (showVersion versionCSV)]
+      , "deprecatedFor" : map (BS8.pack . display) deprecatedFor
       ]
   where
     versionCSV = Version [0,1] ["unstable"]

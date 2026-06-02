@@ -1,3 +1,4 @@
+{-# LANGUAGE OverloadedStrings #-}
 module Distribution.Server.Features.UserNotify.Backup where
 
 import qualified Distribution.Server.Features.UserNotify.Acid as Acid
@@ -13,7 +14,7 @@ import qualified Data.Map as Map
 
 import Data.Time.Clock.POSIX (posixSecondsToUTCTime)
 import Distribution.Text (display)
-import Text.CSV (CSV, Record)
+import qualified Data.ByteString.Char8 as BS8
 
 
 
@@ -59,16 +60,16 @@ importNotifyPref = sequence . map fromRecord . drop 2
 notifyDataToCSV :: BackupType -> Acid.NotifyData -> CSV
 notifyDataToCSV _backuptype (Acid.NotifyData (tbl,_))
     = ["0.1"]
-    : [ "uid","freq","revisionrange","upload","group","pending_tags","dep_for_maintained","dep_trigger_bounds"]
+    : [ "uid","opt_out","revision_range","upload","maintainer_group","doc_builder_report","pending_tags","dep_for_maintained","dep_trigger_bounds"]
     : flip map (Map.toList tbl) (\(uid,np) ->
-        [ display uid
-        , show (notifyOptOut np)
-        , show (notifyRevisionRange np)
-        , show (notifyUpload np)
-        , show (notifyMaintainerGroup np)
-        , show (notifyDocBuilderReport np)
-        , show (notifyPendingTags np)
-        , show (notifyDependencyForMaintained np)
-        , show (notifyDependencyTriggerBounds np)
+        [ BS8.pack (display uid)
+        , BS8.pack (show (notifyOptOut np))
+        , BS8.pack (show (notifyRevisionRange np))
+        , BS8.pack (show (notifyUpload np))
+        , BS8.pack (show (notifyMaintainerGroup np))
+        , BS8.pack (show (notifyDocBuilderReport np))
+        , BS8.pack (show (notifyPendingTags np))
+        , BS8.pack (show (notifyDependencyForMaintained np))
+        , BS8.pack (show (notifyDependencyTriggerBounds np))
         ]
       )
