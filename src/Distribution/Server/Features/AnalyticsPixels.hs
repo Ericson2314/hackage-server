@@ -1,6 +1,6 @@
-{-# LANGUAGE RankNTypes, NamedFieldPuns, RecordWildCards #-}
+{-# LANGUAGE RankNTypes, NamedFieldPuns, RecordWildCards, OverloadedStrings #-}
 
--- | Implements a system to allow users to upvote packages.
+-- | Implements a system to allow users to attach analytics pixels to packages.
 --
 module Distribution.Server.Features.AnalyticsPixels
   ( AnalyticsPixelsFeature(..)
@@ -9,6 +9,9 @@ module Distribution.Server.Features.AnalyticsPixels
   ) where
 
 import Data.Set (Set)
+import qualified Data.Set as Set
+import qualified Data.Text as T
+import Data.Aeson (toJSON, Value(..), object, (.=))
 
 import Distribution.Server.Features.AnalyticsPixels.Acid (acidStore)
 import qualified Distribution.Server.Features.AnalyticsPixels.Store as Store
@@ -16,11 +19,10 @@ import Distribution.Server.Features.AnalyticsPixels.Types
 
 import Distribution.Server.Framework
 
+import Distribution.Package (PackageName)
 import Distribution.Server.Features.Core
 import Distribution.Server.Features.Upload
 import Distribution.Server.Features.Users
-
-import Distribution.Package
 
 -- | Define the prototype for this feature
 data AnalyticsPixelsFeature = AnalyticsPixelsFeature {
@@ -90,10 +92,31 @@ analyticsPixelsFeature  ServerEnv{..}
       }
 
     analyticsPixelsResource :: Resource
-    analyticsPixelsResource = resourceAt "/package/:package/analytics-pixels.:format"
+    analyticsPixelsResource = (resourceAt "/package/:package/analytics-pixels.:format") {
+        resourceGet  = [("json", serveGetPixelsJSON)]
+      , resourcePost = [("json", serveAddPixelJSON)]
+      }
 
     userAnalyticsPixelsResource :: Resource
     userAnalyticsPixelsResource = resourceAt "/user/:username/analytics-pixels.:format"
+
+    serveGetPixelsJSON :: DynamicPath -> ServerPartE Response
+    serveGetPixelsJSON dpath = do
+      pkgname <- packageInPath dpath
+      guardValidPackageName pkgname
+      pixels <- getPackageAnalyticsPixels pkgname
+      ok . toResponse $ toJSON
+        [ analyticsPixelUrl p | p <- Set.toList pixels ]
+
+    serveAddPixelJSON :: DynamicPath -> ServerPartE Response
+    serveAddPixelJSON dpath = do
+      _uid <- guardAuthorised [InGroup trusteesGroup]
+      pkgname <- packageInPath dpath
+      guardValidPackageName pkgname
+      pixelUrl <- look "analytics-pixel"
+      let pixel = AnalyticsPixel (T.pack pixelUrl)
+      added <- addPackageAnalyticsPixel pkgname pixel
+      ok . toResponse $ object ["added" .= added]
 
     getPackageAnalyticsPixels :: MonadIO m => PackageName -> m (Set AnalyticsPixel)
     getPackageAnalyticsPixels =

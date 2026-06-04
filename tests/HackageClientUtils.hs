@@ -10,22 +10,25 @@ import Control.Applicative
 import Data.List (isInfixOf, isSuffixOf)
 import Data.Maybe
 import Data.String ()
-import Data.Aeson (FromJSON(..), Value(..), (.:))
+import Data.Aeson (FromJSON(..), Result(..), Value(..), (.:), fromJSON)
 import Data.Version (showVersion)
 import Network.HTTP hiding (user)
 import Network.URI
+import qualified Network.Socket as NS
 import System.Directory
+import System.Environment (lookupEnv)
 import System.Exit (ExitCode(..), die)
 import System.FilePath
 import System.IO
 import System.IO.Error
 
-import Run
+import Run (run, runWithSocket)
 import MailUtils
 import Util
 import HttpUtils ( ExpectedCode
                  , isOk
                  , isAccepted
+                 , isNoContent
                  , isSeeOther
                  , isNotModified
                  , isUnauthorized
@@ -36,36 +39,49 @@ import qualified HttpUtils as Http
 
 import qualified Paths_hackage_server as Paths
 
-withServerRunning :: FilePath -> IO () -> IO ()
-withServerRunning root f
-    = do info "Forking server thread"
-         mv <- newEmptyMVar
-         bracket (forkIO (do info "Server thread started"
-                             void $ runServer root serverRunningArgs
-                          `finally` putMVar mv ()))
-                 (\t -> do killThread t
-                           takeMVar mv
-                           info "Server terminated")
-                 (\_ -> do waitForServer
-                           info "Server running"
-                           f
-                           info "Finished with server")
+-- | Run an action with the test server. For 'LocalServer', forks and
+-- kills the server process. For 'ExternalServer', just runs the action.
+withServerRunning :: TestServer -> FilePath -> IO () -> IO ()
+withServerRunning ts@(ExternalServer _ _) _workDir f = do
+    info "Using external server"
+    waitForServer ts
+    info "Server running"
+    f
+    info "Finished with server"
+withServerRunning ts@(LocalServer sock _) workDir f = do
+    args <- serverRunningArgs ts workDir
+    root <- getCurrentDirectory
+    info "Forking server thread"
+    mv <- newEmptyMVar
+    bracket (forkIO (do info "Server thread started"
+                        void $ runServerWithSocket root args sock
+                     `finally` putMVar mv ()))
+            (\t -> do killThread t
+                      takeMVar mv
+                      info "Server terminated")
+            (\_ -> do waitForServer ts
+                      info "Server running"
+                      f
+                      info "Finished with server")
 
-serverRunningArgs :: [String]
-serverRunningArgs =
-  ["run", "--ip", "127.0.0.1"
-  , "--port", show testPort
-  , "--delay-cache-updates", "0"
-  , "--base-uri", "http://127.0.0.1:" <> show testPort
-  , "--user-content-uri", "http://localhost:" <> show testPort
-  , "--required-base-host-header", "127.0.0.1:" <> show testPort
-  ]
+serverRunningArgs :: TestServer -> FilePath -> IO [String]
+serverRunningArgs ts workDir = do
+  let p = testServerPort ts
+  return ["run"
+    , "--socket-activation-only"
+    , "--delay-cache-updates", "0"
+    , "--base-uri", "http://127.0.0.1:" <> show p
+    , "--user-content-uri", "http://localhost:" <> show p
+    , "--required-base-host-header", "127.0.0.1:" <> show p
+    , "--state-dir", workDir </> "state"
+    , "--tmp-dir", workDir </> "tmp"
+    ]
 
-waitForServer :: IO ()
-waitForServer = f 10
+waitForServer :: TestServer -> IO ()
+waitForServer ts = f 10
     where f :: Int -> IO ()
           f n = do info "Making a request to see if server is up"
-                   res <- tryIOError $ simpleHTTP (getRequest (mkUrl "/"))
+                   res <- tryIOError $ simpleHTTP (getRequest (mkUrl ts "/"))
                    case res of
                        Right (Right rsp)
                         | rspCode rsp == (2, 0, 0) ->
@@ -78,9 +94,11 @@ waitForServer = f 10
                               f (n - 1)
 
 createBackup :: FilePath -> FilePath -> FilePath -> IO FilePath
-createBackup testName root suffix = do
-    runServerChecked root ["backup", "-o", root </> "tests" </> testName </> suffix]
-    findTarGz (root </> "tests" </> testName </> suffix)
+createBackup root workDir suffix = do
+    let outDir = workDir </> suffix
+    createDirectoryIfMissing False outDir
+    runServerChecked root ["backup", "-o", outDir, "--state-dir", workDir </> "state"]
+    findTarGz outDir
   where
     findTarGz :: FilePath -> IO FilePath
     findTarGz dir = do
@@ -95,9 +113,30 @@ runServerChecked root args = do
     mec <- runServer root args
     case mec of
       Just ExitSuccess -> return ()
-      _                -> die "Bad exit code from server"
+      _                -> die $ "Bad exit code from server, args: " ++ show args
 
 foreign import capi safe "unistd.h sync" c_sync :: IO ()
+
+runServerWithSocket :: FilePath -> [String] -> NS.Socket -> IO (Maybe ExitCode)
+runServerWithSocket root args sock = do
+    c_sync
+    mserverViaPath <- findExecutable "hackage-server"
+    mserver <- case mserverViaPath of
+      Just fn -> return (Just fn)
+      Nothing -> findFile dirs "hackage-server"
+    case mserver of
+        Nothing -> fail ("couldn't find 'hackage-server' test-executable in $PATH nor "
+                         ++ show dirs)
+        Just server -> do
+            putStrLn $ "using " ++ show server
+            runWithSocket server args' sock
+  where
+    dirs = [ root </> "dist-newstyle/build/hackage-server-" ++ ver
+                  </> "build/hackage-server/"
+           , root </> "dist/build/hackage-server/"
+           ]
+    args'  = ("--static-dir=" ++ root </> "datafiles/") : args
+    ver = showVersion Paths.version
 
 runServer :: FilePath -> [String] -> IO (Maybe ExitCode)
 runServer root args = do
@@ -165,36 +204,36 @@ instance FromJSON Group where
                  }
   parseJSON _ = fail "Expected object"
 
-getUsers :: IO [UserInfo]
-getUsers = getUrl NoAuth "/users/.json" >>= decodeJSON
+getUsers :: TestServer -> IO [UserInfo]
+getUsers ts = getUrl ts NoAuth "/users/.json" >>= decodeJSON
 
-getAdmins :: IO Group
-getAdmins = getGroup "/users/admins/.json"
+getAdmins :: TestServer -> IO Group
+getAdmins ts = getGroup ts "/users/admins/.json"
 
-getGroup :: String -> IO Group
-getGroup url = getUrl NoAuth url >>= decodeJSON
+getGroup :: TestServer -> String -> IO Group
+getGroup ts url = getUrl ts NoAuth url >>= decodeJSON
 
-createUserDirect :: Authorization -> User -> String -> IO ()
-createUserDirect auth user pass = do
+createUserDirect :: TestServer -> Authorization -> User -> String -> IO ()
+createUserDirect ts auth user pass = do
   info $ "Creating user " ++ user
-  post auth "/users/" [
+  post ts auth "/users/" [
       ("username",        user)
     , ("password",        pass)
     , ("repeat-password", pass)
     ]
 
-createUserSelfRegister :: User -> String -> String -> IO ()
-createUserSelfRegister user real email = do
+createUserSelfRegister :: TestServer -> User -> String -> String -> IO ()
+createUserSelfRegister ts user real email = do
   info $ "Requesting registration for user " ++ real
       ++ " with email address " ++ testEmailAddress email
-  post NoAuth "/users/register-request" [
+  post ts NoAuth "/users/register-request" [
       ("username", user)
     , ("realname", real)
     , ("email",    testEmailAddress email)
     ]
 
-confirmUser :: String -> String -> IO ()
-confirmUser email pass = do
+confirmUser :: TestServer -> String -> String -> IO ()
+confirmUser ts email pass = do
   confirmation <- waitForEmailWithSubject email "Hackage account confirmation"
   emailText    <- getEmail confirmation
   let [urlWithNonce] = map (uriPath . fromJust . parseURI . trim)
@@ -202,7 +241,7 @@ confirmUser email pass = do
                      . lines
                      $ emailText
   info $ "Confirming new user at " ++ urlWithNonce
-  post NoAuth urlWithNonce [
+  post ts NoAuth urlWithNonce [
       ("password",        pass)
     , ("repeat-password", pass)
     ]
@@ -218,8 +257,8 @@ instance FromJSON NameContactInfo where
     return (NameContactInfo name email)
   parseJSON _ = fail "Expected object"
 
-getNameContactInfo :: Authorization -> String -> IO NameContactInfo
-getNameContactInfo auth url = getUrl auth url >>= decodeJSON
+getNameContactInfo :: TestServer -> Authorization -> String -> IO NameContactInfo
+getNameContactInfo ts auth url = getUrl ts auth url >>= decodeJSON
 
 
 data UserAdminInfo = UserAdminInfo { accountKind :: Maybe String
@@ -239,8 +278,20 @@ instance FromJSON UserAdminInfo where
     return (UserAdminInfo kind notes)
   parseJSON _ = fail "Expected object"
 
-getUserAdminInfo :: Authorization -> String -> IO UserAdminInfo
-getUserAdminInfo auth url = getUrl auth url >>= decodeJSON
+getUserAdminInfo :: TestServer -> Authorization -> String -> IO UserAdminInfo
+getUserAdminInfo ts auth url = getUrl ts auth url >>= decodeJSON
+
+data DeprecatedInfo = DeprecatedInfo
+  { isDeprecated :: Bool
+  , inFavourOf   :: [String]
+  } deriving Show
+
+instance FromJSON DeprecatedInfo where
+  parseJSON (Object obj) = do
+    dep    <- obj .: "is-deprecated"
+    favour <- obj .: "in-favour-of"
+    return DeprecatedInfo { isDeprecated = dep, inFavourOf = favour }
+  parseJSON _ = fail "Expected object"
 
 data PackageInfo = PackageInfo { packageName :: String }
   deriving Show
@@ -251,8 +302,11 @@ instance FromJSON PackageInfo where
     return PackageInfo { packageName = name }
   parseJSON _ = fail "Expected object"
 
-getPackages :: IO [PackageInfo]
-getPackages = getUrl NoAuth "/packages/.json" >>= decodeJSON
+getPackages :: TestServer -> IO [PackageInfo]
+getPackages ts = getUrl ts NoAuth "/packages/.json" >>= decodeJSON
+
+getDeprecatedInfo :: TestServer -> String -> IO DeprecatedInfo
+getDeprecatedInfo ts pkg = getUrl ts NoAuth ("/package/" ++ pkg ++ "/deprecated.json") >>= decodeJSON
 
 {------------------------------------------------------------------------------
   Small layer on top of HttpUtils, specialized to our test server
@@ -261,37 +315,81 @@ getPackages = getUrl NoAuth "/packages/.json" >>= decodeJSON
 type RelativeURL = String
 type AbsoluteURL = String
 
--- A random port, that hopefully won't clash with anything else
-testPort :: Int
-testPort = 8392
+-- | Test server configuration. Either we manage our own server
+-- ('LocalServer') or connect to a pre-existing one ('ExternalServer').
+data TestServer
+  = LocalServer NS.Socket Int   -- ^ Socket and port we manage
+  | ExternalServer String Int   -- ^ Host and port of external server
 
-mkUrl :: RelativeURL -> AbsoluteURL
-mkUrl relPath = "http://127.0.0.1:" ++ show testPort ++ relPath
+-- | Check @HACKAGE_TEST_URL@ env var. If set (e.g. @http://localhost:8080@),
+-- use that server. Otherwise bind a fresh socket.
+initTestServer :: IO TestServer
+initTestServer = do
+  murl <- lookupEnv "HACKAGE_TEST_URL"
+  case murl of
+    Just url | Just uri <- parseURI url
+             , Just auth <- uriAuthority uri
+             , port <- case uriPort auth of
+                 (':':p) -> read p
+                 _       -> 80
+             -> return $ ExternalServer (uriRegName auth) port
+    _ -> do
+      sock <- NS.socket NS.AF_INET NS.Stream NS.defaultProtocol
+      NS.setSocketOption sock NS.ReuseAddr 1
+      NS.bind sock (NS.SockAddrInet 0 (NS.tupleToHostAddress (127,0,0,1)))
+      NS.listen sock (max 1024 NS.maxListenQueue)
+      p <- fromIntegral <$> NS.socketPort sock
+      return $ LocalServer sock p
 
-mkUserContentUrl :: RelativeURL -> AbsoluteURL
-mkUserContentUrl relPath = "http://localhost:" ++ show testPort ++ relPath
+testServerPort :: TestServer -> Int
+testServerPort (LocalServer _ p)    = p
+testServerPort (ExternalServer _ p) = p
 
-mkGetReq :: RelativeURL -> Request_String
-mkGetReq url = getRequest (mkUrl url)
+testServerHost :: TestServer -> String
+testServerHost (LocalServer _ _)    = "127.0.0.1"
+testServerHost (ExternalServer h _) = h
 
-mkGetUserContentReq :: RelativeURL -> Request_String
-mkGetUserContentReq url = getRequest (mkUserContentUrl url)
+mkUrl :: TestServer -> RelativeURL -> AbsoluteURL
+mkUrl ts relPath = "http://" ++ testServerHost ts ++ ":" ++ show (testServerPort ts) ++ relPath
 
-mkPostReq :: RelativeURL -> [(String, String)] -> Request_String
-mkPostReq url vals =
-  setRequestBody (postRequest (mkUrl url))
+mkUserContentUrl :: TestServer -> RelativeURL -> AbsoluteURL
+mkUserContentUrl ts relPath = "http://localhost:" ++ show (testServerPort ts) ++ relPath
+
+mkGetReq :: TestServer -> RelativeURL -> Request_String
+mkGetReq ts url = getRequest (mkUrl ts url)
+
+mkGetUserContentReq :: TestServer -> RelativeURL -> Request_String
+mkGetUserContentReq ts url = getRequest (mkUserContentUrl ts url)
+
+mkPostReq :: TestServer -> RelativeURL -> [(String, String)] -> Request_String
+mkPostReq ts url vals =
+  setRequestBody (postRequest (mkUrl ts url))
                  ("application/x-www-form-urlencoded", urlEncodeVars vals)
 
-mkPutReq :: RelativeURL -> [(String, String)] -> Request_String
-mkPutReq url vals =
-  setRequestBody (putRequest (mkUrl url))
+mkPutReq :: TestServer -> RelativeURL -> [(String, String)] -> Request_String
+mkPutReq ts url vals =
+  setRequestBody (putRequest (mkUrl ts url))
                  ("application/x-www-form-urlencoded", urlEncodeVars vals)
 
--- Like mkPutReq, but posts the given body text directly as text/plain
-mkPutTextReq :: RelativeURL -> String -> Request_String
-mkPutTextReq url body =
-    setRequestBody (putRequest (mkUrl url))
+mkPutTarGzReq :: TestServer -> RelativeURL -> String -> Request_String
+mkPutTarGzReq ts url body =
+    setRequestBody (putRequest (mkUrl ts url))
+             ("application/x-gzip", body)
+
+mkPutTextReq :: TestServer -> RelativeURL -> String -> Request_String
+mkPutTextReq ts url body =
+    setRequestBody (putRequest (mkUrl ts url))
              ("text/plain", body)
+
+mkPostTextReq :: TestServer -> RelativeURL -> String -> Request_String
+mkPostTextReq ts url body =
+    setRequestBody (postRequest (mkUrl ts url))
+             ("text/plain", body)
+
+mkPutJSONReq :: TestServer -> RelativeURL -> String -> Request_String
+mkPutJSONReq ts url body =
+    setRequestBody (putRequest (mkUrl ts url))
+             ("application/json", body)
 
 -- | A convenience constructor for a PUT 'Request'.
 --
@@ -305,96 +403,130 @@ putRequest urlString =
     Just u  -> mkRequest PUT u
 
 
-getUrl :: Authorization -> RelativeURL -> IO String
-getUrl auth url = Http.execRequest auth (mkGetReq url)
+getUrl :: TestServer -> Authorization -> RelativeURL -> IO String
+getUrl ts auth url = Http.execRequest auth (mkGetReq ts url)
 
-getUserContentUrl :: Authorization -> RelativeURL -> IO String
-getUserContentUrl auth url = Http.execRequest auth (mkGetUserContentReq url)
+getUserContentUrl :: TestServer -> Authorization -> RelativeURL -> IO String
+getUserContentUrl ts auth url = Http.execRequest auth (mkGetUserContentReq ts url)
 
-getETag :: RelativeURL -> IO String
-getETag url = Http.responseHeader HdrETag (mkGetReq url)
+getETag :: TestServer -> RelativeURL -> IO String
+getETag ts url = Http.responseHeader HdrETag (mkGetReq ts url)
 
-getETagUserContent :: RelativeURL -> IO String
-getETagUserContent url = Http.responseHeader HdrETag (mkGetUserContentReq url)
+getETagUserContent :: TestServer -> RelativeURL -> IO String
+getETagUserContent ts url = Http.responseHeader HdrETag (mkGetUserContentReq ts url)
 
-mkGetReqWithETag :: String -> RelativeURL -> Request_String
-mkGetReqWithETag url etag =
-    Request (fromJust $ parseURI $ mkUrl url) GET hdrs ""
+mkGetReqWithETag :: TestServer -> String -> RelativeURL -> Request_String
+mkGetReqWithETag ts url etag =
+    Request (fromJust $ parseURI $ mkUrl ts url) GET hdrs ""
   where
     hdrs = [mkHeader HdrIfNoneMatch etag]
 
-mkGetUserContentReqWithETag :: String -> RelativeURL -> Request_String
-mkGetUserContentReqWithETag url etag =
-    Request (fromJust $ parseURI $ mkUserContentUrl url) GET hdrs ""
+mkGetUserContentReqWithETag :: TestServer -> String -> RelativeURL -> Request_String
+mkGetUserContentReqWithETag ts url etag =
+    Request (fromJust $ parseURI $ mkUserContentUrl ts url) GET hdrs ""
   where
     hdrs = [mkHeader HdrIfNoneMatch etag]
 
-validateETagHandling :: RelativeURL -> IO ()
-validateETagHandling url = void $ do
-    etag <- getETag url
+validateETagHandling :: TestServer -> RelativeURL -> IO ()
+validateETagHandling ts url = void $ do
+    etag <- getETag ts url
     checkETag etag
     checkETagMismatch (etag ++ "garbled123")
   where
-    checkETag etag = void $ Http.execRequest' NoAuth (mkGetReqWithETag url etag) isNotModified
-    checkETagMismatch etag = void $ Http.execRequest NoAuth (mkGetReqWithETag url etag)
+    checkETag etag = void $ Http.execRequest' NoAuth (mkGetReqWithETag ts url etag) isNotModified
+    checkETagMismatch etag = void $ Http.execRequest NoAuth (mkGetReqWithETag ts url etag)
 
-validateETagHandlingUserContent :: RelativeURL -> IO ()
-validateETagHandlingUserContent url = void $ do
-    etag <- getETagUserContent url
+validateETagHandlingUserContent :: TestServer -> RelativeURL -> IO ()
+validateETagHandlingUserContent ts url = void $ do
+    etag <- getETagUserContent ts url
     checkETag etag
     checkETagMismatch (etag ++ "garbled123")
   where
-    checkETag etag = void $ Http.execRequest' NoAuth (mkGetUserContentReqWithETag url etag) isNotModified
-    checkETagMismatch etag = void $ Http.execRequest NoAuth (mkGetUserContentReqWithETag url etag)
+    checkETag etag = void $ Http.execRequest' NoAuth (mkGetUserContentReqWithETag ts url etag) isNotModified
+    checkETagMismatch etag = void $ Http.execRequest NoAuth (mkGetUserContentReqWithETag ts url etag)
 
-getJSONStrings :: RelativeURL -> IO [String]
-getJSONStrings url = getUrl NoAuth url >>= decodeJSON
+getJSON :: TestServer -> Authorization -> RelativeURL -> IO Value
+getJSON ts auth url = getUrl ts auth url >>= decodeJSON
 
-checkIsForbidden :: Authorization -> RelativeURL -> IO ()
-checkIsForbidden = checkIsExpectedCode isForbidden
+getJSONStrings :: TestServer -> RelativeURL -> IO [String]
+getJSONStrings ts url = do
+  val <- getJSON ts NoAuth url
+  case fromJSON val of
+    Success xs -> return xs
+    Error err  -> fail $ "Expected JSON string array: " ++ err
 
-checkIsUnauthorized :: Authorization -> RelativeURL -> IO ()
-checkIsUnauthorized = checkIsExpectedCode isUnauthorized
+checkIsForbidden :: TestServer -> Authorization -> RelativeURL -> IO ()
+checkIsForbidden ts = checkIsExpectedCode ts isForbidden
 
-checkIsExpectedCode :: ExpectedCode -> Authorization -> RelativeURL -> IO ()
-checkIsExpectedCode expectedCode auth url = void $
-  Http.execRequest' auth (mkGetReq url) expectedCode
+checkIsUnauthorized :: TestServer -> Authorization -> RelativeURL -> IO ()
+checkIsUnauthorized ts = checkIsExpectedCode ts isUnauthorized
 
-delete :: ExpectedCode -> Authorization -> RelativeURL -> IO ()
-delete expectedCode auth url = void $
-  case parseURI (mkUrl url) of
+checkIsExpectedCode :: TestServer -> ExpectedCode -> Authorization -> RelativeURL -> IO ()
+checkIsExpectedCode ts expectedCode auth url = void $
+  Http.execRequest' auth (mkGetReq ts url) expectedCode
+
+delete :: TestServer -> ExpectedCode -> Authorization -> RelativeURL -> IO ()
+delete ts expectedCode auth url = void $
+  case parseURI (mkUrl ts url) of
     Nothing  -> die "Bad URL"
     Just uri -> Http.execRequest' auth (mkRequest DELETE uri) expectedCode
 
-post :: Authorization -> RelativeURL -> [(String, String)] -> IO ()
-post auth url vals = void $
-    Http.execRequest' auth (mkPostReq url vals) expectedCode
+post :: TestServer -> Authorization -> RelativeURL -> [(String, String)] -> IO ()
+post ts auth url vals = void $
+    Http.execRequest' auth (mkPostReq ts url vals) expectedCode
   where
     expectedCode code = isOk code || isSeeOther code || isAccepted code
 
-put :: Authorization -> RelativeURL -> [(String, String)] -> IO ()
-put auth url vals = void $
-    Http.execRequest' auth (mkPutReq url vals) expectedCode
+-- | POST with parameters as query string instead of request body.
+postQuery :: TestServer -> Authorization -> RelativeURL -> [(String, String)] -> IO ()
+postQuery ts auth url vals = void $
+    Http.execRequest' auth req expectedCode
+  where
+    qurl = url ++ "?" ++ urlEncodeVars vals
+    req  = postRequest (mkUrl ts qurl)
+    expectedCode code = isOk code || isSeeOther code || isAccepted code
+
+put :: TestServer -> Authorization -> RelativeURL -> [(String, String)] -> IO ()
+put ts auth url vals = void $
+    Http.execRequest' auth (mkPutReq ts url vals) expectedCode
   where
     expectedCode code = isOk code || isSeeOther code || isAccepted code
 
-putText :: Authorization -> RelativeURL -> String -> IO ()
-putText auth url body = void $
-    Http.execRequest' auth (mkPutTextReq url body) expectedCode
+postText :: TestServer -> Authorization -> RelativeURL -> String -> IO ()
+postText ts auth url body = void $
+    Http.execRequest' auth (mkPostTextReq ts url body) expectedCode
   where
     expectedCode code = isOk code || isSeeOther code || isAccepted code
 
-postFile :: ExpectedCode
+putTarGz :: TestServer -> Authorization -> RelativeURL -> String -> IO ()
+putTarGz ts auth url body = void $
+    Http.execRequest' auth (mkPutTarGzReq ts url body) expectedCode
+  where
+    expectedCode code = isOk code || isSeeOther code || isAccepted code || isNoContent code
+
+putText :: TestServer -> Authorization -> RelativeURL -> String -> IO ()
+putText ts auth url body = void $
+    Http.execRequest' auth (mkPutTextReq ts url body) expectedCode
+  where
+    expectedCode code = isOk code || isSeeOther code || isAccepted code
+
+putJSON :: TestServer -> Authorization -> RelativeURL -> String -> IO ()
+putJSON ts auth url body = void $
+    Http.execRequest' auth (mkPutJSONReq ts url body) expectedCode
+  where
+    expectedCode code = isOk code || isSeeOther code || isAccepted code || isNoContent code
+
+postFile :: TestServer -> ExpectedCode
          -> Authorization -> RelativeURL
          -> String -> (FilePath, String)
          -> IO ()
-postFile expectedCode auth url field file =
-    Http.execPostFile expectedCode auth (postRequest (mkUrl url)) field file
+postFile ts expectedCode auth url field file =
+    Http.execPostFile expectedCode auth (postRequest (mkUrl ts url)) field file
 
-validate :: Authorization -> RelativeURL -> IO String
-validate auth url = do
+validate :: TestServer -> Authorization -> RelativeURL -> IO String
+validate ts auth url = do
   putStr ("= Validating " ++ show url ++ ": ") ; hFlush stdout
-  (body, errs) <- Http.validate auth (mkUrl url)
+  (body, errs) <- Http.validate auth (mkUrl ts url)
   if null errs
     then do putStrLn "ok"
     else do putStrLn $ "failed: " ++ show (length errs) ++ " error(s)"

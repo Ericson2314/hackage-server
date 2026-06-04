@@ -1,9 +1,9 @@
-{ hackage-server, pkgs, ... }:
+{ hackage-server, hackage-server-with-tests, pkgs, ... }:
 
 pkgs.testers.runNixOSTest {
   name = "hackage-server";
 
-  containers.machine = { pkgs, ... }: {
+  containers.machine = { ... }: {
     imports = [ ./nixos-module.nix ];
 
     services.hackage-server = {
@@ -15,7 +15,7 @@ pkgs.testers.runNixOSTest {
       port = 8080;
     };
 
-    environment.systemPackages = [ pkgs.curl ];
+    environment.systemPackages = [ hackage-server-with-tests ];
   };
 
   testScript = ''
@@ -25,8 +25,9 @@ pkgs.testers.runNixOSTest {
     # Trigger socket activation and wait for the service to come up
     machine.wait_for_open_port(8080)
 
-    # Smoke test
-    machine.succeed("curl -fsS --max-time 30 http://localhost:8080/")
-    machine.succeed("curl -fsS --max-time 10 http://localhost:8080/users/.json")
+    # Run the Haskell FeatureTest against the running server
+    print(machine.succeed(
+        "HACKAGE_TEST_URL=http://localhost:8080 FeatureTest 2>&1"
+    ))
   '';
 }

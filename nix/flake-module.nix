@@ -10,11 +10,53 @@
   };
 
   perSystem = { system, lib, config, pkgs, ... }:
+  let
+    # Build test executables without running them.
+    # doCheck = true so test deps are included and --enable-tests is
+    # passed, but we override checkPhase to skip actually running them.
+    # Test executables are installed into $out/bin.
+    hackage-server-with-tests = pkgs.haskell.lib.overrideCabal
+      config.packages.hackage-server
+      (drv: {
+        doCheck = true;
+        checkPhase = "true";  # don't run tests, just build them
+        postInstall = (drv.postInstall or "") + ''
+          for testExe in dist/build/HighLevelTest \
+                         dist/build/FeatureTest \
+                         dist/build/UserTest \
+                         dist/build/CsvToPostgresTest \
+                         dist/build/UserSignupTest; do
+            name=$(basename "$testExe")
+            if [ -f "$testExe/$name" ]; then
+              install -D "$testExe/$name" "$out/bin/$name"
+            fi
+          done
+        '';
+      });
+
+    # Helper: create a check derivation that runs a test executable
+    # produced by hackage-server-with-tests.
+    mkIntegrationCheck = name: { extraInputs ? [], extraSetup ? "" }: pkgs.runCommand name {
+      nativeBuildInputs = [ hackage-server-with-tests ] ++ extraInputs;
+    } ''
+      export HOME=$TMPDIR
+      # Tests expect datafiles/ relative to cwd
+      ln -s $(dirname $(find ${hackage-server-with-tests.data}/share -name templates -type d | head -1)) datafiles
+      ${extraSetup}
+      ${name}
+      touch $out
+    '';
+  in
   {
-    checks = lib.optionalAttrs pkgs.stdenv.isLinux {
+    checks = {
+      HighLevelTest     = mkIntegrationCheck "HighLevelTest" {};
+      FeatureTest       = mkIntegrationCheck "FeatureTest" {};
+      UserTest          = mkIntegrationCheck "UserTest" {};
+      UserSignupTest = mkIntegrationCheck "UserSignupTest" {};
+    } // lib.optionalAttrs pkgs.stdenv.isLinux {
       nixos-test = import ./test.nix {
         hackage-server = config.packages.hackage-server;
-        inherit pkgs;
+        inherit hackage-server-with-tests pkgs;
       };
     };
 

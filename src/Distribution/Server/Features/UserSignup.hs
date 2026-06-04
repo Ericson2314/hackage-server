@@ -39,6 +39,7 @@ import Distribution.Text (display)
 import Data.Time
 import Network.Mail.Mime
 import Network.URI (URI(..), URIAuth(..))
+import System.Environment (lookupEnv)
 import Graphics.Captcha
 import qualified Data.ByteString.Base64 as Base64
 import qualified Crypto.Hash.SHA256 as SHA256
@@ -313,8 +314,7 @@ userSignupFeature ServerEnv{serverBaseURI, serverCron}
 
         updateAddSignupResetInfo nonce signupInfo
 
-        liftIO $ renderSendMail mail --TODO: if we need any configuration of
-                                     -- sendmail stuff, has to go here
+        liftIO $ sendMailConfigurable mail
 
         resp 202 $ toResponse $
           templateConfirmation
@@ -442,8 +442,7 @@ userSignupFeature ServerEnv{serverBaseURI, serverCron}
 
         updateAddSignupResetInfo nonce resetInfo
 
-        liftIO $ renderSendMail mail --TODO: if we need any configuration of
-                                     -- sendmail stuff, has to go here
+        liftIO $ sendMailConfigurable mail
 
         resp 202 $ toResponse $
           templateConfirmation
@@ -525,3 +524,12 @@ accountSuitableForPasswordReset
     (AccountDetails { accountKind = Just AccountKindRealUser })
                                     = True
 accountSuitableForPasswordReset _ _ = False
+
+-- | Send mail using the sendmail binary. Checks @SENDMAIL_PATH@ env var
+-- first, falling back to the default @\/usr\/sbin\/sendmail@.
+sendMailConfigurable :: Mail -> IO ()
+sendMailConfigurable mail = do
+  mpath <- lookupEnv "SENDMAIL_PATH"
+  case mpath of
+    Just path -> renderSendMailCustom path ["-t"] mail
+    Nothing   -> renderSendMail mail

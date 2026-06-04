@@ -47,7 +47,10 @@ tagsStateComponent stateDir = do
     , stateHandle  = st
     , getState     = query st State.GetPackageTags
     , putState     = update st . State.ReplacePackageTags
-    , backupState  = \_ pkgTags -> [csvToBackup ["tags.csv"] $ tagsToCSV pkgTags]
+    , backupState  = \_ pkgTags ->
+        [ csvToBackup ["tags.csv"] $ tagsToCSV pkgTags
+        , csvToBackup ["reviews.csv"] $ reviewTagsToCSV pkgTags
+        ]
     , restoreState = tagsBackup
     , resetState   = tagsStateComponent
     }
@@ -60,7 +63,7 @@ tagsAliasComponent stateDir = do
     , stateHandle  = st
     , getState     = query st State.GetTagAliasesState
     , putState     = update st . State.AddTagAliasesState
-    , backupState  = \_ aliases -> [csvToBackup ["aliases.csv"] $ aliasToCSV aliases]
+    , backupState  = \_ aliases -> [csvToBackup ["tagAliases.csv"] $ aliasToCSV aliases]
     , restoreState = aliasBackup
     , resetState   = tagsAliasComponent
     }

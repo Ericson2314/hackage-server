@@ -1,6 +1,7 @@
-{-# LANGUAGE NamedFieldPuns  #-}
-{-# LANGUAGE RankNTypes      #-}
-{-# LANGUAGE RecordWildCards #-}
+{-# LANGUAGE NamedFieldPuns      #-}
+{-# LANGUAGE OverloadedStrings  #-}
+{-# LANGUAGE RankNTypes          #-}
+{-# LANGUAGE RecordWildCards     #-}
 
 module Distribution.Server.Features.AdminLog where
 
@@ -14,6 +15,7 @@ import Distribution.Server.Framework
 import Distribution.Server.Pages.AdminLog
 import Distribution.Server.Features.Users
 
+import Data.Aeson (toJSON, object, (.=))
 import Data.Time.Clock (getCurrentTime, UTCTime)
 import qualified Data.ByteString.Lazy.Char8 as BS
 import Distribution.Server.Util.Parse
@@ -67,11 +69,17 @@ adminLogFeature UserFeature{..} Store.Backend{backendStore = adminLogStore, back
     adminLogResource =
       (resourceAt "/admin/log.:format") {
         resourceDesc = [(GET, "Full list of group additions and removals")],
-        resourceGet  = [("html", serveAdminLogGet)]
+        resourceGet  = [("html", serveAdminLogGet), ("json", serveAdminLogJSON)]
       }
 
     queryGetAdminLog :: MonadIO m => m [(UTCTime,UserId,AdminAction,BS.ByteString)]
     queryGetAdminLog = Store.getAdminLog adminLogStore
+
+    serveAdminLogJSON _ = do
+      guardAuthorised_ [InGroup adminGroup]
+      entries <- queryGetAdminLog
+      return . toResponse . toJSON $ object
+        [ "totalEntries" .= length entries ]
 
     serveAdminLogGet _ = do
       rows  <- map mkRow <$> queryGetAdminLog
