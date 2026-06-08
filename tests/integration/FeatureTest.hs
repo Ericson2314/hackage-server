@@ -12,8 +12,6 @@
 {-# LANGUAGE OverloadedStrings #-}
 module Main (main) where
 
-import qualified Codec.Archive.Tar as Tar
-import qualified Codec.Compression.GZip as GZip
 import Control.Monad
 import Data.Aeson (object, (.=), toJSON)
 import qualified Data.ByteString.Lazy.Char8 as LBS
@@ -57,8 +55,6 @@ localTest ts root workDir = do
     withServerRunning ts workDir $ do
       setupBaseData ts
       setupFeatures ts
-      setupUserTests ts
-      setupRevisionTests ts
 
     -- Backup/restore round-trip (imperative — needs server lifecycle control)
     info "Making backup"

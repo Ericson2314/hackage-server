@@ -11,13 +11,15 @@ module Main (main) where
 
 import qualified Codec.Archive.Tar as Tar
 import qualified Codec.Compression.GZip as GZip
-import Control.Exception
 import Control.Monad
 import qualified Data.ByteString.Lazy.Char8 as LBS
 import Data.List (isInfixOf)
 import Data.String ()
 import System.Directory
-import System.Exit (ExitCode(..), die)
+import System.Exit (ExitCode(..))
+
+import Test.Tasty (TestTree, defaultMain, testGroup)
+import Test.Tasty.HUnit (testCase, assertBool, (@?=))
 import System.FilePath
 import System.IO
 import System.IO.Temp (withSystemTempDirectory)
@@ -76,9 +78,9 @@ doit ts root workDir
            ]
          case mec of
              Just (ExitFailure 1) -> return ()
-             Just (ExitFailure _) -> die "Server failed with wrong exit code"
-             Just ExitSuccess     -> die "Server worked unexpectedly"
-             Nothing              -> die "Got a signal?"
+             Just (ExitFailure _) -> fail "Server failed with wrong exit code"
+             Just ExitSuccess     -> fail "Server worked unexpectedly"
+             Nothing              -> fail "Got a signal?"
          info $ "Restoring database from " ++ tarGz1
          runServerChecked root ["restore", "--state-dir", workDir </> "state", tarGz1]
          info "Making another database backup"
@@ -86,12 +88,18 @@ doit ts root workDir
          info "Checking databases match"
          db1 <- LBS.readFile tarGz1
          db2 <- LBS.readFile tarGz2
-         unless (db1 == db2) $ die "Databases don't match"
+         unless (db1 == db2) $ fail "Databases don't match"
          info "Checking server still works, and data is intact"
          withServerRunning ts workDir $ do
            runPackageTests ts
            runFeatureDataTests ts
-         withServerRunning ts workDir $ runRevisionTests ts
+         withServerRunning ts workDir $ do
+           runRevisionTests ts
+           defaultMain $ testGroup "HighLevelTest after revisions"
+             [ runPackageTestsTree ts
+             , runRevisionTestsTree ts
+             , runFeatureDataTestsTree ts
+             ]
 
 
 runUserTests :: TestServer -> IO ()
@@ -99,11 +107,11 @@ runUserTests ts = do
     do info "Getting user list"
        xs <- fmap (map userName) $ getUsers ts
        unless (xs == ["admin"]) $
-           die ("Bad user list: " ++ show xs)
+           fail ("Bad user list: " ++ show xs)
     do info "Getting admin user list"
        xs <- getAdmins ts
        unless (map userName (groupMembers xs) == ["admin"]) $
-           die ("Bad admin user list: " ++ show xs)
+           fail ("Bad admin user list: " ++ show xs)
     do -- For this test we just create the users directly using the admin
        -- interface, there's a separate test that tests the self-signup.
        createUserDirect ts (Auth "admin" "admin") "HackageTestUser1" "testpass1"
@@ -111,11 +119,11 @@ runUserTests ts = do
     do info "Checking new users are now in user list"
        xs <- fmap (map userName) $ getUsers ts
        unless (xs == ["admin","HackageTestUser1","HackageTestUser2"]) $
-           die ("Bad user list: " ++ show xs)
+           fail ("Bad user list: " ++ show xs)
     do info "Checking new users are not in admin list"
        xs <- getAdmins ts
        unless (map userName (groupMembers xs) == ["admin"]) $
-           die ("Bad admin user list: " ++ show xs)
+           fail ("Bad admin user list: " ++ show xs)
     do info "Getting password change page for HackageTestUser1"
        void $ validate ts (Auth "HackageTestUser1" "testpass1") "/user/HackageTestUser1/password"
     do info "Getting password change page for HackageTestUser1 as an admin"
@@ -139,24 +147,24 @@ runUserTests ts = do
        delete ts isForbidden (Auth "HackageTestUser2" "newtestpass2") "/user/HackageTestUser2"
        xs <- fmap (map userName) $ getUsers ts
        unless (xs == ["admin","HackageTestUser1","HackageTestUser2"]) $
-           die ("Bad user list: " ++ show xs)
+           fail ("Bad user list: " ++ show xs)
     do info "Deleting HackageTestUser2 as admin"
        delete ts isNoContent (Auth "admin" "admin") "/user/HackageTestUser2"
        xs <- fmap (map userName) $ getUsers ts
        unless (xs == ["admin","HackageTestUser1"]) $
-           die ("Bad user list: " ++ show xs)
+           fail ("Bad user list: " ++ show xs)
     do info "Getting user info for HackageTestUser1"
        xs <- validate ts NoAuth "/user/HackageTestUser1"
        --TODO: set the user's real name, and then look for that here
        unless ("HackageTestUser1" `isInfixOf` xs) $
-           die ("Bad user info: " ++ show xs)
+           fail ("Bad user info: " ++ show xs)
 
 runPackageUploadTests :: TestServer -> IO ()
 runPackageUploadTests ts = do
     do info "Getting package list"
        xs <- map packageName `liftM` getPackages ts
        unless (xs == []) $
-           die ("Bad package list: " ++ show xs)
+           fail ("Bad package list: " ++ show xs)
     do info "Trying to upload testpackage"
        postFile ts isForbidden
                 (Auth "HackageTestUser1" "testpass1")
@@ -174,7 +182,7 @@ runPackageUploadTests ts = do
     do info "Checking Package Candidate Exists"
        xs <- validate ts NoAuth "/package/testpackage-1.0.0.0/candidate"
        unless (">testpackage: <small>test package testpackage</small></h1>" `isInfixOf` xs) $
-           die ("Bad package candidate info: " ++ show xs)
+           fail ("Bad package candidate info: " ++ show xs)
     do info "Uploading testpackage"
        postFile ts isOk
                 (Auth "HackageTestUser1" "testpass1")
@@ -187,7 +195,7 @@ runPackageUploadTests ts = do
     do info "Checking Package Exists"
        xs <- validate ts NoAuth "/package/testpackage-1.0.0.0"
        unless (">testpackage</a>: <small>test package testpackage</small></h1>" `isInfixOf` xs) $
-           die ("Bad package info: " ++ show xs)
+           fail ("Bad package info: " ++ show xs)
     do info "Checking Package Candidate no longer exists after package upload"
        checkIsExpectedCode ts isNotFound NoAuth "/package/testpackage-1.0.0.0/candidate"
     do info "Setting upload time"
@@ -196,14 +204,14 @@ runPackageUploadTests ts = do
            uploadTime
        xs <- getUrl ts NoAuth "/package/testpackage-1.0.0.0/upload-time"
        unless (xs == uploadTimeISO) $
-            die ("Bad upload time: " ++ show xs)
+            fail ("Bad upload time: " ++ show xs)
     do info "Setting upload time (ISO)"
        putText ts (Auth "HackageTestUser1" "testpass1")
            "/package/testpackage-1.0.0.0/upload-time"
            uploadTimeISO2
        xs <- getUrl ts NoAuth "/package/testpackage-1.0.0.0/upload-time"
        unless (xs == uploadTimeISO2) $
-            die ("Bad upload time: " ++ show xs)
+            fail ("Bad upload time: " ++ show xs)
     do info "Trying to upload existing testpackage as candidate"
        postFile ts isForbidden
                 (Auth "HackageTestUser1" "testpass1")
@@ -239,7 +247,7 @@ runRevisionTests ts = do
     do info "Checking revision exists"
        xs <- getUrl ts NoAuth "/package/testpackage-1.0.0.0/revision/1.cabal"
        unless (xs == revisedCabalFileContent) $
-           die "Bad revised cabal file content"
+           fail "Bad revised cabal file content"
     do info "Uploading testpackage with flags"
        postFile ts isOk
                 (Auth "HackageTestUser1" "testpass1")
@@ -253,7 +261,7 @@ runRevisionTests ts = do
     do info "Checking automatic default flag revision exists"
        xs <- getUrl ts NoAuth "/package/testpackageFlags-1.0.0.0/revision/1.cabal"
        unless (xs == revisedCabalFileContentDefaultAutomaticFlag) $
-           die "Bad revised cabal file content"
+           fail "Bad revised cabal file content"
     do info "Revising flag to manual"
        post ts (Auth "HackageTestUser1" "testpass1") "/package/testpackageFlags-1.0.0.0/testpackageFlags.cabal/edit"
          [ ("cabalfile", revisedCabalFileContentToManualFlag)
@@ -262,7 +270,7 @@ runRevisionTests ts = do
     do info "Checking automatic -> manual flag revision exists"
        xs <- getUrl ts NoAuth "/package/testpackageFlags-1.0.0.0/revision/2.cabal"
        unless (xs == revisedCabalFileContentToManualFlag) $
-           die "Bad revised cabal file content"
+           fail "Bad revised cabal file content"
     do info "Revising default for manual flag"
        post ts (Auth "HackageTestUser1" "testpass1") "/package/testpackageFlags-1.0.0.0/testpackageFlags.cabal/edit"
          [ ("cabalfile", revisedCabalFileContentDefaultManualFlag)
@@ -271,7 +279,7 @@ runRevisionTests ts = do
     do info "Checking manual default flag revision exists"
        xs <- getUrl ts NoAuth "/package/testpackageFlags-1.0.0.0/revision/3.cabal"
        unless (xs == revisedCabalFileContentDefaultManualFlag) $
-           die "Bad revised cabal file content"
+           fail "Bad revised cabal file content"
     do info "Revising flag to automatic"
        post ts (Auth "HackageTestUser1" "testpass1") "/package/testpackageFlags-1.0.0.0/testpackageFlags.cabal/edit"
          [ ("cabalfile", revisedCabalFileContentToAutomaticFlag)
@@ -280,7 +288,7 @@ runRevisionTests ts = do
     do info "Checking manual -> automatic flag revision exists"
        xs <- getUrl ts NoAuth "/package/testpackageFlags-1.0.0.0/revision/4.cabal"
        unless (xs == revisedCabalFileContentToAutomaticFlag) $
-           die "Bad revised cabal file content"
+           fail "Bad revised cabal file content"
   where
     (_, _, _, testpackageCabalFileContent, _, _) = testpackage
     revisedCabalFileContent =
@@ -306,7 +314,7 @@ runPackageTests ts = do
     do info "Getting package list"
        xs <- map packageName `liftM` getPackages ts
        unless (xs == ["testpackage"]) $
-           die ("Bad package list: " ++ show xs)
+           fail ("Bad package list: " ++ show xs)
     do info "Getting package index"
        targz <- getUrl ts NoAuth "/packages/index.tar.gz"
        let tar = GZip.decompress $ LBS.pack targz
@@ -314,54 +322,54 @@ runPackageTests ts = do
            entryFilenames = map Tar.entryPath    entries
            entryContents  = map Tar.entryContent entries
        unless (entryFilenames == [testpackageCabalIndexFilename]) $
-           die ("Bad index filenames: " ++ show entryFilenames)
+           fail ("Bad index filenames: " ++ show entryFilenames)
        case entryContents of
            [Tar.NormalFile bs _]
             | LBS.unpack bs == testpackageCabalFile ->
                return ()
            _ ->
-               die "Bad index contents"
+               fail "Bad index contents"
     do info "Getting package index with etag"
        validateETagHandling ts "/packages/index.tar.gz"
 
     do info "Getting testpackage info"
        xs <- validate ts NoAuth "/package/testpackage.html"
        unless (">testpackage</a>: <small>test package testpackage</small></h1>" `isInfixOf` xs) $
-           die ("Bad package info for unversioned HTML /package/testpackage.html endpoint: " ++ show xs)
+           fail ("Bad package info for unversioned HTML /package/testpackage.html endpoint: " ++ show xs)
 
     do info "Getting testpackage-1.0.0.0 info"
        xs <- validate ts NoAuth "/package/testpackage-1.0.0.0"
        unless (">testpackage</a>: <small>test package testpackage</small></h1>" `isInfixOf` xs) $
-           die ("Bad package info for versioned HTML /package/testpackage-1.0.0.0 endpoint: " ++ show xs)
+           fail ("Bad package info for versioned HTML /package/testpackage-1.0.0.0 endpoint: " ++ show xs)
 
     do info "Getting testpackage-1.0.0.0 info (JSON)"
        xs <- validate ts NoAuth "/package/testpackage-1.0.0.0.json"
        unless ("\"synopsis\":\"test package testpackage\"" `isInfixOf` xs) $
-           die ("Bad package info for versioned JSON endpoint, expected the synopsis field to contain \"test package testpackage\": " ++ show xs)
+           fail ("Bad package info for versioned JSON endpoint, expected the synopsis field to contain \"test package testpackage\": " ++ show xs)
 
     do info "Getting testpackage version info (JSON)"
        xs <- validate ts NoAuth "/package/testpackage.json"
        unless ("\"1.0.0.0\":\"normal\"" `isInfixOf` xs) $
-           die ("Bad package version info: " ++ show xs)
+           fail ("Bad package version info: " ++ show xs)
 
     do info "Getting testpackage Cabal file"
        cabalFile <- getUrl ts NoAuth "/package/testpackage-1.0.0.0/testpackage.cabal"
        unless (cabalFile == testpackageCabalFile) $
-           die "Bad Cabal file"
+           fail "Bad Cabal file"
     do info "Getting testpackage tar file"
        tarFile <- getUrl ts NoAuth "/package/testpackage/testpackage-1.0.0.0.tar.gz"
        unless (tarFile == testpackageTarFileContent) $
-           die "Bad tar file"
+           fail "Bad tar file"
     do info "Getting testpackage source"
        hsFile <- getUserContentUrl ts NoAuth ("/package/testpackage/src" </> testpackageHaskellFilename)
        unless (hsFile == testpackageHaskellFileContent) $
-           die "Bad Haskell file"
+           fail "Bad Haskell file"
     do info "Getting testpackage source with etag"
        validateETagHandlingUserContent ts ("/package/testpackage/src" </> testpackageHaskellFilename)
     do info "Getting testpackage maintainer info"
        xs <- getGroup ts "/package/testpackage/maintainers/.json"
        unless (map userName (groupMembers xs) == ["HackageTestUser1"]) $
-           die "Bad maintainers list"
+           fail "Bad maintainers list"
   where
     (_,                             testpackageTarFileContent,
      testpackageCabalIndexFilename, testpackageCabalFile,
@@ -397,35 +405,35 @@ runFeatureDataTests ts = do
     do info "Checking uploaders group"
        xs <- getGroup ts "/packages/uploaders/.json"
        unless ("HackageTestUser1" `elem` map userName (groupMembers xs)) $
-           die ("HackageTestUser1 missing from uploaders: " ++ show (map userName (groupMembers xs)))
+           fail ("HackageTestUser1 missing from uploaders: " ++ show (map userName (groupMembers xs)))
     do info "Checking mirrorers group"
        xs <- getGroup ts "/packages/mirrorers/.json"
        unless (map userName (groupMembers xs) == ["HackageTestUser1"]) $
-           die ("Bad mirrorers list: " ++ show (map userName (groupMembers xs)))
+           fail ("Bad mirrorers list: " ++ show (map userName (groupMembers xs)))
     -- UserDetails feature
     do info "Checking user details for HackageTestUser1"
        nci <- getNameContactInfo ts (Auth "HackageTestUser1" "testpass1")
                                  "/user/HackageTestUser1/name-contact.json"
        unless (realName nci == "Test User One") $
-           die ("Bad user real name: " ++ show (realName nci))
+           fail ("Bad user real name: " ++ show (realName nci))
        unless (contactEmailAddress nci == "test1@example.com") $
-           die ("Bad user contact email: " ++ show (contactEmailAddress nci))
+           fail ("Bad user contact email: " ++ show (contactEmailAddress nci))
     -- PreferredVersions feature: deprecated packages
     do info "Checking testpackage is deprecated"
        dep <- getDeprecatedInfo ts "testpackage"
        unless (isDeprecated dep) $
-           die ("testpackage should be deprecated but isn't: " ++ show dep)
+           fail ("testpackage should be deprecated but isn't: " ++ show dep)
     -- Tags feature: auto-assigned tags from package category
     do info "Checking testpackage tags"
        tags <- getJSONStrings ts "/package/testpackage/tags.json"
        let expected = ["bsd3", "library", "mycategory"]
        unless (all (`elem` tags) expected) $
-           die ("Missing tags, expected " ++ show expected ++ " in " ++ show tags)
+           fail ("Missing tags, expected " ++ show expected ++ " in " ++ show tags)
     -- AdminLog feature: log entries exist (from group add operations)
     do info "Checking admin log has entries"
        logInfo <- getUrl ts (Auth "admin" "admin") "/admin/log.json"
        unless ("totalEntries" `isInfixOf` logInfo) $
-           die ("Bad admin log response: " ++ show logInfo)
+           fail ("Bad admin log response: " ++ show logInfo)
     -- DownloadCount feature: endpoint works (counts may not be flushed yet)
     do info "Checking download counts endpoint"
        void $ getUrl ts NoAuth "/packages/top.json"
@@ -433,12 +441,12 @@ runFeatureDataTests ts = do
     do info "Checking build reports for testpackage"
        reports <- getUrl ts NoAuth "/package/testpackage-1.0.0.0/reports/"
        unless ("InstallOk" `isInfixOf` reports) $
-           die ("Build report missing or wrong: " ++ take 200 reports)
+           fail ("Build report missing or wrong: " ++ take 200 reports)
     -- Distro feature: distro was created
     do info "Checking distro list"
        distros <- getUrl ts NoAuth "/distros/"
        unless ("TestDistro" `isInfixOf` distros) $
-           die ("TestDistro missing from distro list: " ++ show distros)
+           fail ("TestDistro missing from distro list: " ++ show distros)
 
 buildReport :: String
 buildReport = unlines
@@ -455,3 +463,105 @@ buildReport = unlines
 
 testpackage :: (FilePath, String, FilePath, String, FilePath, String)
 testpackage = mkPackage "testpackage" Nothing
+
+
+------------------------------------------------------------------------
+-- TestTree versions of the verification functions, for the final
+-- tasty pass where failures should accumulate rather than abort.
+
+runPackageTestsTree :: TestServer -> TestTree
+runPackageTestsTree ts = testGroup "Package content"
+    [ testCase "package list" $ do
+        xs <- map packageName `liftM` getPackages ts
+        assertBool ("testpackage missing: " ++ show xs) ("testpackage" `elem` xs)
+    , testCase "package index" $ do
+        targz <- getUrl ts NoAuth "/packages/index.tar.gz"
+        let tar = GZip.decompress $ LBS.pack targz
+            entries = Tar.foldEntries (:) [] (error . show) $ Tar.read tar
+        assertBool "Index should contain testpackage"
+          (any ("testpackage" `isInfixOf`) (map Tar.entryPath entries))
+    , testCase "package index etag" $ validateETagHandling ts "/packages/index.tar.gz"
+    , testCase "package HTML" $ do
+        xs <- validate ts NoAuth "/package/testpackage-1.0.0.0"
+        assertBool ("Bad package info: " ++ take 200 xs)
+          (">testpackage</a>: <small>test package testpackage</small></h1>" `isInfixOf` xs)
+    , testCase "package JSON" $ do
+        xs <- validate ts NoAuth "/package/testpackage-1.0.0.0.json"
+        assertBool ("Bad package JSON: " ++ take 200 xs)
+          ("\"synopsis\":\"test package testpackage\"" `isInfixOf` xs)
+    , testCase "cabal file" $ do
+        let (_, _, _, cabalFile, _, _) = testpackage
+        got <- getUrl ts NoAuth "/package/testpackage-1.0.0.0/testpackage.cabal"
+        -- After revision the cabal file includes x-revision
+        assertBool ("Bad cabal file: " ++ take 200 got) ("x-revision: 1" `isInfixOf` got)
+    , testCase "tar file" $ do
+        let (_, tarContent, _, _, _, _) = testpackage
+        got <- getUrl ts NoAuth "/package/testpackage/testpackage-1.0.0.0.tar.gz"
+        got @?= tarContent
+    , testCase "source file" $ do
+        let (_, _, _, _, hsFilename, hsContent) = testpackage
+        got <- getUserContentUrl ts NoAuth ("/package/testpackage/src" </> hsFilename)
+        got @?= hsContent
+    , testCase "source file etag" $ do
+        let (_, _, _, _, hsFilename, _) = testpackage
+        validateETagHandlingUserContent ts ("/package/testpackage/src" </> hsFilename)
+    , testCase "maintainers" $ do
+        xs <- getGroup ts "/package/testpackage/maintainers/.json"
+        map userName (groupMembers xs) @?= ["HackageTestUser1"]
+    ]
+
+runRevisionTestsTree :: TestServer -> TestTree
+runRevisionTestsTree ts = testGroup "Revisions"
+    [ testCase "cabal revision" $ do
+        let (_, _, _, cabalContent, _, _) = testpackage
+            expected = "x-revision: 1\ndescription: a description added by revision\n" ++ cabalContent
+        got <- getUrl ts NoAuth "/package/testpackage-1.0.0.0/revision/1.cabal"
+        got @?= expected
+    , testCase "flag revision 1" $ do
+        got <- getUrl ts NoAuth "/package/testpackageFlags-1.0.0.0/revision/1.cabal"
+        got @?= mkFlagRevisionContent True False 1
+    , testCase "flag revision 2" $ do
+        got <- getUrl ts NoAuth "/package/testpackageFlags-1.0.0.0/revision/2.cabal"
+        got @?= mkFlagRevisionContent True True 2
+    , testCase "flag revision 3" $ do
+        got <- getUrl ts NoAuth "/package/testpackageFlags-1.0.0.0/revision/3.cabal"
+        got @?= mkFlagRevisionContent False True 3
+    , testCase "flag revision 4" $ do
+        got <- getUrl ts NoAuth "/package/testpackageFlags-1.0.0.0/revision/4.cabal"
+        got @?= mkFlagRevisionContent False False 4
+    ]
+  where
+    mkFlagRevisionContent flagDefault manual revision =
+      let flagStanza = unlines ["flag isTest", "  default: " ++ show flagDefault, "  manual: " ++ show manual]
+          (_, _, _, content, _, _) = mkPackage "testpackageFlags" (Just flagStanza)
+      in "x-revision: " ++ show (revision :: Int) ++ "\n" ++ content
+
+runFeatureDataTestsTree :: TestServer -> TestTree
+runFeatureDataTestsTree ts = testGroup "Feature data"
+    [ testCase "uploaders group" $ do
+        xs <- getGroup ts "/packages/uploaders/.json"
+        assertBool ("HackageTestUser1 missing from uploaders") ("HackageTestUser1" `elem` map userName (groupMembers xs))
+    , testCase "mirrorers group" $ do
+        xs <- getGroup ts "/packages/mirrorers/.json"
+        map userName (groupMembers xs) @?= ["HackageTestUser1"]
+    , testCase "user details" $ do
+        nci <- getNameContactInfo ts (Auth "HackageTestUser1" "testpass1") "/user/HackageTestUser1/name-contact.json"
+        realName nci @?= "Test User One"
+        contactEmailAddress nci @?= "test1@example.com"
+    , testCase "deprecated" $ do
+        dep <- getDeprecatedInfo ts "testpackage"
+        assertBool "testpackage should be deprecated" (isDeprecated dep)
+    , testCase "tags" $ do
+        tags <- getJSONStrings ts "/package/testpackage/tags.json"
+        assertBool ("Missing tags: " ++ show tags) (all (`elem` tags) ["bsd3", "library", "mycategory"])
+    , testCase "admin log" $ do
+        logInfo <- getUrl ts (Auth "admin" "admin") "/admin/log.json"
+        assertBool ("Bad admin log: " ++ take 200 logInfo) ("totalEntries" `isInfixOf` logInfo)
+    , testCase "download counts" $ void $ getUrl ts NoAuth "/packages/top.json"
+    , testCase "build reports" $ do
+        reports <- getUrl ts NoAuth "/package/testpackage-1.0.0.0/reports/"
+        assertBool ("Build report missing: " ++ take 200 reports) ("InstallOk" `isInfixOf` reports)
+    , testCase "distro list" $ do
+        distros <- getUrl ts NoAuth "/distros/"
+        assertBool ("TestDistro missing: " ++ take 200 distros) ("TestDistro" `isInfixOf` distros)
+    ]
