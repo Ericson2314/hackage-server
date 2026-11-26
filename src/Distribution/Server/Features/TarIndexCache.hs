@@ -22,6 +22,7 @@ import qualified Distribution.Server.Features.TarIndexCache.Store as Store
 import qualified Distribution.Server.Features.TarIndexCache.State as Acid
 import Distribution.Server.Features.Users
 import Distribution.Server.Packages.Types
+import Distribution.Server.Packages.Utils
 import Data.TarIndex
 import qualified Data.TarIndex as TarIndex
 import Distribution.Server.Util.ServeTarball (constructTarIndex)

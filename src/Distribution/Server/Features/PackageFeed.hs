@@ -8,6 +8,7 @@ import Distribution.Server.Features.Users
 import Distribution.Server.Framework
 import Distribution.Server.Packages.ChangeLog
 import Distribution.Server.Packages.Types
+import Distribution.Server.Packages.Utils
 import Distribution.Server.Users.Types (UserId, UserName)
 import Distribution.Server.Util.Parse (unpackUTF8)
 import Distribution.Server.Util.ServeTarball (loadTarEntry)
@@ -79,7 +80,7 @@ packageFeedFeature ServerEnv{..}
       now <- liftIO getCurrentTime
       pkgname <- packageInPath dpath
       pkgs <- sortOn (Down . pkgOriginalUploadTime) <$> lookupPackageName pkgname
-      userIdToName <- queryUserNamesFor (map (snd . pkgOriginalUploadInfo) pkgs)
+      userIdToName <- queryUserNamesFor (map (uploadInfoUser . pkgOriginalUploadInfo) pkgs)
       pkgs' <- liftIO $ forM pkgs changelog
       return $ toResponse $ renderPackageFeed userIdToName serverBaseURI now pkgname pkgs'
 
@@ -100,7 +101,7 @@ renderPackageFeed userIdToName hostURI now name pkgs = RSS title uri desc (chann
         desc = "New releases of package '" ++ unPackageName name ++ "' on Hackage."
         items = feedItems userIdToName uri <$> pkgs
         uri = hostURI { uriPath = "/package/" ++ display name }
-        updated = maybe now (fst . pkgOriginalUploadInfo . fst) (listToMaybe pkgs)
+        updated = maybe now (pkgOriginalUploadTime . fst) (listToMaybe pkgs)
 
 channel :: UTCTime -> [RSS.ChannelElem]
 channel updated =
@@ -130,8 +131,8 @@ feedItems userIdToName hostURI (pkgInfo, chlog) =
           , d "Maintainer" $ maintainer pd
           ] +++ XHtml.hr +++ chlog
         pkgName = display (pkgInfoId pkgInfo)
-        (time, uploaderId) = pkgOriginalUploadInfo pkgInfo
+        UploadInfo time uploaderId = pkgOriginalUploadInfo pkgInfo
         timestr = formatTime defaultTimeLocale "%Y-%m-%dT%H:%M:%SZ" time
         uploader = display $ userIdToName uploaderId
-        pd = packageDescription (pkgDesc pkgInfo)
+        pd = packageDescription $ pkgDesc $ pkgLatestRevision pkgInfo
         d dt dd = XHtml.dterm (XHtml.toHtml dt) +++ XHtml.ddef (XHtml.toHtml dd)

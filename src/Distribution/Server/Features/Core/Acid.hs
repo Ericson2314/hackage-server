@@ -9,7 +9,8 @@ import qualified Distribution.Server.Features.Core.State as Acid
 import Distribution.Server.Features.Security.Migration
 import Distribution.Server.Framework
 import qualified Distribution.Server.Packages.PackageIndex as PackageIndex
-import Distribution.Server.Packages.Types (PkgInfo, pkgLatestUploadTime)
+import Distribution.Server.Packages.Types (PkgInfo)
+import Distribution.Server.Packages.Utils (pkgLatestUploadTime)
 
 import Distribution.Package (packageId)
 

@@ -11,6 +11,7 @@ module Distribution.Server.Pages.Recent (
   ) where
 
 import Distribution.Server.Packages.Types
+import Distribution.Server.Packages.Utils
 import Distribution.Server.Users.Types (UserId, UserName)
 import Distribution.Server.Pages.Template
          ( hackagePageWithHead )
@@ -37,11 +38,11 @@ import Distribution.Server.Util.Paging (PaginatedConfiguration(..), hasNext,
 
 -- | The users that 'recentPage' and 'recentFeed' show.
 recentUserIds :: PaginatedConfiguration -> [PkgInfo] -> [UserId]
-recentUserIds conf = map (snd . pkgOriginalUploadInfo) . paginate conf
+recentUserIds conf = map (uploadInfoUser . pkgOriginalUploadInfo) . paginate conf
 
 -- | The users that 'revisionsPage' and 'recentRevisionsFeed' show.
 revisionsUserIds :: PaginatedConfiguration -> [PkgInfo] -> [UserId]
-revisionsUserIds conf = map (snd . pkgLatestUploadInfo) . paginate conf
+revisionsUserIds conf = map (uploadInfoUser . pkgLatestUploadInfo) . paginate conf
 
 -- | Takes a list of package info, in reverse order by timestamp.
 
@@ -67,7 +68,7 @@ recentPage conf userIdToName pkgs =
 
 
 pageSizeForm :: URL -> Html
-pageSizeForm base = 
+pageSizeForm base =
   let pageSizeLabel = XHtml.label ! [XHtml.thefor "pageSize"] << "Page Size: "
       pageSizeInput = XHtml.input ! [XHtml.thetype "number", XHtml.name "pageSize", XHtml.strAttr "min" "0"]
       submitButton = XHtml.button ! [XHtml.thetype "submit"] << "Submit"
@@ -75,20 +76,20 @@ pageSizeForm base =
   in theForm << (pageSizeLabel <> pageSizeInput <> submitButton)
 
 
-paginator :: PaginatedConfiguration -> URL -> Html 
-paginator pc@PaginatedConfiguration{currPage} baseUrl = 
-  let 
+paginator :: PaginatedConfiguration -> URL -> Html
+paginator pc@PaginatedConfiguration{currPage} baseUrl =
+  let
     info = XHtml.thediv << pagingInfo pc
 
-    next = XHtml.anchor ! [XHtml.href (fromMaybe "" (nextURL baseUrl pc)) | hasNext pc] << "Next" 
+    next = XHtml.anchor ! [XHtml.href (fromMaybe "" (nextURL baseUrl pc)) | hasNext pc] << "Next"
     prev = XHtml.anchor ! [XHtml.href (fromMaybe "" (prevURL baseUrl pc)) | hasPrev pc] << "Previous"
-      
+
 
     pagedURLS = zip [1..] (allPagedURLs baseUrl pc)
-    pagedLinks = (\(x,y) -> XHtml.anchor ! [XHtml.href y, 
+    pagedLinks = (\(x,y) -> XHtml.anchor ! [XHtml.href y,
       if currPage == x then XHtml.theclass "current" else noAttr ] << show x) <$> pagedURLS
 
-    wrapper = XHtml.thediv ! [XHtml.theclass "paginator"] << 
+    wrapper = XHtml.thediv ! [XHtml.theclass "paginator"] <<
       (prev <> reducePagedLinks pc pagedLinks <> next)
 
 
@@ -109,10 +110,10 @@ reducePagedLinks PaginatedConfiguration{currPage} xs
         fillLast x = insertAt (pred . length $ x) filler x
         keepFirstPages x = case splitAt (length x - 2) x of (hts, hts') -> take 5 hts ++ hts'
         keepLastPages x = case splitAt 2 x of (hts, hts') -> hts ++ takeLast 5 hts'
-        keepMiddlePages x = 
-          case splitAt currPage x of (hts, hts') -> take 2 hts ++ [last hts] ++ take 2 hts' 
+        keepMiddlePages x =
+          case splitAt currPage x of (hts, hts') -> take 2 hts ++ [last hts] ++ take 2 hts'
                                       ++ takeLast 2 hts'
-                                      
+
 insertAt :: Int -> a -> [a] -> [a]
 insertAt n a x = case splitAt n x of (hts, hts') -> hts ++ [a] ++ hts'
 
@@ -151,7 +152,7 @@ makeRow userIdToName pkginfo =
     nbsp = XHtml.primHtmlChar "nbsp"
     user = userIdToName userId
 
-    (time, userId) = pkgOriginalUploadInfo pkginfo
+    UploadInfo time userId = pkgOriginalUploadInfo pkginfo
     pkgid = pkgInfoId pkginfo
 
 makeRevisionRow :: (UserId -> UserName) -> PkgInfo -> Html
@@ -167,7 +168,7 @@ makeRevisionRow userIdToName pkginfo =
     nbsp = XHtml.primHtmlChar "nbsp"
     user = userIdToName userId
 
-    (time, userId) = pkgLatestUploadInfo pkginfo
+    UploadInfo time userId = pkgLatestUploadInfo pkginfo
     pkgid = pkgInfoId pkginfo
     revno = "-r" ++ show (pkgNumRevisions pkginfo - 1)
     revlabel = [XHtml.toHtml (display pkgid), XHtml.toHtml revno]
@@ -210,7 +211,7 @@ recentFeed conf userIdToName hostURI now pkgs = RSS
     (start,end) = pageIndexRange conf
     desc = "Showing " ++ show start ++ " - " ++ show end ++ " most recent additions to Hackage, the Haskell package database."
     pkgList = paginate conf pkgs
-    updated = maybe now (fst . pkgOriginalUploadInfo) (listToMaybe pkgList)
+    updated = maybe now pkgOriginalUploadTime (listToMaybe pkgList)
 
 recentRevisionsFeed :: PaginatedConfiguration -> (UserId -> UserName) -> URI -> UTCTime -> [PkgInfo] -> RSS
 recentRevisionsFeed conf userIdToName hostURI now pkgs = RSS
@@ -223,10 +224,10 @@ recentRevisionsFeed conf userIdToName hostURI now pkgs = RSS
     (start, end) = pageIndexRange conf
     desc = "Showing " ++ show start ++ " - " ++ show end ++ " most recent revisions to cabal metadata in Hackage, the Haskell package database."
     pkgList = paginate conf pkgs
-    updated = maybe now (fst . pkgOriginalUploadInfo) (listToMaybe pkgList)
+    updated = maybe now pkgOriginalUploadTime (listToMaybe pkgList)
 
 channel :: UTCTime -> [RSS.ChannelElem]
-channel updated = 
+channel updated =
   [ RSS.Language "en"
   , RSS.ManagingEditor email
   , RSS.WebMaster email
@@ -248,12 +249,12 @@ releaseItem userIdToName hostURI pkgInfo =
   where
     uri   = hostURI { uriPath = packageURL pkgId }
     title = display (packageName pkgId) ++ " " ++ display (packageVersion pkgId)
-    body  = fromShortText $ synopsis (packageDescription (pkgDesc pkgInfo))
+    body  = fromShortText $ synopsis $ packageDescription $ pkgDesc $ pkgLatestRevision pkgInfo
     desc  = "<i>Added by " ++ display user ++ ", " ++ showTime time ++ ".</i>"
          ++ if null body then "" else "<p>" ++ body ++ "</p>"
     user = userIdToName userId
 
-    (time, userId) = pkgOriginalUploadInfo pkgInfo
+    UploadInfo time userId = pkgOriginalUploadInfo pkgInfo
     pkgId = pkgInfoId pkgInfo
 
 revisionItem :: (UserId -> UserName) -> URI -> PkgInfo -> [RSS.ItemElem]
@@ -274,5 +275,5 @@ revisionItem userIdToName hostURI pkgInfo =
     user = userIdToName userId
     revision = pkgNumRevisions pkgInfo - 1
 
-    (time, userId) = pkgLatestUploadInfo pkgInfo
+    UploadInfo time userId = pkgLatestUploadInfo pkgInfo
     pkgId = pkgInfoId pkgInfo

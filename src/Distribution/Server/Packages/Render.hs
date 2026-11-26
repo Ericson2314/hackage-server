@@ -22,7 +22,6 @@ import Control.Arrow ((&&&), (***))
 import Data.Char (toLower, isSpace)
 import qualified Data.Map as Map
 import qualified Data.Set as Set
-import qualified Data.Vector as Vec
 import Data.List (intercalate)
 import Data.Time.Clock (UTCTime)
 import System.FilePath.Posix ((</>), (<.>))
@@ -48,6 +47,7 @@ import Distribution.Types.LibraryVisibility (LibraryVisibility(LibraryVisibility
 -- hackage-server
 import Distribution.Server.Framework.CacheControl (ETag)
 import Distribution.Server.Packages.Types
+import Distribution.Server.Packages.Utils
 import Distribution.Server.Packages.ModuleForest
 import Distribution.Server.Users.Types
 import Distribution.Utils.Path (getSymbolicPath)
@@ -99,7 +99,7 @@ data PackageRender = PackageRender {
 
 -- | The users whose info 'doPackageRender' shows.
 packageRenderUserIds :: PkgInfo -> [UserId]
-packageRenderUserIds info = [snd (pkgOriginalUploadInfo info), snd (pkgLatestUploadInfo info)]
+packageRenderUserIds info = [pkgOriginalUploadUser info, uploadInfoUser (pkgLatestUploadInfo info)]
 
 doPackageRender :: (UserId -> Maybe UserInfo) -> PkgInfo -> PackageRender
 doPackageRender lookupUser info = PackageRender
@@ -126,11 +126,11 @@ doPackageRender lookupUser info = PackageRender
     , rendHasTarball   = not . null $ pkgAllTarballs info
     , rendChangeLog    = Nothing -- populated later
     , rendReadme       = Nothing -- populated later
-    , rendUploadInfo   = let (utime, uid) = pkgOriginalUploadInfo info
+    , rendUploadInfo   = let UploadInfo utime uid = pkgOriginalUploadInfo info
                          in (utime, lookupUser uid)
-    , rendUpdateInfo   = let maxrevision  = pkgMaxRevision info
-                             (utime, uid) = pkgLatestUploadInfo info
-                             uinfo        = lookupUser uid
+    , rendUpdateInfo   = let maxrevision          = pkgMaxRevision info
+                             UploadInfo utime uid = pkgLatestUploadInfo info
+                             uinfo                = lookupUser uid
                          in if maxrevision > MetadataRevIx 0
                               then Just (maxrevision, utime, uinfo)
                               else Nothing
@@ -139,7 +139,7 @@ doPackageRender lookupUser info = PackageRender
     , rendOther        = desc
     }
   where
-    genDesc  = pkgDesc info
+    genDesc  = pkgDesc $ pkgLatestRevision info
     flatDesc = flattenPackageDescription genDesc
     desc     = packageDescription genDesc
     pkgUri   = "/package/" ++ display (pkgInfoId info)

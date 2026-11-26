@@ -42,6 +42,7 @@ import qualified Distribution.Server.Features.BuildReports.BuildReport as BR
 import Distribution.Server.Users.Types
 import qualified Distribution.Server.Users.Group as Group
 import Distribution.Server.Packages.Types
+import Distribution.Server.Packages.Utils
 import Distribution.Server.Packages.Render
 import Distribution.Server.Users.Group (UserGroup(..))
 
@@ -638,7 +639,7 @@ mkHtmlCore ServerEnv{serverBaseURI, serverBlobStore}
             pkgname = packageName realpkg
             docURL  = packageDocsContentUri docs realpkg
             execs   = rendExecNames render
-            pkgdesc = flattenPackageDescription $ pkgDesc pkg
+            pkgdesc = flattenPackageDescription $ pkgDesc $ pkgLatestRevision pkg
             maintainers = maintainersGroup pkgname
 
         prefInfo      <- queryGetPreferredInfo pkgname
@@ -821,7 +822,7 @@ mkHtmlCore ServerEnv{serverBaseURI, serverBlobStore}
                 (cabalFileByteString prev)
                 (cabalFileByteString curr)
 
-      userIdToName <- queryUserNamesFor (map snd uploadInfos)
+      userIdToName <- queryUserNamesFor (map uploadInfoUser uploadInfos)
       cacheControl [NoCache] (etagFromHash numRevisions)
       template <- getTemplate templates "revisions.html"
       return $ toResponse $ template
@@ -836,7 +837,7 @@ mkHtmlCore ServerEnv{serverBaseURI, serverBlobStore}
         revisionToTemplate :: (UserId -> UserName) -> UploadInfo -> Int
                            -> (SHA256Digest, [Change])
                            -> TemplateVal
-        revisionToTemplate userIdToName (utime, uid) revision (sha256hash, changes) =
+        revisionToTemplate userIdToName (UploadInfo utime uid) revision (sha256hash, changes) =
           let uname = userIdToName uid
            in templateDict
                 [ templateVal "number" revision

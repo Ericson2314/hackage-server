@@ -38,10 +38,10 @@ data Store = Store {
     -- | Package versions whose latest upload or revision is after the first
     -- time and no later than the second.
   , latestUploadsBetween   :: forall m. MonadIO m => UTCTime -> UTCTime -> m [PkgInfo]
-  , addPackage             :: forall m. MonadIO m => PkgInfo -> UploadInfo -> UserName -> [TarIndexEntry] -> m Bool
+  , addPackage             :: forall m. MonadIO m => PkgInfo -> OldUploadInfo -> UserName -> [TarIndexEntry] -> m Bool
   , deletePackage          :: forall m. MonadIO m => PackageId -> m (Maybe PkgInfo)
-  , addPackageRevision     :: forall m. MonadIO m => PackageId -> CabalFileText -> UploadInfo -> UserName -> m (Maybe PkgInfo, PkgInfo)
-  , addPackageTarball      :: forall m. MonadIO m => PackageId -> PkgTarball -> UploadInfo -> m (Maybe (PkgInfo, PkgInfo))
+  , addPackageRevision     :: forall m. MonadIO m => PackageId -> CabalFileText -> OldUploadInfo -> UserName -> m (Maybe PkgInfo, PkgInfo)
+  , addPackageTarball      :: forall m. MonadIO m => PackageId -> PkgTarball -> OldUploadInfo -> m (Maybe (PkgInfo, PkgInfo))
   , setPackageUploader     :: forall m. MonadIO m => PackageId -> UserId -> m (Maybe (PkgInfo, PkgInfo))
   , setPackageUploadTime   :: forall m. MonadIO m => PackageId -> UTCTime -> m (Maybe (PkgInfo, PkgInfo))
   , addOtherIndexEntry     :: forall m. MonadIO m => TarIndexEntry -> m ()

@@ -21,6 +21,7 @@ import Distribution.Server.Features.PreferredVersions
 import Distribution.Server.Util.CountingMap (cmFind)
 
 import Distribution.Server.Packages.Types
+import Distribution.Server.Packages.Utils
 import Distribution.Server.Users.Types
 
 import Distribution.Package
@@ -155,7 +156,7 @@ initListFeature _env = do
         modifyItem pkgname $ \x ->
             updateReferenceVersion prefsinfo allVersions $
               x
-                { itemLastUpload = fst (pkgOriginalUploadInfo pkg)
+                { itemLastUpload = pkgOriginalUploadTime pkg
                 }
         runHook_ itemUpdate (Set.singleton pkgname)
 
@@ -259,7 +260,7 @@ listFeature CoreFeature{..}
         pkgs <- queryLookupPackageName pkgname
         case pkgs of
            [] -> modifyMemState itemCache (Map.delete pkgname)
-           _  -> modifyItem pkgname (updateDescriptionItem $ pkgDesc $ last pkgs)
+           _  -> modifyItem pkgname (updateDescriptionItem $ pkgDesc $ pkgLatestRevision $ last pkgs)
         runHook_ itemUpdate (Set.singleton pkgname)
 
     refreshDownloads = do
@@ -279,7 +280,7 @@ listFeature CoreFeature{..}
     constructItem :: PkgInfo -> IO (PackageName, PackageItem)
     constructItem pkg = do
         let pkgname = packageName pkg
-            desc = pkgDesc pkg
+            desc = pkgDesc $ pkgLatestRevision pkg
         intRevDirectCount <- revDirectCount pkgname
         tags  <- queryTagsForPackage pkgname
         downs <- recentPackageDownloads
@@ -295,7 +296,7 @@ listFeature CoreFeature{..}
           , itemDeprecated = deprs
           , itemDownloads  = cmFind pkgname downs
           , itemVotes      = votes
-          , itemLastUpload = fst (pkgOriginalUploadInfo pkg)
+          , itemLastUpload = pkgOriginalUploadTime pkg
           , itemRevDepsCount = intRevDirectCount
           , itemHotness = votes + fromIntegral (cmFind pkgname downs) + fromIntegral intRevDirectCount * 2
           }

@@ -66,9 +66,9 @@ data PartialIndex = PartialIndex !(Map PackageId PartialPkg)
 
 data PartialPkg = PartialPkg {
     partialCabal         :: [(Int, CabalFileText)],
-    partialCabalUpload   :: [(Int, UploadInfo)],
+    partialCabalUpload   :: [(Int, OldUploadInfo)],
     partialTarball       :: [(Int, (FilePath, BlobId))],
-    partialTarballUpload :: [(Int, (UploadInfo, Maybe TarballInfo))]
+    partialTarballUpload :: [(Int, (OldUploadInfo, Maybe TarballInfo))]
 }
 
 data TarballInfo = TarballInfo {
@@ -135,11 +135,11 @@ parsePackageId pkgStr = case simpleParse pkgStr of
   Nothing    -> fail $ "Package directory " ++ show pkgStr ++ " isn't a valid package id"
   Just pkgId -> return pkgId
 
-importCabalMetadata :: [String] -> CSV -> Restore [(Int, UploadInfo)]
+importCabalMetadata :: [String] -> CSV -> Restore [(Int, OldUploadInfo)]
 importCabalMetadata _fp (_versionStr:_headers:body) =
     mapM fromRecord body
   where
-    fromRecord :: Record -> Restore (Int, UploadInfo)
+    fromRecord :: Record -> Restore (Int, OldUploadInfo)
     fromRecord [strIndex, strTime, strUser] = do
        index   <- parseRead    "index"   strIndex
        utcTime <- parseUTCTime "time"    strTime
@@ -149,14 +149,14 @@ importCabalMetadata _fp (_versionStr:_headers:body) =
 importCabalMetadata fp _ =
     fail $ "Invalid cabal metadata in " ++ foldr1 (</>) fp
 
-importTarballMetadata :: [String] -> CSV -> Restore [(Int, (UploadInfo, Maybe TarballInfo))]
+importTarballMetadata :: [String] -> CSV -> Restore [(Int, (OldUploadInfo, Maybe TarballInfo))]
 importTarballMetadata _fp ([strVersion]:_headers:body) = do
     version <- parseVersion "CSV version header" strVersion
     if version >= Version [0,2] []
       then mapM fromRecord_v2 body
       else mapM fromRecord_v1 body
   where
-    fromRecord_v2 :: Record -> Restore (Int, (UploadInfo, Maybe TarballInfo))
+    fromRecord_v2 :: Record -> Restore (Int, (OldUploadInfo, Maybe TarballInfo))
     fromRecord_v2 [strIndex, strTime, strUser, strTarGzMD5, strTarGzLen, strTarGzSHA256, strTarMD5] = do
        index   <- parseRead    "index"   strIndex
        utcTime <- parseUTCTime "time"    strTime
@@ -168,7 +168,7 @@ importTarballMetadata _fp ([strVersion]:_headers:body) = do
        return (index, ((utcTime, user), Just TarballInfo{..}))
     fromRecord_v2 x = fail $ "Error processing versions list: " ++ show x
 
-    fromRecord_v1 :: Record -> Restore (Int, (UploadInfo, Maybe TarballInfo))
+    fromRecord_v1 :: Record -> Restore (Int, (OldUploadInfo, Maybe TarballInfo))
     fromRecord_v1 [strIndex, strTime, strUser] = do
        index   <- parseRead    "index"   strIndex
        utcTime <- parseUTCTime "time"    strTime
@@ -211,10 +211,10 @@ partialToFullPkg (pkgId, PartialPkg{..}) = do
       pkgTarballRevisions  = Vec.fromList tarballRevisions
     }
   where
-    combineCabal :: CabalFileText -> UploadInfo -> Restore (CabalFileText, UploadInfo)
+    combineCabal :: CabalFileText -> OldUploadInfo -> Restore (CabalFileText, OldUploadInfo)
     combineCabal cabalFile uploadInfo = return (cabalFile, uploadInfo)
 
-    combineTarball :: (FilePath, BlobId) -> (UploadInfo, Maybe TarballInfo) -> Restore (PkgTarball, UploadInfo)
+    combineTarball :: (FilePath, BlobId) -> (OldUploadInfo, Maybe TarballInfo) -> Restore (PkgTarball, OldUploadInfo)
     combineTarball (filename, blobId) (uploadInfo, Just TarballInfo{..}) = do
       pkgTarballGz <-
         -- If the blob ID of the restored file matches the one in the metadata,
@@ -284,7 +284,7 @@ partialToFullPkg (pkgId, PartialPkg{..}) = do
        fail $ "Upload log entry for " ++ item ++ " (index "
            ++ show (fst y) ++") found, but file itself missing"
 
-    sortByUploadTimes :: [(a, UploadInfo)] -> [(a, UploadInfo)]
+    sortByUploadTimes :: [(a, OldUploadInfo)] -> [(a, OldUploadInfo)]
     sortByUploadTimes = sortBy (comparing (fst . snd))
 
 -- Workaround: in zlib prior to 0.5.4.1, GZip.decompress would not fully
@@ -316,7 +316,7 @@ infoToAllEntries pkg =
     in cabals ++ tarballs
 
 ----------- Converting pieces of PkgInfo to entries
-cabalListToExport :: PackageId -> [(CabalFileText, UploadInfo)] -> [BackupEntry]
+cabalListToExport :: PackageId -> [(CabalFileText, OldUploadInfo)] -> [BackupEntry]
 cabalListToExport pkgId cabalInfos =
       csvToBackup (pkgPath pkgId "uploads.csv") cabalMetadata
     : map blobEntry (zip [0..] cabals)
@@ -337,14 +337,14 @@ cabalListToExport pkgId cabalInfos =
         versionCSVVer = Version [0,1] ["unstable"]
         versionCSVKey = ["index", "time", "user-id"]
 
-    metadataEntry :: (Int, UploadInfo) -> Record
+    metadataEntry :: (Int, OldUploadInfo) -> Record
     metadataEntry (index, (time, user)) = [
         BS8.pack (show (index :: Int))
       , formatUTCTime time
       , BS8.pack (display user)
       ]
 
-tarballListToExport :: PackageId -> [(PkgTarball, UploadInfo)] -> [BackupEntry]
+tarballListToExport :: PackageId -> [(PkgTarball, OldUploadInfo)] -> [BackupEntry]
 tarballListToExport pkgId tarballInfos =
       csvToBackup (pkgPath pkgId "tarball.csv") tarballMetadata
     : map blobEntry (zip [0..] (map fst tarballInfos))
@@ -375,7 +375,7 @@ tarballListToExport pkgId tarballInfos =
                         , "tar-md5"
                         ]
 
-    metadataEntry :: (Int, (TarballInfo, UploadInfo)) -> Record
+    metadataEntry :: (Int, (TarballInfo, OldUploadInfo)) -> Record
     metadataEntry (index, (TarballInfo{..}, (time, user))) = [
         BS8.pack (show (index :: Int))
       , formatUTCTime time

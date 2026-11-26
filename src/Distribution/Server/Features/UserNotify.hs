@@ -35,6 +35,7 @@ import Distribution.Server.Users.Types (UserId, UserInfo (..), UserName)
 import Distribution.Server.Users.UserIdSet as UserIdSet
 
 import Distribution.Server.Packages.Types
+import Distribution.Server.Packages.Utils
 
 import Distribution.Server.Framework
 import Distribution.Server.Framework.Templating
@@ -565,7 +566,7 @@ userNotifyFeature UserFeature{..}
                   NotifyNewRevision
                     { notifyPackageId = pkgInfoId pkg
                     , notifyRevisions =
-                        filter (\(t, _) -> earlier < t && t <= now)
+                        filter ((\t -> earlier < t && t <= now) . uploadInfoTime)
                           $ pkgAllRevisionsUploadInfos pkg
                     }
               else do
@@ -660,7 +661,7 @@ notificationUserIds :: (UserId, Notification) -> [UserId]
 notificationUserIds (recipient, notif) =
   recipient : case notif of
     NotifyNewVersion{notifyPackageInfo} -> [pkgLatestUploadUser notifyPackageInfo]
-    NotifyNewRevision{notifyRevisions} -> map snd notifyRevisions
+    NotifyNewRevision{notifyRevisions} -> map uploadInfoUser notifyRevisions
     NotifyMaintainerUpdate{notifyUserActor, notifyUserSubject} -> [notifyUserActor, notifyUserSubject]
     NotifyDocsBuild{} -> []
     NotifyUpdateTags{} -> []
@@ -798,14 +799,15 @@ getNotificationEmails
     renderNotifyNewVersion pkg =
       EmailContentParagraph $
         "Package upload, " <> renderPkgLink (pkgInfoId pkg) <> ", by " <>
-        renderUserTime (pkgLatestUploadUser pkg) (pkgLatestUploadTime pkg)
+        renderUploadInfo (UploadInfo (pkgLatestUploadTime pkg) (pkgLatestUploadUser pkg))
 
+    renderNotifyNewRevision :: PackageIdentifier -> [UploadInfo] -> EmailContent
     renderNotifyNewRevision pkg revs =
       EmailContentParagraph ("Package metadata revision(s), " <> renderPkgLink pkg <> ":")
-      <> EmailContentList (map (uncurry $ flip renderUserTime) $ sortOn (Down . fst) revs)
+      <> EmailContentList (map renderUploadInfo $ sortOn (Down . uploadInfoTime) revs)
 
     renderNotifyMaintainerUpdate updateType userActor userSubject pkg reason time =
-      EmailContentParagraph ("Group modified by " <> renderUserTime userActor time <> ":")
+      EmailContentParagraph ("Group modified by " <> renderUploadInfo (UploadInfo time userActor) <> ":")
       <> EmailContentList
           [ case updateType of
               MaintainerAdded ->
@@ -872,7 +874,7 @@ getNotificationEmails
 
     renderTime = emailContentStr . formatTime defaultTimeLocale "%c"
 
-    renderUserTime u t = renderUser u <> " [" <> renderTime t <> "]"
+    renderUploadInfo (UploadInfo t u) = renderUser u <> " [" <> renderTime t <> "]"
 
 {----- Utilities -----}
 

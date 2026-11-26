@@ -16,6 +16,7 @@ import Distribution.Server.Features.Users
 import Distribution.Server.Features.Mirror.Acid (acidStore)
 import qualified Distribution.Server.Features.Mirror.Store as Store
 import Distribution.Server.Packages.Types
+import Distribution.Server.Packages.Utils
 import Distribution.Server.Users.Types
 import Distribution.Server.Users.Users hiding (lookupUserName)
 import Distribution.Server.Users.Group (UserGroup(..), GroupDescription(..), nullDescription)

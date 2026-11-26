@@ -22,6 +22,7 @@ import Distribution.Server.Features.Users
 import qualified Distribution.Server.Packages.PackageIndex as PackageIndex
 import Distribution.Server.Packages.PackageIndex (PackageIndex)
 import Distribution.Server.Packages.Types
+import Distribution.Server.Packages.Utils
 import Distribution.Server.Packages.Render (categorySplit)
 import Distribution.Utils.ShortText (fromShortText)
 
@@ -110,7 +111,7 @@ initTagsFeature ServerEnv{serverStateDir} = do
           Nothing      -> return ()
           Just pkginfo -> do
             let pkgname = packageName pkgid
-                itags = constructImmutableTags . pkgDesc $ pkginfo
+                itags = constructImmutableTags . pkgDesc . pkgLatestRevision $ pkginfo
             curtags <- Store.getTagsForPackage tagsStore pkgname
             aliases <- mapM (Store.getTagAlias tagsStore) (itags ++ Set.toList curtags)
             let newtags = Set.fromList aliases
@@ -277,7 +278,7 @@ tagsFeature CoreFeature{ queryLatestPackages }
 constructTagIndex :: PackageIndex PkgInfo -> State.PackageTags
 constructTagIndex = foldl' addToTags State.emptyPackageTags . PackageIndex.allPackagesByName
   where addToTags pkgTags pkgList =
-            let info = pkgDesc $ last pkgList
+            let info = pkgDesc $ pkgLatestRevision $ last pkgList
                 pkgname = packageName info
                 categoryTags = Set.fromList . constructCategoryTags . packageDescription $ info
                 immutableTags = Set.fromList . constructImmutableTags $ info
@@ -287,7 +288,7 @@ constructTagIndex = foldl' addToTags State.emptyPackageTags . PackageIndex.allPa
 constructImmutableTagIndex :: [PkgInfo] -> State.PackageTags
 constructImmutableTagIndex = foldl' addToTags State.emptyPackageTags
   where addToTags calcTags pkg =
-            let info = pkgDesc pkg
+            let info = pkgDesc $ pkgLatestRevision pkg
                 !pn = packageName info
                 !tags = constructImmutableTags info
             in State.setTags pn (Set.fromList tags) calcTags
